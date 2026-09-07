@@ -14,7 +14,7 @@
 # Stage 2 (public CI) re-proves the non-secret-dependent subset.
 set -u
 
-VERSION="0.2.1"
+VERSION="0.2.2"
 CONTRACT_VERSION=1
 SELF_SHA=$(shasum -a 256 "$0" | awk '{print $1}')
 
@@ -503,7 +503,8 @@ while IFS= read -r hit; do n=$((n+1)); note "leak.paths: $hit"; done < <(
     -o -name "*.key" -o -name "id_rsa*" \) -print 2>/dev/null | sed 's|^\./||'
   cd "$OUT" && find . -path "./infrastructure/*" -type f 2>/dev/null | sed 's|^\./||' \
     | grep -v -e "^infrastructure/scripts/build-signet-release.sh$" -e "^infrastructure/scripts/linux-gate.sh$" \
-              -e "^infrastructure/scripts/signet-export.sh$" -e "^infrastructure/scripts/export-allowlist.txt$"
+              -e "^infrastructure/scripts/signet-export.sh$" -e "^infrastructure/scripts/export-allowlist.txt$" \
+              -e "^infrastructure/scripts/npm-audit-gate.sh$"
 )
 record leak.paths "$([ $n -eq 0 ] && echo pass || echo fail)" $n
 

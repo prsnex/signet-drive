@@ -50,11 +50,12 @@ infrastructure/scripts/linux-gate.sh
 # pending his ruling (audited: no server coupling, would run green).
 .github/workflows/web-ci.yml
 .github/workflows/audit.yml
+infrastructure/scripts/npm-audit-gate.sh
 # Public-only workflow, staged outside .github/ so it never runs in the
 # private repo; the repository guard inside it is the second layer.
 # Note: the export-push credential needs the workflow scope to push this.
 ? public/github-workflows/close-external-prs.yml => .github/workflows/close-external-prs.yml
-? public/github-workflows/stage2-reproof.yml => .github/workflows/stage2-reproof.yml
+# stage2-reproof.yml HELD OUT (Gus, 2026-09-07): it calls verify/stage2-reproof.sh, which does not exist yet (the OSP's Stage-2 re-proof tool is unbuilt); shipping the workflow made every public push red. Returns with the tool.
 
 ## Top-level public docs (authored as public artifacts; land via carve, then export)
 ? SECURITY.md
