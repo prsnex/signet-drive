@@ -1,0 +1,15 @@
+{
+  "name": "signet-test-vector-generator",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Generates committed golden vectors for the Signet Drive wrap chains (tier-3 JOSE conformance via panva/jose; tier-4 file envelope + the human-side KEM-key wrap chain via Node WebCrypto). Output is committed to ../golden/; this is never a CI runtime dependency.",
+  "scripts": {
+    "gen": "node ecdh_es_a256kw_gen.mjs > ../golden/wrap-chain.json",
+    "gen:kem": "node kem_wrap_gen.mjs > ../golden/kem-wrap.json",
+    "gen:chunk": "node chunk_envelope_gen.mjs > ../golden/chunk-envelope.json"
+  },
+  "dependencies": {
+    "jose": "5.9.6"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "_comment": "GENERATED — do not hand-edit. Run `cd gen && npm run gen:kem`. Human-side KEM-key wrap chain (Envelope §8 / WebAuthn-PRF v07) via Node WebCrypto HKDF-SHA-256 + AES-256-GCM. Consumed by crypto/tests/kem_wrap.rs + Test Vector Category 01.",
+  "label": "signet-drive-kem-wrap-v1",
+  "kem_privkey_wrap": {
+    "description": "PRF output -> HKDF-SHA-256 W -> AES-256-GCM wrap of a PKCS#8 ECDH P-256 key (Envelope §8.2/§8.3). derive_wrap_key(prf_output)==W; wrap_kem_privkey(W, pkcs8, iv) produces {iv,ct,tag}; unwrap recovers pkcs8.",
+    "prf_output_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "expected_w_hex": "fac1e06abf3cb605d2d95cd59b52ecfcf6858da0240490b1b46c0a4b47106e74",
+    "pkcs8_hex": "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104205449836690d75caf29f0dd029ddb31b3ddb8aba9d2d515c5012465e817d4a9dca14403420004c1e349cb61ec70248ce801034c3834e1b88ebe1161cb25af38741f785fcfc4c47bc96708ef80952b53f8d2555fe72b841ed04588628b1d378a594939500ec9c9",
+    "iv_b64u": "AQIDBAUGBwgJCgsM",
+    "expected_ct_b64u": "A0xIOU8T48k63ThGG5DPvjBlqXoO3yyHsjXXWs5Mdog0hMYIuGLWENsLChfsTf6nObswx8lP32LK3eYMZ8keMzKRSdwhG02wJtXboiucIC_08RCEZ20PpJRbF6dYDEFlDqUEZTkA77h5shwEgSM6p-b9Ol-Q-K772wCgbHTsE4eaDiLaT8fYCKpv",
+    "expected_tag_b64u": "mr3PGzskSt8e6gr-qFp-OQ"
+  }
+}

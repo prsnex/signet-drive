@@ -1,0 +1,78 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 PRSN EX Inc.
+
+name: stage2-reproof
+
+# The Stage-2 re-proof (public CI): re-runs the non-secret-dependent subset of
+# the export gate over the published tree, plus the Stage-2-only checks
+# (workflows.expected, metadata.lint). See verify/stage2-reproof.sh; the
+# checks live there so they run identically in CI and locally.
+#
+# PUBLIC-ONLY WORKFLOW: staged in the private repo at
+# public/github-workflows/stage2-reproof.yml and relocated to
+# .github/workflows/ by the export allowlist mapping (the close-external-prs
+# pattern), so it never runs in the private repo. It is read-only and harmless
+# in forks, so it carries no repository guard; the target ruleset requires its
+# check only in the public repo.
+on:
+  # Every export lands as a push to main (push restricted to the export
+  # credential once the target ruleset applies); the re-proof is the required
+  # status check on that push. Release tags re-prove the exact tagged tree.
+  push:
+    branches: [main]
+    tags: ['v*.*.*', 'server-v*.*.*']
+  # Weekly: repo/org metadata can drift out-of-band (settings are not tree
+  # content), and a scheduled run re-proves an unchanged tree the same way
+  # audit.yml catches new advisories on unchanged deps.
+  schedule:
+    - cron: '43 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Job name is pinned by the target ruleset's required-status-check entry
+  # (ruleset-spec v01 §target: "the Stage-2 gate re-proof workflow must pass").
+  # Renaming this job breaks the ruleset pin; change both together.
+  reproof:
+    name: stage-2 re-proof
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # lockfile.consistency needs both toolchains; everything else in the
+      # script is POSIX + grep/awk/perl already on the runner. Same trusted
+      # action set as ci.yml/web-ci.yml, no new marketplace actions.
+      # SHA-pinned (bug133): the digest is authoritative, the comment informational.
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1 (ref no longer selects the toolchain; see with.toolchain)
+        with:
+          toolchain: stable
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Run the Stage-2 re-proof
+        env:
+          SIGNET_METADATA_LINT: '1'
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          chmod +x verify/stage2-reproof.sh
+          ./verify/stage2-reproof.sh --tree . --verdict stage2-verdict.json
+
+      # The verdict is the machine record (content-free check results); upload
+      # on failure too so a red run leaves the same evidence as a green one.
+      - name: Upload verdict
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stage2-verdict
+          path: stage2-verdict.json

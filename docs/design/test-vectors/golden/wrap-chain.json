@@ -1,0 +1,49 @@
+{
+  "_comment": "GENERATED — do not hand-edit. Run `cd gen && npm install && npm run gen`. tier-3 (ECDH-ES+A256KW) via panva/jose; tier-4 (file envelope) via Node WebCrypto AES-GCM. Consumed by crypto/tests/golden_vectors.rs.",
+  "jose_lib": "panva/jose",
+  "ecdh_es_a256kw_dek": {
+    "description": "DEK wrap (no apv). Rust unwrap_dek(recipient.d, {epk, ct=encrypted_key}) must recover the CEK that AES-256-GCM-decrypts the JWE payload.",
+    "recipient_jwk": {
+      "kty": "EC",
+      "crv": "P-256",
+      "x": "weNJy2HscCSM6AEDTDg04biOvhFhyyWvOHQfeF_PxMQ",
+      "y": "e8lnCO-AlStT-NJVX-crhB7QRYhiix03illJOVAOyck",
+      "d": "VEmDZpDXXK8p8N0Cndsxs924q6nS1RXFASRl6BfUqdw"
+    },
+    "payload_utf8": "signet-drive ECDH-ES+A256KW DEK conformance vector",
+    "jwe": {
+      "ciphertext": "IlTF_5VMaeoExola0t7ezENZYG13qMzHv4kt5Qh71NpNd_1hIxlzb9RhB0KMgaRofng",
+      "iv": "zTUfXH2_lwkw4L72",
+      "tag": "tfq3BWqUyyy4EIxiAy8ASg",
+      "encrypted_key": "WGIlYntYafYlJoDDDIu-0h3n_cCaX-XsqmeQmC-4RaVXKr9NMu_GkA",
+      "protected": "eyJhbGciOiJFQ0RILUVTK0EyNTZLVyIsImVuYyI6IkEyNTZHQ00iLCJlcGsiOnsieCI6ImxHb05sa21WaTdHS3hKRldPVzd1S3FpTWxjTm9OM0dpckJ1Tm5mUGNNWUUiLCJjcnYiOiJQLTI1NiIsImt0eSI6IkVDIiwieSI6InV6WWoxdFhiZFRKcjJIcEg2VzZMYXR4QmdMZFRZZHN3SGdtbEZGdTFCTkEifX0"
+    }
+  },
+  "ecdh_es_a256kw_metadata": {
+    "description": "Metadata-key wrap with apv=root_folder_id (P-015). Rust unwrap_metadata_key(recipient.d, jwe, root_folder_id) must recover the CEK.",
+    "recipient_jwk": {
+      "kty": "EC",
+      "crv": "P-256",
+      "x": "weNJy2HscCSM6AEDTDg04biOvhFhyyWvOHQfeF_PxMQ",
+      "y": "e8lnCO-AlStT-NJVX-crhB7QRYhiix03illJOVAOyck",
+      "d": "VEmDZpDXXK8p8N0Cndsxs924q6nS1RXFASRl6BfUqdw"
+    },
+    "root_folder_id_hex": "aaaaaaaa00004000800000000000000a",
+    "payload_utf8": "signet-drive metadata-key (P-015 apv) conformance vector",
+    "jwe": {
+      "ciphertext": "iAjkzEv9TsDMOK_Z9egHiAyGDiO7GqVWvDokbMcTKPlRE4NcWQfgkuYx_Tf3I9tWsngLjHut0IU",
+      "iv": "cZNNKtOYhgTu9XM8",
+      "tag": "9sOzKr5hvI2URwBimdbFjA",
+      "encrypted_key": "GTu7QfTcYcnERjOndYhzpAWiIONFGn3lbvjpQWdkBSE9SAGoDDNUuA",
+      "protected": "eyJhbGciOiJFQ0RILUVTK0EyNTZLVyIsImVuYyI6IkEyNTZHQ00iLCJlcGsiOnsieCI6InctVm5lM2loZkpwaDlkejQyX2lxdkZxRnNuWnoxSHJjbVpPNXMycWQzWGsiLCJjcnYiOiJQLTI1NiIsImt0eSI6IkVDIiwieSI6IkZwTVdrV1BFRnhKTHNEdEtnLWdCc0o3aG9jcGtLRHltU3E5RFl6ZXU0VTAifSwiYXB2IjoicXFxcXFnQUFRQUNBQUFBQUFBQUFDZyJ9"
+    }
+  },
+  "file_envelope_cat02": {
+    "description": "Single-PUT file envelope (Cat 02 TC02-01): [0x01 magic][0x01 alg][12 IV][ct][16 tag], AAD=file_id. seal_file(..) must produce envelope_hex byte-for-byte.",
+    "dek_hex": "3f2e06da630763b9110cc4c8a47d2d8bf6dda7001de26332bac3b3f169c14e67",
+    "iv_hex": "0102030405060708090a0b0c",
+    "file_id_hex": "00000000000040008000000000000111",
+    "plaintext_utf8": "hello signet",
+    "envelope_hex": "01010102030405060708090a0b0c81981a814155666dac1de50ae5cb9b084e9958dc3de6b2e1d6ad318a"
+  }
+}

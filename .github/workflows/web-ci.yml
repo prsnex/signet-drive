@@ -1,0 +1,209 @@
+name: web-ci
+
+# Gates the web client (Phase 3 C0+). Path-filtered to the web project, the
+# committed golden the differential harness consumes, and this workflow.
+# Gates: svelte-check (types, incl. .svelte), eslint, prettier --check, vitest
+# (the crypto/auth unit + golden-vector suite), and the SvelteKit static build
+# (the app shell landed in C1b-1; svelte-check replaces the bare tsc typecheck).
+on:
+  push:
+    # Scope the push trigger to main. Without this, a push to a feature branch touching
+    # a web path ran web-ci once for the push AND again for the PR — a double-run on
+    # every web-touching branch. Now: PR branches run it once (via the PR), and main
+    # runs it once after merge.
+    #
+    # ⛔⛔ CORRECTION (S204). This comment used to read "(matching ci.yml)" and that
+    # STOPPED BEING TRUE: ci.yml removed its post-merge main run at S064 as "redundant
+    # for our flow", while web-ci kept its own. The claim of a match outlived the match —
+    # a hardcoded assertion cannot notice it has become false — and the divergence then
+    # read as an oversight nobody could justify, because the only stated reason was
+    # symmetry with a workflow that had moved.
+    #
+    # ⭐ WHY WEB LEGITIMATELY DIFFERS, RECORDED SO IT IS NOT "ALIGNED AWAY" (Chris ruled
+    # this to the S204 list; the disposition is RECORD, not align):
+    #   ci.yml is a DETERMINISTIC gate — compile, unit tests, clippy. Re-running the same
+    #   commit gains nothing, so its mitigation ("keep PRs current with main before
+    #   merging") is sufficient and the second run is pure cost.
+    #   web-ci's `swdl-namespace-contract` is a THREE-ENGINE PLAYWRIGHT BROWSER TEST and
+    #   is NOT deterministic in that sense. A post-merge run is a SECOND SAMPLE of a
+    #   non-deterministic check, taken on the exact merged artifact that ships. For a
+    #   flaky-by-nature gate a second sample carries information; for a hermetic one it
+    #   does not. That asymmetry is the reason, and it is a property of the CHECK, not of
+    #   the language.
+    #
+    # ⚠ THE EVIDENCE, WITH ITS LIMIT STATED. Measured over 40 post-merge main runs: 39
+    # success, 1 failure (2026-08-20, #440, `17ba31e5`) — and that failure was on
+    # swdl-namespace-contract, 50 minutes after the same branch's PR run had PASSED. So
+    # the main run did catch something the PR run did not. ⛔ BUT the failing commit was
+    # NEVER RE-RUN (run_attempt=1) and the next green main run was a DIFFERENT commit, so
+    # whether it was a real merge-result defect or a Playwright flake is UNDETERMINED and
+    # this comment does not claim otherwise. ⇒ n=1 in a known-flaky job cannot justify
+    # REMOVING the run, which is why the disposition is to record the rationale rather
+    # than to align: deleting a check because its one catch MIGHT have been noise is how
+    # useful gates disappear.
+    #
+    # ⭐ REVISIT TRIGGER, so "record it" does not become "keep it forever" (Gus, S204).
+    # Undetermined evidence justifies neither deleting nor keeping indefinitely — it
+    # justifies keeping WITH A NAMED POINT OF RE-DECISION. That point is the LEAN-CI
+    # batch (Chris's parked item), where this run's per-merge minute cost belongs anyway
+    # and where the call can be made against ACCUMULATED post-merge data instead of one
+    # ambiguous sample. ⚠ Until then the honest state is "kept, reason recorded, evidence
+    # inconclusive" — not "settled".
+    branches: [main]
+    paths:
+      - 'web/**'
+      - 'docs/design/test-vectors/golden/wrap-chain.json'
+      - 'docs/design/test-vectors/golden/chunk-envelope.json'
+      - 'docs/design/test-vectors/golden/hybrid-crossover.json'
+      - '.github/workflows/web-ci.yml'
+  pull_request:
+    paths:
+      - 'web/**'
+      - 'docs/design/test-vectors/golden/wrap-chain.json'
+      - 'docs/design/test-vectors/golden/chunk-envelope.json'
+      - 'docs/design/test-vectors/golden/hybrid-crossover.json'
+      - '.github/workflows/web-ci.yml'
+
+# One in-flight web CI per ref: a new push to the same branch cancels the
+# superseded run (iterative PR work) instead of running both to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run check
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm run test
+      - run: npm run build
+
+  # ⚠⚠ THE JOB NAME IS THE HONEST LABEL, and that is deliberate (Gus, S179).
+  # It is `swdl-namespace-contract`, NOT `swdl-e2e` and nothing implying downloads
+  # are covered — because "the suite runs in CI" is what survives into memory, and
+  # check names survive where comments do not.
+  #
+  # WHAT THIS GUARDS: the reserved-namespace contract on chromium + firefox + webkit.
+  # The worker must answer `/__signet_dl/<unregistered>` with its own 404 body and
+  # must NEVER answer HTML. That is bug197's exact shape — the host answered
+  # `200 + index.html` and four downloads landed as 2401 bytes of our own SPA shell
+  # under the users' filenames, on a custody product. ⛔ Proven must-fail at S179:
+  # with the worker's interception disabled, all three engines fail on
+  # `Received string: "text/html"`.
+  #
+  # ⛔ WHAT THIS DOES **NOT** GUARD — BYTE VERIFICATION. The two sha-of-artifact
+  # tests are chromium-only (WebAuthn PRF is CDP-only) and need Postgres, MinIO,
+  # Mailpit and a dev-auth API server. They run LOCALLY, by hand, per release
+  # (`npm run e2e:swdl`). A green run here says the namespace contract holds. It
+  # says NOTHING about whether a download produces the right bytes.
+  #
+  # The full browser-CI foundation — services + a dev-auth server build + three
+  # engines, ~a session to build and ~20-25 min per run — is PARKED as a named
+  # option for Chris's resourcing call, not forgotten.
+  #
+  # Selection is by explicit `--grep` in the npm script, never by relying on the
+  # chromium-only skips inside the spec: what CI runs is visible here, not
+  # derivable from skip conditions scattered through the file.
+  swdl-namespace-contract:
+    name: swdl-namespace-contract (3 engines; NOT byte coverage)
+    runs-on: ubuntu-latest
+    # ⭐⭐ S183 — THIS JOB RUNS IN THE OFFICIAL PLAYWRIGHT IMAGE, AND THAT IS THE FIX.
+    # Browsers AND their system libraries are pre-baked, so the job installs nothing
+    # and fetches nothing. That is what finally ends the apt saga below: you cannot
+    # mis-bound a download you do not perform.
+    # ⚠ `--user 1001` matches the runner's uid so the checkout is writable — the
+    # pattern from Playwright's own GitHub Actions docs (ROOTS §B-3.8: adopt
+    # generally accepted practice wholesale rather than re-derive it).
+    container:
+      image: mcr.microsoft.com/playwright:v1.60.0-noble
+      options: --user 1001
+    env:
+      # Single source for the guard step below. Must equal the image tag above.
+      PLAYWRIGHT_IMAGE_VERSION: '1.60.0'
+    # THE ONLY CEILING IN THIS JOB, and it is deliberately blunt (S183).
+    # It exists for a TRUE HANG, not to bound a transfer. Every per-step
+    # wall-clock bound was deleted — see the block below for why.
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      # ⛔⛔⛔ S183 — APT IS GONE FROM THIS JOB. FOUR REMEDIES DIED HERE; READ THIS
+      # BEFORE ADDING A FIFTH.
+      #
+      #   S180  a 2401s apt stall made one web-ci run take 40 minutes -> 360s bound
+      #         + 3 retries.
+      #   S182  that bound TRUNCATED A WORKING INSTALL, and `timeout` killed only the
+      #         `npx` parent while the orphaned `apt-get` kept /var/lib/dpkg/
+      #         lock-frontend, so the retries raced our own corpse -> re-shaped to
+      #         600s / 2 attempts / lock-wait / backoff.
+      #   S183a IT FAILED AGAIN. The install was 181 packages / 114 MB; attempt 1
+      #         reached Get:51 of 181 in ~592s and was killed at the bound. ⭐ THE
+      #         ORPHAN WAS NOT STUCK — it kept downloading (Get:52..Get:59, one of
+      #         them 13.6 MB) with its output INTERLEAVED into our own "waiting 5s"
+      #         lines. It held the lock because it was WORKING. Attempt 2 died in 2s.
+      #   S183b dropping `--with-deps` (PR #436) killed apt and ran in 1m6s — but
+      #         WEBKIT COULD NOT LAUNCH: the bare runner is short THIRTY-FIVE
+      #         libraries (libgtk-4, the whole gstreamer stack, all fourteen
+      #         libflite*, libavif, libharfbuzz-icu, libwoff2dec, libx264 …).
+      #         chromium ✓ firefox ✓ webkit ✘ — a PRE-STATED falsifier, fired in
+      #         66 seconds. That is why this job is now containerised.
+      #
+      # ⭐⭐ THE GENERAL LESSON (Gus, S183): WHEN A BOUND KEEPS BEING WRONG AT
+      # DIFFERENT VALUES, THE DEFECT IS NEVER THE VALUE. 360s wrong, 600s wrong, any
+      # number wrong — the bounded quantity has no fixed size. A 600s bound over
+      # 114 MB silently encodes a REQUIRED RATE of ~190 KB/s; that day's mirror gave
+      # ~54 KB/s. ROOTS §B-3.4 (no wall-clock constant may bound a `bytes / rate`
+      # quantity) — bug211's OWN defect class, reproduced by the very job gating
+      # bug211's fix.
+      #
+      # ⭐ THE REMEDY IS SUBTRACTION, AND §B-3.4 IS NOW SATISFIED BY ABSENCE: there
+      # is no download in this job, therefore no bound around one. The only ceiling
+      # is the job-level `timeout-minutes`, which exists for a true hang.
+      #
+      # ⚠ CI RUNS BUNDLED CHROMIUM, NOT BRANDED CHROME. The image ships no branded
+      # Chrome, and installing it would mean apt — the category this change deletes.
+      # The narrowing is deliberate and bounded; the full rationale (and the limit of
+      # what it licenses) lives in web/playwright.swdl-ci.config.ts. Branded-Chrome
+      # coverage is retained in the per-release LOCAL three-engine run.
+      #
+      # ⚠ ACCEPTANCE: green is NOT enough. The run must show `3 passed` — webkit must
+      # LAUNCH AND ASSERT, never be quietly absent. Fewer than 3 is a FAIL, because a
+      # silent skip and a real pass are indistinguishable in the check mark.
+      - name: Assert the image matches the locked Playwright version
+        # A POSITIVE CONTROL for the one silent-drift risk containerising introduces:
+        # the image tag and package-lock.json can diverge, and mismatched
+        # client/browser versions fail in confusing ways. This turns that into a loud
+        # failure that names its own fix.
+        run: |
+          set -eu
+          locked="$(node -p "require('@playwright/test/package.json').version")"
+          echo "locked @playwright/test : ${locked}"
+          echo "container image pin     : ${PLAYWRIGHT_IMAGE_VERSION}"
+          [ "${locked}" = "${PLAYWRIGHT_IMAGE_VERSION}" ] || {
+            echo "MISMATCH — bump the container image tag in web-ci.yml to v${locked}-noble (and PLAYWRIGHT_IMAGE_VERSION to ${locked})"
+            exit 1
+          }
+      # Builds and previews the app itself (the config's webServer does both, every
+      # run) — no service worker registers under `vite dev`, which is the whole
+      # reason this suite exists on a BUILT app.
+      - run: npm run e2e:swdl:contract

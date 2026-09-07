@@ -1,0 +1,48 @@
+# close-external-prs.yml: respond to and close external pull requests.
+#
+# This repository is open source, closed contribution (CONTRIBUTING.md).
+# Public main is produced by a per-release export, so a PR cannot merge here
+# even mechanically. This workflow replies with the policy and closes the PR.
+#
+# Safety notes:
+# - pull_request_target grants write permissions, which is safe here because
+#   the workflow never checks out or executes PR code. Do not add a checkout
+#   step to this file.
+# - The repository guard keeps the workflow inert everywhere except the
+#   public repo, including the private tree if this file ever lands there.
+# - The action is pinned by commit SHA (Scorecard: pinned dependencies).
+name: External PR policy
+on:
+  pull_request_target:
+    types: [opened, reopened]
+permissions:
+  pull-requests: write
+jobs:
+  respond-and-close:
+    if: github.repository == 'prsnex/signet-drive'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const body = [
+              "Thank you for the pull request.",
+              "",
+              "This repository is open source and closed contribution for now: public `main` is produced by a per-release export from a private working tree, so pull requests cannot merge here. [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md) has the full picture.",
+              "",
+              "If this change fixes something real, please open an issue describing it. If we agree, we will fix it in the private tree and credit you in the release notes.",
+              "",
+              "This pull request is closed automatically by policy, with thanks."
+            ].join("\n");
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body
+            });
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              state: "closed"
+            });

@@ -1,0 +1,53 @@
+# cargo-nextest configuration (adopted S108 — the PR-C rider).
+#
+# nextest runs the SAME test binaries cargo builds — it changes the scheduler
+# (process-per-test isolation; parallelism ACROSS test binaries), never what a
+# test asserts. Two deliberate robustness holds:
+#
+#   * NO automatic retries, ever. An intermittent failure is a finding to
+#     diagnose (this codebase's flakes have repeatedly been real signals),
+#     never something the harness quietly re-rolls. If a scoped exception is
+#     ever wanted for a known-infrastructure flake, it gets its own reviewed
+#     override here — loud, named, and bounded — not a default.
+#
+#   * CI runs to completion (no fail-fast): one push reports EVERY failure,
+#     instead of hiding sibling failures behind the first one.
+#
+# Doctests: nextest does not run them; the workspace currently has none
+# (verified S108 — every doc code-block is a `text` diagram). CI keeps an
+# explicit `cargo test --doc` step as the future-proofing gate so a runnable
+# doc example can never silently drop out of the suite.
+
+[profile.default]
+retries = 0
+
+[profile.ci]
+retries = 0
+fail-fast = false
+
+# The lifecycle-worker suites (S112, found by the first post-nextest PR — the
+# S108 "watch for parallel-scheduler findings" rider paying out): global
+# sweeps over the ONE shared Postgres steal each other's side effects across
+# parallel processes (first sweeper marks + notifies; idempotence makes the
+# second tick a no-op — e.g. a deletion-notice email lands in the OTHER
+# test's mock mailer, the lapse.rs:130 race; the same window exists between
+# multipart's backdate-then-sweep and any run_once tick, D2 increment
+# review Q4). These binaries serialize among themselves; everything else
+# stays parallel.
+#
+# MEMBERSHIP RULE (the invariant a new test binary is checked against, not a
+# grep someone must remember to re-run): a binary joins this group if it BOTH
+#   (a) drives a global sweep (`run_once`, `sweep_expired_multipart_uploads`,
+#       or any future sweep that scans beyond rows it created), AND
+#   (b) can hold rows in a sweepable state at any point mid-test
+#       (past-grace accounts, backdated expiries, ...).
+[test-groups.lifecycle-worker]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary(lapse) | binary(sweep_pending) | binary(orphan_sweep) | binary(lifecycle) | binary(trial_lifecycle) | binary(admin) | binary(multipart) | binary(fault_injection) | binary(incomplete_prsn) | binary(retention_sweep)'
+test-group = 'lifecycle-worker'
+
+[[profile.ci.overrides]]
+filter = 'binary(lapse) | binary(sweep_pending) | binary(orphan_sweep) | binary(lifecycle) | binary(trial_lifecycle) | binary(admin) | binary(multipart) | binary(fault_injection) | binary(incomplete_prsn) | binary(retention_sweep)'
+test-group = 'lifecycle-worker'

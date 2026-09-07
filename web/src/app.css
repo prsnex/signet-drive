@@ -1,0 +1,172 @@
+/* Signet Drive — visual foundation.
+   "Signet ink on warm paper": calm, precise, trustworthy. A serif wordmark over a
+   clean sans UI; a single confident accent (signet ink, a deep indigo) for action;
+   generous whitespace. Restrained by intent — this is a security product. */
+
+:root {
+  --bg: #f4f3ef;
+  --surface: #ffffff;
+  --surface-2: #faf9f6;
+  --ink: #1b1b1f;
+  --ink-soft: #3f3f46;
+  --muted: #71717a;
+  --border: #e6e3db;
+  --field-border: #d6d3ca;
+  --accent: #3f3d8a;
+  --accent-hover: #322f73;
+  --accent-text: #3f3d8a;
+  --accent-soft: #eceaf6;
+  /* Half-strength accent-soft (midpoint to white) — a section-scale wash that
+     active rows (--accent-soft) still read against (bug053). */
+  --accent-wash: #f5f4fa;
+  /* ── The sidebar's four section palettes (bug103/bug109; rebuilt S209) ──────
+     Each of the four left-panel sections is THREE tones: a TITLE band and two
+     alternating ROW tints. Tokens, not literals, so a future dark theme can remap.
+
+     ⛔ WHAT WAS WRONG BEFORE. There were TWO band tones for FOUR sections —
+     PRIVATE and SHARE both wore --neutral-band, SHARED WITH YOU had no band at
+     all — and the alternating rows were ONE shared pair (white / --bg) used by
+     every section. So a section's identity rested entirely on its title, and two
+     of the four did not even have a distinct one.
+
+     ⭐ WHY IT LOOKED FINE ANYWAY, which is the trap: --bg IS a tint of
+     --neutral-band, so PRIVATE's three tones were a coherent family BY ACCIDENT OF
+     HISTORY. Nothing enforced it, and the moment SHARE became green a beige stripe
+     underneath belonged to neither section.
+
+     ⭐ HOW THE SET IS CHOSEN — measured, not by eye. Bands are separated by HUE at
+     near-equal lightness. At this saturation two bands ~28° apart read as "two
+     slightly different beiges", which is exactly how PRIVATE and SHARE looked while
+     they shared a token. The closest pair here is 73°.
+     ⚠ Keep any future band ≥45° from all others, or the section it marks stops
+     being distinguishable at a glance.
+
+     Rows are the band's own hue at 25% and 55% over white; the title is the same
+     hue pulled further from white again (Chris chose this depth, S209, from
+     swatches). One hue per section, three strengths — so a row always belongs
+     visibly to its section rather than to the panel. */
+
+  /* PRIVATE FOLDERS — warm grey */
+  --neutral-band: #e6e2d8;
+  --private-row-a: #fbfaf8;
+  --private-row-b: #f6f5f1;
+
+  /* SHARE FOLDERS — green */
+  --share-band: #c6dcc9;
+  --share-row-a: #f6f9f6;
+  --share-row-b: #eaf2eb;
+
+  /* PRSN ACCOUNTS — lavender */
+  --accent-band: #d6d0ed;
+  --prsn-row-a: #f8f7fc;
+  --prsn-row-b: #f0eef8;
+
+  /* SHARED WITH YOU — mauve */
+  --shared-in-band: #ead6e0;
+  --shared-in-row-a: #fcf8fa;
+  --shared-in-row-b: #f7f0f3;
+  --on-accent: #ffffff;
+  --danger: #b3261e;
+  --danger-bg: #fbf1f0;
+  --positive: #2f6f4f;
+  --positive-bg: #edf5f0;
+  --warn: #8a6116;
+  --warn-bg: #f9f3e6;
+  --ring: rgba(63, 61, 138, 0.28);
+  --radius: 14px;
+  --radius-sm: 9px;
+  --shadow: 0 1px 2px rgba(20, 20, 35, 0.05), 0 12px 34px rgba(20, 20, 35, 0.07);
+  --font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --font-serif: ui-serif, Georgia, 'Iowan Old Style', 'Times New Roman', serif;
+
+  /* Type scale — 1.25 ratio on a 16px base. Serif is the display voice, sans the UI. */
+  --text-xs: 0.8rem;
+  --text-sm: 0.9rem;
+  --text-base: 1rem;
+  --text-lg: 1.25rem;
+  --text-xl: 1.56rem;
+  --text-2xl: 1.95rem;
+
+  /* Spacing scale — 4px base. New code uses these; existing values migrate opportunistically. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 64px;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  min-height: 100dvh;
+  background-color: var(--bg);
+  background-image: radial-gradient(1100px 560px at 50% -12%, #ffffff, rgba(255, 255, 255, 0));
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+/* The serif is the display voice: page titles, section titles, empty-state
+   headlines, modal titles. Small eyebrow-label headings opt back to sans locally. */
+h1,
+h2 {
+  font-family: var(--font-serif);
+}
+
+/* A titled surface — the account dashboard groups related settings into cards. */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.5rem;
+  box-shadow: var(--shadow);
+}
+
+/* The app tooltip (bug056 — see lib/tooltip.ts). Global because the bubble is
+   appended to <body>, out of reach of component-scoped styles. */
+.sig-tooltip {
+  position: fixed;
+  z-index: 1000;
+  max-width: 280px;
+  padding: 0.45rem 0.65rem;
+  background: var(--ink);
+  color: var(--surface);
+  font-family: var(--font-sans);
+  font-size: 0.8rem;
+  line-height: 1.35;
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

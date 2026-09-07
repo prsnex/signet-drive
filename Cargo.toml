@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 PRSN EX Inc.
+
+[workspace]
+resolver = "3"
+members = ["crypto", "crypto-wasm", "channel", "cli"]
+
+[workspace.package]
+# The crate version IS the release version: the git tag is `v{this}` and the GHCR
+# image tag matches, so `/v1/server-info` (env!("CARGO_PKG_VERSION")) honestly reports
+# what's deployed. Bump in lockstep with each release tag (S072 — converged from the
+# accidental 0.1.0 drift that made server-info report 0.1.0 for every release since).
+version = "1.0.1"
+edition = "2024"
+# 1.85 (edition 2024's floor) → 1.88: the `time` ≥0.3.47 security bump
+# (RUSTSEC-2026-0009) needs it, and there is no 1.85-compatible fix. We build on
+# `stable` (rust-toolchain.toml), so the effective floor is current stable anyway;
+# this keeps the declared MSRV honest. (S064 D2 burn-down.)
+rust-version = "1.88"
+license = "Apache-2.0"
+authors = ["Hlin <hlin@prsnex.ai>"]
+repository = "https://github.com/prsnex/signet-drive-private"
+
+[profile.release]
+# strip = symbols: the shipped `signet` app is ~half the size with identical behavior,
+# and drops embedded build-path strings (reproducibility-friendly). Rust panic messages
+# (file:line) are unaffected — they live at the panic site, not the symbol table.
+# Cross-path reproducibility (F-REPRO-R2(a), S112): the RELEASE PIPELINE adds
+# `--remap-path-prefix` for the checkout / cargo-home / sysroot via RUSTFLAGS
+# (`build-signet-release.sh` step 2 — cargo `trim-paths` is still nightly; swap
+# when it stabilizes), making the macOS full-binary hash — LC_UUID included —
+# byte-identical from any build directory (verified two-path, S112).
+strip = true
+
+# The WASM ML-KEM module ships to browsers — size is the constraint there
+# (PQR item 4; the B-probe reference is ~20 KB gz with opt-level=z + LTO).
+# Per-package opt-level is safe to pin here; LTO stays a workspace-global
+# decision, so the wasm artifact is measured without it (documented in the
+# crate).
+[profile.release.package.signet-crypto-wasm]
+opt-level = "z"

@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 PRSN EX Inc.
+
+# The exact-version pin is reproducible-build axis R5 (Gus S002 / Bug027):
+# every builder — dev Macs, CI (dtolnay/rust-toolchain honors this file), the
+# release pipeline, and the wasm-pkg-repro byte-compare — compiles with the
+# same rustc, so binary/wasm anchors rebuild-match by construction. Bump
+# deliberately (a new committed wasm pkg + release manifests follow the bump);
+# MSRV stays 1.88 (Cargo.toml rust-version).
+[toolchain]
+channel = "1.96.0"
+components = ["clippy", "rustfmt"]
+targets = ["wasm32-unknown-unknown"]

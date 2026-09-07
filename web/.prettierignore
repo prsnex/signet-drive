@@ -1,0 +1,11 @@
+node_modules
+package-lock.json
+coverage
+dist
+build
+.svelte-kit
+test-results
+playwright-report
+src/lib/paraglide
+project.inlang
+src/lib/crypto/mlkem-wasm

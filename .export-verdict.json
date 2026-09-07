@@ -1,0 +1,13 @@
+{
+  "contract_version": 1,
+  "input_tag": "b698a8461e53197e17a09d67e1917d23f318e823",
+  "input_commit": "b698a8461e53197e17a09d67e1917d23f318e823",
+  "tool_version": "0.2.1",
+  "tool_sha256": "af4d82c021d77ea0ca1c2b649dd1e555bc9cc278ed06f8bc9ed6d8a515caa76a",
+  "allowlist_sha256": "fd674efdd3a8dc8c535980ce15900727348701643cad26262027424d46747521",
+  "dry_run": false,
+  "checks": [
+    {"id":"leak.paths","result":"pass","findings":0},{"id":"leak.substrate","result":"pass","findings":0},{"id":"leak.secrets","result":"pass","findings":0},{"id":"leak.hostnames","result":"pass","findings":0},{"id":"docs.allowlist","result":"pass","findings":0},{"id":"lockfile.identity","result":"pass","findings":0},{"id":"license.spdx","result":"pass","findings":0},{"id":"bloat.vendored","result":"pass","findings":0},{"id":"style.lint","result":"pass","findings":0},{"id":"refs.closure","result":"pass","findings":0},{"id":"root.required","result":"pass","findings":0},{"id":"copy.complete","result":"pass","findings":0},{"id":"lockfile.subset","result":"pass","findings":0},{"id":"lockfile.frozen","result":"pass","findings":0}
+  ],
+  "verdict": "GATE-PASS"
+}

@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 PRSN EX Inc.
+
+[package]
+name = "signet-crypto"
+description = "Signet Drive shared cryptography crate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Off-the-shelf primitives only (v1 assurance model §1). RustCrypto is pure-Rust
+# with an audit history, and — importantly for the differential harness — a
+# different lineage from the OpenSSL-family oracle (unlike `ring`, which is
+# BoringSSL-derived). Pinned to the digest-0.10 / cipher-0.4 / elliptic-curve-0.13
+# cohort that p256 0.13 (the current EC release) lives in; the newer sha2-0.11 /
+# hkdf-0.13 / aes-kw-0.3 line would split trait versions and fail to compose.
+# `oid` adds the AssociatedOid impls (e.g. OidSha256) that let the x509-cert
+# CertificateBuilder derive the ecdsa-with-SHA256 signature-algorithm identifier
+# from a p256 ES256 signer (Garnet PR3a, the server-as-CA). Additive.
+sha2 = { version = "0.10", features = ["oid"] }
+hkdf = "0.12"
+# HMAC-SHA-256 (RFC 2104) — Stripe webhook signature verification (D2). Rides the
+# digest-0.10 cohort (compatible with sha2 0.10 / hkdf 0.12).
+hmac = "0.12"
+aes-gcm = "0.10"
+aes-kw = "0.2"
+# `pkcs8` adds DER SubjectPublicKeyInfo encoding (the public-key fingerprint
+# preimage). `rand_core`/getrandom supplies the per-wrap ephemeral key. Both
+# ride the p256 0.13 cohort.
+p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8", "pem"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+# Envelope (de)serialization is bytes-on-the-wire (Envelope §1.6): the wrap
+# envelope JWK + base64url fields, the lowercase-hex fingerprint. `serde` for the
+# envelope structs; `base64`/`hex` for the field encodings.
+serde = { version = "1", features = ["derive"] }
+base64 = "0.22"
+hex = "0.4"
+# B4: JSON Canonicalization Scheme (RFC 8785 / JCS). The server-signed
+# verification response (Envelope §9), the transparency-log receipt (§10a), and
+# the attestation-ceremony operation-bound challenge all sign over
+# `JCS(json_object)` — so canonical JSON is now bytes-on-the-wire (not just a
+# caller/test concern), and `signet-crypto` owns the single canonicalization
+# impl shared by the server signer and the (B6) CLI verifier. `serde_json` is
+# promoted to a runtime dependency for this. `serde_jcs` is a thin RFC-8785
+# canonicalizer over `serde_json::Value`; it is KAT'd against the official JCS
+# test vectors in `tests/jcs.rs`.
+serde_json = "1"
+serde_jcs = "0.1"
+# Garnet PR3 (the server-as-CA): X.509 certificate + PKCS#10 CSR DER (de)serialization
+# and the certificate builder. RustCrypto — same ring-free lineage as the rest of the
+# crate (rcgen pulls `ring`; `openssl` would contaminate the differential oracle), and
+# it rides the der-0.7 / spki-0.7 / const-oid-0.9 cohort p256 0.13 already lives in.
+# Signing is delegated to the existing p256 ES256 key (`builder` feature); `pem` for the
+# PEM I/O the pickup endpoint returns. `hazmat` exposes `Profile::Manual` — the sanctioned
+# manual-profile path — so the self-signed deployment CA can pin BasicConstraints pathlen:0
+# (Profile::Root leaves the path length unconstrained); it adds no crypto, only profile
+# control, and the built profile is asserted by `ca_cert_has_the_ca_profile`.
+x509-cert = { version = "0.2", features = ["builder", "pem", "hazmat"] }
+# Garnet Phase-2 (the shared token verifier, `garnet_token`): the access-token `kid`/`grant_id`
+# are UUIDs, and `encode_signing_input` mints the log-correlation `jti` (v4). `v4` only — the
+# wire claims serialize as strings, so no `serde` feature is needed here.
+uuid = { version = "1", features = ["v4"] }
+# PQR Crypto Spec §4.6: the content-wrap combiner intermediates (Z, IKM, KEK) are
+# zeroized promptly after wrap/unwrap — both the classical Concat-KDF path and the
+# hybrid SP 800-227 KDM. Same major the CLI already uses for its keystore secrets.
+zeroize = "1"
+
+[dev-dependencies]
+# Differential-test oracle: OpenSSL (C; an independent codebase + lineage from
+# RustCrypto). Dev-only — never a dependency of the shipped crate.
+openssl = "0.10"

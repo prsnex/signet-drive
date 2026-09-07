@@ -1,0 +1,360 @@
+name: audit
+
+# Dependency-vulnerability audit (S062 review D2): cargo-audit (the RustSec advisory
+# DB) for the Rust workspace + npm audit for the web client. Runs on dependency-lock
+# changes AND on a schedule — a new advisory can be published against an unchanged
+# lockfile, so the schedule catches what a push/PR trigger alone cannot.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHAT THIS AUDITS, AND WHAT IT DOES NOT (S184 — write the empty column down)
+#
+# COVERED — two items, both keyed on PUBLISHED advisories:
+#   1. Rust dependency graph (Cargo.lock, all workspace members) vs the RustSec DB.
+#      FAILS on any vulnerability advisory WITH a fixed version that is not listed
+#      in `.cargo/audit.toml`. "unmaintained"/"unsound"/"yanked" are reported, not
+#      fatal.
+#   2. Web npm dependency graph (web/package-lock.json, prod + dev) vs the GitHub
+#      Advisory DB. FAILS on any HIGH/CRITICAL advisory not in
+#      `web/audit-baseline.txt`; moderate/low are reported below the gate.
+#   Both waiver files carry a written rationale per entry, and every applied waiver
+#   is PRINTED at runtime — waived, never hidden.
+#
+# ⚠ NOT COVERED — no check here looks at any of these, and a green run says
+# NOTHING about them:
+#   - PACKAGE AUTHENTICITY / PROVENANCE. Both databases only know about DISCLOSED
+#     defects. A freshly-poisoned package with no advisory filed passes clean.
+#     (Partial mitigations elsewhere: Actions are pinned to full commit SHAs, and
+#     lockfiles carry per-package checksums — neither is a provenance check.)
+#   - The DEPLOYED container's OS packages. We audit lockfiles in git, not the
+#     running image.
+#   - Drift between the lockfile and the deployed artifact.
+#   - Secrets committed to the repo.
+#   - LIVENESS OF THIS WORKFLOW ITSELF. The alarm below fires when a run FAILS; it
+#     cannot fire when a run never happens. GitHub disables scheduled workflows in
+#     repositories with no activity for 60 days, and nothing here would notice.
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/Cargo.lock'
+      - '**/Cargo.toml'
+      - 'web/package-lock.json'
+      - 'web/package.json'
+      - '.github/workflows/audit.yml'
+  pull_request:
+    paths:
+      - '**/Cargo.lock'
+      - '**/Cargo.toml'
+      - 'web/package-lock.json'
+      - 'web/package.json'
+      - '.github/workflows/audit.yml'
+  schedule:
+    # ⭐ THE FREQUENCY KNOB — this one line is the cadence control (S184).
+    #
+    # Mondays + Thursdays 06:17 UTC. Change the day list to change frequency:
+    #   '17 6 * * 1'      weekly      (the pre-S184 setting)
+    #   '17 6 * * 1,4'    2x weekly   (current)
+    #   '17 6 * * *'      daily
+    #
+    # ⚠ GitHub Actions cron schedules must be literal YAML — they cannot be driven
+    # by a repo variable or setting, so cadence is a one-line edit and nothing more
+    # clever is available. For an immediate run, use the workflow_dispatch button
+    # below rather than editing this.
+    #
+    # WHY A SCHEDULE AT ALL, and why it was too slow: a new advisory is published
+    # against an UNCHANGED lockfile, so neither the push nor the PR trigger fires —
+    # both are path-filtered to manifests. S183 is the worked example: `h2`
+    # RUSTSEC-2026-0258 landed on `main` and was invisible to every trigger; it
+    # surfaced only because a release PR happened to touch a lockfile. The schedule
+    # is the ONLY trigger that catches this class, which is why its period is the
+    # width of our exposure window.
+    - cron: '17 6 * * 1,4'
+
+  # On-demand run, no PR and no edit required — the "check right now" path.
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  # ⚠ Cancel ONLY superseded PR runs. A scheduled run must never be cancelled by a
+  # push to the same ref: a cancelled run is neither success nor failure, so it
+  # would silently skip the alarm below — reintroducing the exact silence this
+  # workflow exists to remove (S184). The event_name in the group key also keeps a
+  # scheduled run and a push run from colliding in the first place.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Least privilege, stated explicitly rather than inherited from the repo default.
+#
+# ⛔ `issues: write` is DELIBERATELY ABSENT here. It is needed by `alarm` and
+# `heartbeat`, and both declare it at JOB level — where a job-level block
+# overrides this one entirely. Granting it here instead did nothing for them and
+# leaked the scope to `cargo-audit` and `npm-audit`, which declare no block of
+# their own and so inherit this one — while running third-party code
+# (`cargo install`, `npm ci`) against a checkout that persists credentials.
+#
+# ⚠ The comment that stood here claimed the permission was "required by the
+# `alarm` job and by nothing else" — true of the REQUIREMENT and false of the
+# CONFIG, which handed it to four jobs. Least privilege was asserted in prose and
+# not implemented; the two are checked separately or not at all. (Gus, S185.)
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    name: cargo audit (RustSec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1 (ref no longer selects the toolchain; see with.toolchain)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Install from source rather than a third-party install action — same
+      # CI-supply-chain stance as ci.yml (no new marketplace action). `--locked`
+      # pins cargo-audit's own dependency versions; rust-cache makes reruns cheap.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      # Fails the job on a crate with a known vulnerability (a RustSec advisory with a
+      # fixed version). The advisory baseline present when this gate was introduced is
+      # ignored-with-rationale in `.cargo/audit.toml` (S063 D2; burn-down tracked on the
+      # Launch Punch-List), so this gate's live job is to fail on a NEWLY introduced
+      # advisory. Warnings (unmaintained / yanked) are reported, not fatal.
+      - name: cargo audit
+        run: cargo audit
+
+  npm-audit:
+    name: npm audit (web)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      # Fail only on high/critical advisories — moderate/low are common transitive
+      # noise in the JS ecosystem and would make the gate flap; raise the bar later.
+      #
+      # S137: this was a bare `npm audit --audit-level=high`, which had no way to
+      # express "known, justified, watched" — unlike the Rust side, which has had a
+      # disclosed baseline since S062 (`.cargo/audit.toml`). The moment a high
+      # advisory landed on a transitive DEV dependency we cannot move
+      # (brace-expansion, pinned under eslint@9 by minimatch@3 — every 1.x release
+      # is inside the advisory window, so npm's only remedy is a breaking
+      # eslint@10), the gate went permanently red and blocked every PR touching a
+      # manifest. A permanently red gate trains people to ignore it.
+      #
+      # The bar is NOT lowered: the script fails on every high/critical advisory
+      # absent from `web/audit-baseline.txt`, prints each waiver it applies with its
+      # rationale (waived, never hidden), and keys on each ADVISORY's own severity
+      # rather than npm's package counts — a package inherits its worst transitive
+      # severity, so one high advisory presents as "5 high" once minimatch, eslint
+      # and friends inherit it, which is exactly how S137 briefly mis-read two
+      # still-moderate runtime advisories as having crossed the threshold.
+      - run: ../infrastructure/scripts/npm-audit-gate.sh
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # THE ALARM (S184). Cadence shrinks the exposure window; only an alarm CLOSES it
+  # — a red run at 06:17 with nobody watching is still silent, and that silence is
+  # what let RUSTSEC-2026-0258 sit on `main` (S183).
+  #
+  # Fires ONLY for unattended triggers. A pull_request failure already has a human
+  # attached to it and needs no issue; schedule / workflow_dispatch / push-to-main
+  # do not.
+  #
+  # IDEMPOTENT BY CONSTRUCTION: one open issue per failing ref, commented on
+  # subsequent failures rather than re-created. A daily-new-issue alarm becomes
+  # noise, and noise trains people to ignore the gate — the same failure mode
+  # `web/audit-baseline.txt` exists to prevent.
+  #
+  # No new marketplace action: `gh` is preinstalled on GitHub runners, so this adds
+  # zero CI supply-chain surface (the stance stated in the cargo-audit job above).
+  # ─────────────────────────────────────────────────────────────────────────────
+  alarm:
+    name: alarm on unattended failure
+    needs: [cargo-audit, npm-audit]
+    # ⚠⚠ THE REPOSITORY GUARD IS A DISCLOSURE CONTROL, not tidiness (Gus, S184).
+    # This file is slated to EXPORT to the public repo, and these jobs post issues
+    # to whatever repository runs them. A public "⚠ Dependency audit FAILED" issue
+    # would ANNOUNCE AN UNPATCHED ADVISORY IN OUR DEPENDENCY GRAPH to the world,
+    # automatically, before we had fixed it.
+    #
+    # Written as EQUALS-the-private-repo, never not-equals-the-public-one: any repo
+    # that is not explicitly this one — a fork, a third repo, a rename — gets NO
+    # posting. Fail-safe by construction; a new repo cannot opt itself in silently.
+    # The audit jobs themselves still run everywhere, so a public tree keeps the
+    # transparency and loses only our internal alerting.
+    if: >-
+      github.repository == 'prsnex/signet-drive-private' &&
+      failure() &&
+      (github.event_name == 'schedule' ||
+       github.event_name == 'workflow_dispatch' ||
+       github.event_name == 'push')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open or update the audit-failure issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT: ${{ github.event_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          LABEL="audit-failure"
+          TITLE="⚠ Dependency audit FAILED on ${REF_NAME}"
+
+          # The label may not exist yet; creating it is idempotent enough for our
+          # purposes and must not fail the alarm if it is already there.
+          gh label create "$LABEL" \
+            --description "Automated: scheduled/unattended dependency audit failed" \
+            --color B60205 2>/dev/null || true
+
+          # ⚠ The heredoc body must stay indented to satisfy the YAML block scalar,
+          # but `cat <<EOF` PRESERVES that indentation — 10 leading spaces would
+          # render the whole issue as a Markdown code block. Piping through `sed`
+          # strips exactly the YAML indent while keeping intentional list nesting.
+          # (Piped rather than `sed -i`, whose in-place flag differs between GNU and
+          # BSD; this form is portable and needs no runner assumption.)
+          BODY_FILE="$(mktemp)"
+          cat <<EOF | sed 's/^          //' >"$BODY_FILE"
+          The dependency audit failed on a **${EVENT}** run — i.e. with nobody necessarily watching.
+
+          - **Run:** ${RUN_URL}
+          - **Ref:** \`${REF_NAME}\`
+          - **Triggered by:** \`${EVENT}\`
+
+          **What this means.** A crate or npm package in our dependency graph matches a
+          published advisory that is *not* in a waiver baseline. See the run log for the
+          specific advisory ID and package.
+
+          **What to do.**
+          1. Open the run above and read which advisory fired.
+          2. Either bump the dependency past the fixed version, **or** add the advisory to
+             \`.cargo/audit.toml\` (Rust) / \`web/audit-baseline.txt\` (npm) **with a written
+             rationale and a revisit condition**. Never waive silently.
+          3. Close this issue once the audit is green again.
+
+          ⚠ This issue is reused for repeat failures on this ref — new failures are added
+          as comments rather than new issues.
+          EOF
+
+          existing=$(gh issue list --label "$LABEL" --state open --limit 100 \
+                       --json number,title \
+                       --jq "[.[] | select(.title == \"${TITLE}\")] | .[0].number // empty")
+
+          if [ -n "$existing" ]; then
+            echo "Existing open alarm issue #${existing} — commenting rather than duplicating."
+            gh issue comment "$existing" --body "Audit failed again on a \`${EVENT}\` run: ${RUN_URL}"
+          else
+            echo "No open alarm issue for this ref — creating one."
+            gh issue create --title "$TITLE" --label "$LABEL" --body-file "$BODY_FILE"
+          fi
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # THE HEARTBEAT (S184). The alarm above fires on FAILURE; it cannot fire when a
+  # run never happens — and a workflow that has silently stopped is indistinguishable
+  # from one that keeps finding nothing. GitHub disables scheduled workflows after 60
+  # days of repository inactivity, so that is a real state, not a hypothetical.
+  #
+  # This posts ONE comment per unattended run, pass or fail, to a single long-lived
+  # "run log" issue. Subscribers to that issue get an email per run from GitHub
+  # itself — no SMTP credential, no marketplace action, no new supply-chain surface.
+  # Proof-of-life is the product; the result is carried along with it.
+  #
+  # ⚠ DELIBERATELY SEPARATE FROM THE ALARM. Routine "all clear" traffic sharing a
+  # channel with real alerts is how an alert stops being salient — the same failure
+  # mode `web/audit-baseline.txt` exists to prevent. Two issues, two volumes, two
+  # meanings: this one is boring by design, the alarm is not.
+  #
+  # `always()` is load-bearing: without it this job inherits the default
+  # success-only condition and would go silent in exactly the case worth reporting.
+  # ─────────────────────────────────────────────────────────────────────────────
+  heartbeat:
+    name: heartbeat (run log)
+    needs: [cargo-audit, npm-audit]
+    # ⚠⚠ Same repository guard as `alarm`, same reason — see its comment. The run
+    # log is OUR proof-of-life channel; a fork must not append to it, and a public
+    # repo must not grow a run-log issue of its own.
+    if: >-
+      github.repository == 'prsnex/signet-drive-private' &&
+      always() &&
+      (github.event_name == 'schedule' ||
+       github.event_name == 'workflow_dispatch' ||
+       github.event_name == 'push')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Append this run to the audit run log
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT: ${{ github.event_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CARGO_RESULT: ${{ needs.cargo-audit.result }}
+          NPM_RESULT: ${{ needs.npm-audit.result }}
+        run: |
+          set -euo pipefail
+
+          LABEL="audit-heartbeat"
+          TITLE="🔁 Dependency audit — run log"
+
+          if [ "$CARGO_RESULT" = "success" ] && [ "$NPM_RESULT" = "success" ]; then
+            VERDICT="✅ PASS"
+          else
+            VERDICT="❌ FAIL"
+          fi
+          STAMP="$(date -u '+%Y-%m-%d %H:%M UTC')"
+
+          COMMENT="**${VERDICT}** — ${STAMP} · \`${REF_NAME}\` · trigger \`${EVENT}\`
+          - cargo audit (RustSec): \`${CARGO_RESULT}\`
+          - npm audit (web): \`${NPM_RESULT}\`
+          - [run log](${RUN_URL})"
+          COMMENT="$(printf '%s\n' "$COMMENT" | sed 's/^          //')"
+
+          gh label create "$LABEL" \
+            --description "Automated: per-run dependency-audit heartbeat" \
+            --color 0E8A16 2>/dev/null || true
+
+          existing=$(gh issue list --label "$LABEL" --state open --limit 100 \
+                       --json number,title \
+                       --jq "[.[] | select(.title == \"${TITLE}\")] | .[0].number // empty")
+
+          if [ -n "$existing" ]; then
+            echo "Appending to run log #${existing}."
+            gh issue comment "$existing" --body "$COMMENT"
+          else
+            echo "No run log yet — creating it."
+            BODY_FILE="$(mktemp)"
+            cat <<EOF | sed 's/^          //' >"$BODY_FILE"
+          **This issue exists to be subscribed to. Leave it open.**
+
+          Every unattended run of the dependency audit appends one comment here — pass
+          or fail. Subscribe (right-hand sidebar) to receive an email per run.
+
+          **Why a heartbeat and not just an alarm.** The alarm issue fires only when the
+          audit FAILS. It cannot fire when the audit stops running, and a workflow that
+          has silently stopped looks exactly like one that keeps finding nothing. GitHub
+          disables scheduled workflows after 60 days of repository inactivity, so a
+          silent stop is a real state. **A gap in this log is itself the signal.**
+
+          Real failures also open a separate, louder issue labelled \`audit-failure\` —
+          this log is deliberately boring so that the alarm stays salient.
+
+          ---
+
+          ${COMMENT}
+          EOF
+            gh issue create --title "$TITLE" --label "$LABEL" --body-file "$BODY_FILE"
+          fi

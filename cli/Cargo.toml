@@ -1,0 +1,159 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 PRSN EX Inc.
+
+[package]
+name = "signet-cli"
+description = "Signet Drive command-line interface (the `signet` binary)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "signet_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "signet"
+path = "src/main.rs"
+
+[features]
+# F-DOWNGRADE(a) — the HARD-OFF gate (D2, Gus): re-opens the classical-only-
+# WRITE path (a wrap with no ML-KEM half). NEVER enabled in CI or a shipped
+# binary — the release `signet` contains no classical-write code at all
+# (cfg'd out, not branched around). Retained solely so a future v2 non-Mac
+# custody decision can re-open it deliberately, with full context, instead of
+# re-writing it. The classical crypto CODE (half of every hybrid op + the
+# whole read path) is not behind this gate and never was.
+classical-write = []
+
+[dependencies]
+# The CLI does no raw crypto: every primitive goes through `signet-crypto`, the
+# single validated chokepoint shared with the server. The CLI's job is the macOS
+# keystore + arg parsing + I/O + (later) HTTP. (One scoped exception: the hybrid
+# WRITER's ML-KEM encapsulation below — a public-key op with no keystore role.)
+signet-crypto = { path = "../crypto" }
+# The hybrid content-wrap WRITER (PQR §4.5, item 4/§9.2): encapsulating to a
+# RECIPIENT's ML-KEM-1024 key is a public-key operation — no Secure Enclave or
+# broker involvement — so the CLI runs it in-process with the same RustCrypto
+# crate the wasm module and the §11.2 differential tests pin. The recipient's
+# PRIVATE-key ops (decap) stay keystore-only. All platforms: the Linux
+# container binary uploads/wraps too.
+ml-kem = { version = "0.2", features = ["deterministic"] }
+# The `Encapsulate` trait ml-kem's encapsulation keys implement (the same
+# pre-release pin ml-kem 0.2.3 itself carries).
+kem = "=0.3.0-pre.0"
+# The SOFTWARE keystore's PQ ops (item 7a — promoted from the macOS-only
+# dev-dependency): the four-key enrollment PoP needs ml-dsa signing + ml-kem
+# decap on the dev/test tier too (the enroll orchestration test, the garnet
+# seed harness, the staging solo methodology). Custody unchanged — a real PRSN
+# is SE-only, enforced server-side; `software` never enrolls in production.
+ml-dsa = { version = "0.1", features = ["rand_core"] }
+# The host<->container delegation channel — the in-container delegation keystore
+# and the `signet host-signer` subcommand share this protocol crate
+# (wire + auth + transport).
+signet-channel = { path = "../channel" }
+# Arg parsing (CLI Spec v08 §"Out-of-scope": clap with derive macros).
+clap = { version = "4", features = ["derive"] }
+# Config file (~/.config/signet/config.toml) + structured output.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# Field encodings (fingerprints = lowercase hex; pubkeys / wrap blobs = base64url).
+hex = "0.4"
+base64 = "0.22"
+# OS CSPRNG for at-rest nonces + (PR2) DEKs; same rand_core cohort as the crypto crate.
+rand_core = { version = "0.6", features = ["getrandom"] }
+# Zeroize secret material (key scalars, KEKs, DEKs) on drop.
+zeroize = { version = "1", features = ["derive"] }
+# Parse UUID arguments to 16 bytes + mint v4 file ids for multipart uploads;
+# `serde` lets the `list` views serialize folder/file ids as strings under `--json`.
+uuid = { version = "1", features = ["v4", "serde"] }
+# Blocking HTTP client for the server-bound commands (attestation-verify /
+# transparency-verify / audit / update). rustls (no OpenSSL); sync — no async
+# runtime for a CLI.
+socket2 = "0.6"
+# bug060: PINNED, and the pin is load-bearing. This bug's entire mechanism lived
+# in ureq's internals — `timeout_write` is applied only inside DeadlineStream
+# (which we deliberately never activate, so no write bound existed), and
+# SO_RCVTIMEO is armed at connect and persists through a request body write. The
+# bucket transport was written against that exact behaviour. A silent minor bump
+# could change it with no visible signal, so bumps must re-run the transport's
+# fault-injection tests (cli/src/http.rs: put_presigned_* ) before landing.
+ureq = "=2.12.1"
+# Garnet Phase-2 (#3): the SE-broker's mutual-TLS listener (sync rustls — no tokio,
+# matching the CLI). `default-features = false` drops `tls12` (TLS 1.3 floor,
+# Auth-Core §5.2) and `ring` (the tree is deliberately ring-free; `aws_lc_rs` is the
+# provider, already in the workspace via the S3 SDK).
+# `prefer-post-quantum` (PQR item 10): X25519MLKEM768 becomes the FIRST default kx
+# group (without the flag it is offered-but-last, so the ClientHello key_share is
+# classical X25519 and that wins) — every rustls site in this crate (broker mTLS
+# both ends, the Garnet agent client, the http.rs agent) goes PQ-first with
+# automatic classical fallback.
+# bug060: rustls's buffer behaviour is part of the same analysis (both its
+# plaintext and sendable_tls buffers are bounded at 64 KiB, which is why
+# userspace parking could be ruled out as the stall mechanism). Deliberately NOT
+# exact-pinned — rustls is shared with 27 other dependents here, so an exact pin
+# would fracture the workspace on any of their bumps. The requirement is that a
+# bump re-verifies transport behaviour, not that it never happens.
+rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs", "prefer-post-quantum"] }
+# PQR item 10: http.rs builds its own rustls ClientConfig for ureq (ureq's internal
+# default hard-codes the *ring* provider, which has no ML-KEM). Same Mozilla trust
+# anchors as ureq's default; already in the workspace graph.
+webpki-roots = "1"
+# Garnet Phase-2 (#4): the broker parses the grant-status response's RFC3339 `server_time` (Auth-Core
+# §6, the trusted-time anchor) to unix seconds for the lease. `parsing` only — already in the tree.
+time = { version = "0.3", features = ["parsing"] }
+
+# macOS-only: the `secure_enclave` keystore backend (B6a PR4) talks to the
+# Security framework. Target-gated, so linux CI never compiles it (stays green);
+# the production macOS binary includes it. OSX_10_15 exposes the data-protection
+# keychain (where SE keys must live).
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3.7", features = ["OSX_10_15"] }
+security-framework-sys = { version = "2", features = ["OSX_10_15"] }
+core-foundation = "0.10"
+# The menu-bar status item (Launch-Punch-List §1-29): the always-on host-signer also
+# shows an LSUIElement NSStatusItem (no Dock icon / no window). AppKit via objc2 —
+# macOS-only, so the bundled static-Linux helper never links it. Per-class feature
+# flags keep the linked surface tight.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSTimer", "NSDate"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSResponder",
+    "NSStatusBar",
+    "NSStatusItem",
+    "NSStatusBarButton",
+    "NSMenu",
+    "NSMenuItem",
+    "NSButton",
+    "NSControl",
+    "NSView",
+    "NSAlert",
+    "NSTextField",
+    "NSPasteboard",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+# Integration tests spawn the built `signet` binary; these verify its crypto
+# output (integration test crates don't inherit the normal deps).
+signet-crypto = { path = "../crypto" }
+base64 = "0.22"
+serde_json = "1"
+uuid = "1"
+hex = "0.4"
+# The hybrid-crossover golden's fixture generator derives the recipient's
+# P-256 public key + JWK from its committed scalar (the RustCrypto cohort pin).
+p256 = "0.13"
+
+# macOS-only dev extras for the hardware differential tests (PQR Spec §11.2 —
+# SE sign ↔ RustCrypto verify). ml-kem + kem moved to regular [dependencies]
+# with the hybrid WRITER (item 4); ml-dsa followed at item 7a (the software
+# keystore's PQ ops). On real hardware the *private*-key PQ path remains the
+# Secure Enclave via the CryptoKit shim.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+rand_core = { version = "0.6", features = ["getrandom"] }

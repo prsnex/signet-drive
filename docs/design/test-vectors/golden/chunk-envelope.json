@@ -1,0 +1,11 @@
+{
+  "_comment": "GENERATED — do not hand-edit. Run `cd docs/design/test-vectors/gen && npm run gen:chunk`. §4.2 multipart chunk envelope via Node WebCrypto (HKDF-SHA-256 IV + AES-256-GCM). Consumed by crypto/tests/envelope.rs + web/src/lib/crypto/envelope.test.ts — a cross-impl reference (Rust + browser WebCrypto must match these bytes).",
+  "dek_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+  "file_id_hex": "00000000000040008000000000000111",
+  "chunk_index": 7,
+  "chunk_count": 10,
+  "is_last": false,
+  "plaintext_utf8": "chunk seven payload",
+  "iv_hex": "90ce866ff2e9d766cbe9a138",
+  "envelope_hex": "02010000000790ce866ff2e9d766cbe9a138cb72614d1b70f74e8c4d2b80dcc9ccdae871fab42841f8ee4ca374b6348cf1a20518d7"
+}

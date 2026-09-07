@@ -1,0 +1,69 @@
+# npm advisory baseline — the accepted-with-rationale set.
+#
+# WHY THIS EXISTS (S137). `cargo audit` has had a disclosed ignore baseline since
+# S062 (`.cargo/audit.toml`), whose own comment states the principle: **the gate's
+# real job is to FAIL on a newly-introduced advisory.** The npm gate had no
+# equivalent, so it could not distinguish "new" from "known, justified, watched" —
+# and the moment an advisory landed on a transitive dev dependency we cannot move,
+# it went permanently red and blocked every PR touching a manifest. A permanently
+# red gate trains everyone to ignore it, which is strictly worse than either
+# fixing or declaring. This file makes the npm side symmetric with the Rust side.
+#
+# THIS IS NOT A LOWERED BAR. `infrastructure/scripts/npm-audit-gate.sh` still fails
+# on every high/critical advisory that is NOT listed here, and it PRINTS each waiver
+# it applies — waived, never hidden (the same disclosure condition applied to the
+# public repo's leak waivers and to exporting `.cargo/audit.toml` itself).
+#
+# Format: one advisory per line — GHSA-id, then a rationale after `|`.
+# Anything else is a comment. Re-review this list whenever it changes.
+#
+# ── Accepted ──────────────────────────────────────────────────────────────────
+#
+# (empty — the set has no current members.)
+#
+# HISTORY: GHSA-mh99-v99m-4gvg (brace-expansion DoS, high) was waived here S137 as
+# dev-only-and-unprunable, then RESOLVED S158/v0.5.27 by a clean fix, not a waiver:
+# `npm update brace-expansion` moved both dev-tooling paths — eslint@9→minimatch@3
+# (1.1.16→1.1.18) and typescript-eslint→minimatch@10 (5.0.8→5.0.9) — off the
+# advisory window. The S137 rationale said "npm update moves nothing," which was
+# TRUE THEN (no patched 1.x release existed); a patched 1.1.18 shipped since, so the
+# same command now prunes it. The follow-up advisory GHSA-rgw5-rvv9-x895 (same
+# package, same paths) was resolved by the same update. Both fixes are non-breaking,
+# lint + svelte-check verified, and touch no runtime/bundle dependency. The gate's
+# own STALE-detection flagged the dead waiver — removed here. (Full rationale in git
+# at this file's S137 revision.)
+#
+# HISTORY: GHSA-5p4m-2wfm-xmqj (js-yaml, quadratic CPU in !!omap resolution,
+# CVE-2026-59870, high) surfaced S163 against an UNCHANGED lockfile — a newly
+# published advisory, not one any change of ours introduced, and it blocked every
+# PR from the moment it landed. RESOLVED by a clean fix, not a waiver: an
+# `overrides` pin to js-yaml ^4.3.1 in web/package.json.
+#
+# ⚠ THE TRAP, recorded because it cost real time: `npm update js-yaml` reports
+# "up to date" and moves NOTHING. 4.3.1 ships under the `v4-legacy` dist-tag while
+# `latest` is 5.2.3 — a major outside @eslint/eslintrc's ^4.1.1 — so npm will not
+# reach the patched version on its own and the fix must be named explicitly.
+# `npm audit fix` is also the wrong button here: it additionally moves
+# @sveltejs/kit, a bundle dependency, which §1-51 governs (see below).
+#
+# The single path is dev-only — eslint → @eslint/eslintrc → js-yaml, dev=true in
+# the lockfile — and the only YAML it parses is our own ESLint config, so there is
+# no attacker-controlled input. Verified before push: gate PASS (0 high/critical),
+# full web-ci green locally (check · lint · format:check · test · build), and the
+# built bundle's wasm hash UNCHANGED at 99b08c10 — the pin does not touch the
+# shipped artifact.
+#
+# ── Deliberately NOT listed (they are below the gate; §1-51 governs) ──────────
+#
+# GHSA-866w-xmhq-wj7x (@sveltejs/kit, moderate) · GHSA-wqjv-9729-c5q2
+# (@sveltejs/kit, moderate) · GHSA-pxg6-pf52-xh8x (cookie, low) — these do NOT
+# need waiving: the gate fails at high/critical only, and these sit below it,
+# exactly as punch-list §1-51 recorded. Listing them would falsely imply the gate
+# was catching them. §1-51 remains the owner of the kit-bump decision: the
+# vulnerable kit feature is remote functions, verified unused (S136), and kit is a
+# transparency-log-committed runtime bundle dependency, so its bump needs its own
+# PR with bundle re-verification.
+#
+# ⚠ If a kit/cookie advisory is ever re-scored to high, it does NOT belong here as
+# a waiver — it belongs in the §1-51 bump, because it would be a real runtime
+# exposure in the bundle we publish.

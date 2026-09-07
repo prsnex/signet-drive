@@ -1,0 +1,26 @@
+# leak-waivers.txt; the DISCLOSED baseline for the leak.hostnames check.
+# Stage-1 (signet-export.sh) and Stage-2 (stage2-reproof.sh) consume this file
+# identically; it exports to verify/leak-waivers.txt so a green check always
+# means "green against this published baseline", never "green modulo
+# undisclosed ignores".
+#
+# Format: path | class | rationale
+# Classes: staging-host, local-port, rfc1918, public-ip
+# An entry suppresses exactly its class in exactly its file; every other class
+# still fails there. Remove an entry when its reason no longer holds; the
+# gate re-fails on the next run. New entries need the check author (Gus) and
+# the tree owner (Hlin) both named in the rationale.
+
+cli/src/bucket_transport.rs | rfc1918 | is_local_host() boundary-classification fixtures in plaintext_warning_targets_only_genuinely_remote_hosts: the RFC1918 literals ARE the semantics under test (172.32.0.1 is the just-outside-172.16/12 negative); TEST-NET substitutes would invert the assertion. Decided Gus + Hlin, 2026-07-25.
+
+# ⛔ RATIONALES MUST NEVER QUOTE CLASS-MATCHING LITERALS: this file self-exports
+# to verify/leak-waivers.txt where the scanner reads it, and a waiver file cannot
+# waive itself (measured 2026-08-29 — a quoted fixture address tripped the very
+# class its entry waived; fourth instrument-as-own-subject instance that day).
+# Convention note (2026-08-29): public-repo CONTENT decisions are Chris + Gus
+# (governance amendment, 2026-08-29); new entries name the check author (Gus)
+# and the content owner (Chris). Hlin remains named on pre-amendment entries.
+
+infrastructure/scripts/signet-export.sh | staging-host | self-test negative-control fixture (st_host_infra): the string must match the class pattern or the arm proves nothing; it names no real host. Gus + Chris, 2026-08-29.
+infrastructure/scripts/signet-export.sh | local-port | self-test negative-control fixture: same reasoning; the port literal exists to trip the check under test. Gus + Chris, 2026-08-29.
+infrastructure/scripts/signet-export.sh | rfc1918 | self-test negative-control fixture: a reserved-range literal planted to prove the scanner fires; TEST-NET substitutes would not match the class under test. Gus + Chris, 2026-08-29.

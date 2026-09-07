@@ -1,0 +1,152 @@
+# export-allowlist.txt: the curated public subset of the Signet Drive tree.
+# Governed by OSP v017 ("What's open" + "Docs scope"). This file itself exports.
+#
+# Syntax: one entry per line.
+#   path/            include a directory (recursive, tracked files only)
+#   path             include a single file
+#   src => dest      include a file, renamed/relocated in the public tree
+#   ? path           optional: include when present; an ABSENT source is
+#                    reported loudly (optional-unmatched) but never fails the
+#                    gate (used for public editions and docs not yet authored;
+#                    reporting made real in tool 0.2.1 — 0.2.0 swallowed it)
+#   - path           exclude: prune from the export even if an include matched
+#   + path           re-include: a live-config FILE that survives the excludes.
+#                    Files only; the tool errors on a '+' directory. Use for
+#                    config we actually run (publishing THE file, not a copy;
+#                    a map here would publish a drifting copy; a false claim).
+# Comments (#) and blank lines are ignored.
+# The export tool records this file's sha256 in the gate verdict.
+
+## Workspace code: the client trust surface (everything a user must verify
+## runs client-side; the server only ever holds ciphertext)
+Cargo.toml
+Cargo.lock
+rust-toolchain.toml
+LICENSE
+cli/
+crypto/
+crypto-wasm/
+channel/
+web/
+# server/ and migrations/ are HELD BACK at launch (ruled by Chris, 2026-08-19):
+# the client surface publishes first; server code may be added by a later ruling.
+# Publishing later is trivial and retracting published code is impossible, so this
+# is the reversible direction. Public byte-verification accordingly covers the
+# client artifacts: the wasm module, the web bundle, and the CLI binary.
+
+## Reproducibility carve: the sole infrastructure/ exception (OSP §verification story)
+infrastructure/scripts/build-signet-release.sh
+infrastructure/scripts/linux-gate.sh
+# The export tool self-exports (watchers read the mechanism; §8 pin (b), Hlin-reviewed)
+? infrastructure/scripts/signet-export.sh
+? infrastructure/scripts/export-allowlist.txt
+# The DISCLOSED leak-check waiver baseline (path|class|rationale); published so
+# "green" always means "green against this baseline", never "modulo hidden ignores"
+? infrastructure/scripts/leak-waivers.txt => verify/leak-waivers.txt
+
+## CI definitions that travel (deploy workflows stay private)
+# ci.yml HELD BACK (ruled by Chris, 2026-08-19): it is server-coupled and would run
+# permanently red in the public tree; no public edition either. web-ci.yml disposition
+# pending his ruling (audited: no server coupling, would run green).
+.github/workflows/web-ci.yml
+.github/workflows/audit.yml
+# Public-only workflow, staged outside .github/ so it never runs in the
+# private repo; the repository guard inside it is the second layer.
+# Note: the export-push credential needs the workflow scope to push this.
+? public/github-workflows/close-external-prs.yml => .github/workflows/close-external-prs.yml
+? public/github-workflows/stage2-reproof.yml => .github/workflows/stage2-reproof.yml
+
+## Top-level public docs (authored as public artifacts; land via carve, then export)
+? SECURITY.md
+? CONTRIBUTING.md
+? CODE_OF_CONDUCT.md
+? TRADEMARKS.md
+# STYLE.md CUT (Chris, 2026-08-10, S008 root-docs scoping): internal prose rulebook with no
+# public function on a closed-contribution mirror; style.lint enforces it mechanically.
+? MAINTAINERS
+? CHANGELOG.md
+# The public README replaces the internal one at export time:
+? public/README.md => README.md
+# Curated public .gitignore (usability; the internal one stays private)
+? public/gitignore => .gitignore
+
+## Docs: Tier-1 only (OSP three-tier model; public editions, clean names)
+# Overview naming: provisionally ruled by Chris 2026-08-10 ("fine for now"); public name
+# is Overview, not 1Pager (internal vocabulary). One-line revert if he reverses.
+? docs/design/Signet-Drive-Overview-public.md => docs/design/Signet-Drive-Overview.md
+? docs/design/Signet-Drive-PQR-Crypto-Spec-public.md => docs/design/Signet-Drive-PQR-Crypto-Spec.md
+? docs/design/Signet-Drive-Envelope-Format-public.md => docs/design/Signet-Drive-Envelope-Format.md
+? docs/design/Signet-Drive-Transparency-Log-Spec-public.md => docs/design/Signet-Drive-Transparency-Log-Spec.md
+# Harness Contract for PRSNs: HELD OUT of the public export until PRSN integration is a public offering (Chris + Gus, 2026-09-06); the -public.md source stays in the tree.
+# docs/api/ CUT (Chris, 2026-08-10, S008 scope ruling): the live /api-docs page is
+# the one canonical API surface; the repo README points to it. No second copy, no
+# generator. Reverses Gus's earlier generate-from-source lean.
+
+# docs/operations/* CUT (Chris, 2026-08-10, S008 scope ruling): internal QA process
+# records do not ship. The automated test suites in the published crates (cli/tests,
+# crypto tests, web/e2e) are code and DO ship; the boundary is process records vs
+# runnable verification. Server-side suites left with server/ (held back, 2026-08-19).
+
+## Test vectors (assurance artifacts; the generator's vendored deps are pruned)
+docs/design/test-vectors/
+- docs/design/test-vectors/gen/node_modules/
+# acvp/ CUT (Chris accepted S007c in principle, confirmed 2026-08-10): 5.1 MB of
+# republished NIST data; the pointer + our differential-test results replace it
+# (that one-paragraph edit to the test-vectors README is Hlin's, staged via carve).
+- docs/design/test-vectors/acvp/
+# The vector PROSE ships as public editions (same pattern as the design docs;
+# 2026-08-19): the internal working docs stay private; the editions land via the
+# carve and export under clean names. golden/ and gen/ scripts ship unchanged.
+- docs/design/test-vectors/README.md
+- docs/design/test-vectors/gen/README.md
+- docs/design/test-vectors/01-hkdf-sha256-prf-derivation.md
+- docs/design/test-vectors/02-aes-256-gcm-roundtrips.md
+- docs/design/test-vectors/03-signet-v1-canonical-bytes.md
+- docs/design/test-vectors/04-empty-body-hash.md
+- docs/design/test-vectors/05-receipt-canonical-bytes.md
+- docs/design/test-vectors/06-verification-response-canonical-bytes.md
+- docs/design/test-vectors/07-pubkey-log-entry-hash.md
+- docs/design/test-vectors/08-transparency-log-leaf-hash.md
+- docs/design/test-vectors/09-transparency-log-internal-hash.md
+- docs/design/test-vectors/10-transparency-log-merkle-root.md
+? docs/design/test-vectors/README-public.md => docs/design/test-vectors/README.md
+? docs/design/test-vectors/gen/README-public.md => docs/design/test-vectors/gen/README.md
+? docs/design/test-vectors/01-hkdf-sha256-prf-derivation-public.md => docs/design/test-vectors/01-hkdf-sha256-prf-derivation.md
+? docs/design/test-vectors/02-aes-256-gcm-roundtrips-public.md => docs/design/test-vectors/02-aes-256-gcm-roundtrips.md
+? docs/design/test-vectors/03-signet-v1-canonical-bytes-public.md => docs/design/test-vectors/03-signet-v1-canonical-bytes.md
+? docs/design/test-vectors/04-empty-body-hash-public.md => docs/design/test-vectors/04-empty-body-hash.md
+? docs/design/test-vectors/05-receipt-canonical-bytes-public.md => docs/design/test-vectors/05-receipt-canonical-bytes.md
+? docs/design/test-vectors/06-verification-response-canonical-bytes-public.md => docs/design/test-vectors/06-verification-response-canonical-bytes.md
+? docs/design/test-vectors/07-pubkey-log-entry-hash-public.md => docs/design/test-vectors/07-pubkey-log-entry-hash.md
+? docs/design/test-vectors/08-transparency-log-leaf-hash-public.md => docs/design/test-vectors/08-transparency-log-leaf-hash.md
+? docs/design/test-vectors/09-transparency-log-internal-hash-public.md => docs/design/test-vectors/09-transparency-log-internal-hash.md
+? docs/design/test-vectors/10-transparency-log-merkle-root-public.md => docs/design/test-vectors/10-transparency-log-merkle-root.md
+
+## Verification surface: the verify tooling self-exports from its private home.
+## ('? verify/' matched nothing — the scripts live in infrastructure/scripts/ —
+## and 0.2.0 swallowed the warning; explicit REQUIRED maps replace it so an
+## absence is a copy.complete finding, not a silence. Measured: v0.5.58 dry-run.)
+infrastructure/scripts/verify-release.sh => verify/verify-release.sh
+infrastructure/scripts/verify-translog.sh => verify/verify-translog.sh
+infrastructure/scripts/verify-web-bundle.sh => verify/verify-web-bundle.sh
+
+## Never: belt-and-braces excludes (the deny-scan also enforces these)
+- .env
+- .env.example
+- .env.prod
+- .env.prod.example
+- docker-compose.yml
+- docker-compose.prod.yml
+- docker-compose.ovh.yml
+- README.md
+- prototypes/
+- target-gate/
+- .claude/
+- .cargo/
+- .config/
+
+## Live-config re-includes: named FILES that survive the excludes above
+## (decided Hlin 2026-07-25: publish the config the gate actually runs:
+## nextest's no-retry posture and the audit advisory baseline are trust claims)
++ .config/nextest.toml
++ .cargo/audit.toml

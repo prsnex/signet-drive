@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 PRSN EX Inc.
+
+[package]
+name = "signet-channel"
+description = "Signet Drive host<->container key-delegation channel (the containerized-PRSN host-signer protocol)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The channel does no raw crypto: the AEAD seal/open and the HKDF directional-key
+# derivation both go through `signet-crypto`, the single validated chokepoint
+# shared with the server + CLI. (CSPRNG nonce/secret draws use `rand_core::OsRng`
+# directly — the same convention as `signet-crypto::encname` and the CLI.)
+signet-crypto = { path = "../crypto" }
+# Message bodies are serde structs serialized to JSON, then AEAD-sealed before they
+# touch the (same-user-readable) channel folder. serde_json matches the workspace.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# base64url for the byte fields inside messages (pubkeys / signatures / Z).
+base64 = "0.22"
+# OS CSPRNG for per-message nonces + the per-PRSN secret; same rand_core cohort as
+# the crypto + cli crates.
+rand_core = { version = "0.6", features = ["getrandom"] }
+# Zeroize the per-PRSN secret + derived per-direction keys on drop.
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"

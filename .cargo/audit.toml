@@ -1,0 +1,21 @@
+# cargo-audit configuration — the dependency-advisory ignore set (S062-review D2).
+#
+# The gate's real job is to FAIL on a newly-introduced advisory. The S063 baseline
+# ignored 5 advisories; S064 burned that down — the `time` DoS (RUSTSEC-2026-0009)
+# and the 3 `rustls-webpki 0.101.7` cert-validation advisories (RUSTSEC-2026-0098/
+# 0099/0104) are now FIXED (the `time` >=0.3.47 bump + the aws-sdk-s3 TLS feature
+# surgery that drops the legacy rustls-0.21 connector), so they are removed from this
+# list and the gate enforces them again. Only `rsa` remains. Re-review this list
+# whenever it changes.
+
+[advisories]
+ignore = [
+    # rsa 0.9.10 — "Marvin Attack" timing side-channel (medium; NO upstream fix
+    # exists). NOT in any build graph: `cargo tree -i rsa -e all --target all` prints
+    # nothing. It is locked only as a transitive of `sqlx-mysql` — an OPTIONAL sqlx
+    # backend we do not enable (we use `postgres`) — so Cargo records it in the
+    # (feature-agnostic) lock but compiles it into none of our binaries. It cannot be
+    # pruned without dropping sqlx, and there is no fixed version to bump to; ignored
+    # with no real exposure. Revisit if a fix ships or sqlx restructures its backends.
+    "RUSTSEC-2023-0071",
+]

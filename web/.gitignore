@@ -1,0 +1,16 @@
+node_modules
+coverage
+dist
+build
+.svelte-kit
+test-results
+playwright-report
+*.log
+
+# inlang Paraglide: the generated message code (regenerated at prepare/build time
+# via compile:i18n + the Vite plugin) and inlang's transient project files (cache,
+# .meta.json, README) are ignored. Only settings.json is tracked; the message
+# catalogs live in messages/{locale}.json (tracked).
+src/lib/paraglide/
+project.inlang/*
+!project.inlang/settings.json
