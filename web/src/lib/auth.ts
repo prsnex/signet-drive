@@ -82,11 +82,26 @@ export async function verifySignupEmail(
   return { accountId: verified.account_id, handle: verified.handle };
 }
 
-/** Signup phase 2b: register a passkey, harvest its PRF output, generate + wrap
- *  the KEM keypair, initialize the account's key material, and return the
- *  session. Retry-safe after a cancelled or failed credential ceremony: it needs
- *  only the accountId, never the (already-consumed) verification token. */
-export async function registerSignupPasskey(deps: AuthDeps, accountId: string): Promise<Session> {
+/** The passkey created in signup phase 2b-i, carried to phase 2b-ii (the unlock).
+ *  Only what the local PRF assertion needs: the credential id to allow, and the
+ *  rp id the registration was made against. Nothing secret. */
+export interface SignupCredential {
+  credentialId: Bytes;
+  rpId?: string;
+}
+
+/** Signup phase 2b-i: register a passkey. One authenticator prompt
+ *  (`credentials.create()`), then `complete-registration`. Returns the created
+ *  credential's descriptor for phase 2b-ii.
+ *
+ *  bug244: split from the unlock so the page can put ITS OWN screen — and the
+ *  user's own click — between the two prompts, and so a failure after this point
+ *  retries the unlock alone. Retrying registration after a stored credential is
+ *  refused by the server (v1 is single-passkey), which was the lock-out. */
+export async function registerSignupCredential(
+  deps: AuthDeps,
+  accountId: string,
+): Promise<SignupCredential> {
   const { api, gateway } = deps;
 
   const reg = await api.beginRegistration(accountId);
@@ -99,19 +114,54 @@ export async function registerSignupPasskey(deps: AuthDeps, accountId: string): 
     ceremony_id: reg.ceremony_id,
     credential: serializeRegistrationResponse(created),
   });
+  return { credentialId: new Uint8Array(created.rawId), rpId: readRpId(reg.options) };
+}
 
-  // Harvest the new credential's PRF output via a locally-built assertion (not
-  // posted to the server — buildPrfAssertionOptions).
+/** Signup phase 2b-ii: unlock. One authenticator prompt (`credentials.get()` on
+ *  the passkey just created — a LOCAL assertion, never posted; see
+ *  buildPrfAssertionOptions) harvests its PRF output; then the hybrid KEM key
+ *  material is generated, wrapped under it, and initialised on the server.
+ *  Retry-safe: needs only the accountId and the credential descriptor; makes no
+ *  registration request. */
+export async function unlockSignupKeys(
+  deps: AuthDeps,
+  accountId: string,
+  credential: SignupCredential,
+): Promise<Session> {
+  const { api, gateway } = deps;
   const assertion = await gateway.get(
     buildPrfAssertionOptions({
-      credentialId: new Uint8Array(created.rawId),
+      credentialId: credential.credentialId,
       prfSaltValue: await prfSalt(),
-      rpId: readRpId(reg.options),
+      rpId: credential.rpId,
     }),
   );
   if (!assertion) throw new InvalidInputError('PRF assertion was cancelled');
-  const prfOutput = extractPrfFirst(assertion);
+  return initializeKeysFromPrf(api, accountId, extractPrfFirst(assertion), credential.credentialId);
+}
 
+/** Signup phase 2b, both halves back to back: register a passkey, harvest its
+ *  PRF output, generate + wrap the KEM keypair, initialize the account's key
+ *  material, and return the session. The `/verify` page drives the halves
+ *  separately (bug244); this composition serves callers that do not need the
+ *  interstitial. Retry-safe after a cancelled or failed credential ceremony: it
+ *  needs only the accountId, never the (already-consumed) verification token. */
+export async function registerSignupPasskey(deps: AuthDeps, accountId: string): Promise<Session> {
+  const credential = await registerSignupCredential(deps, accountId);
+  return unlockSignupKeys(deps, accountId, credential);
+}
+
+/** Generate the hybrid KEM key material, wrap it under the PRF-derived wrap key,
+ *  and initialise it on the server (set-once). Shared by the signup unlock and by
+ *  sign-in's finish-an-unfinished-signup path (bug244): the two arrive with the
+ *  same thing in hand — a PRF output from an assertion on the account's active
+ *  passkey — and must produce the same key material. */
+async function initializeKeysFromPrf(
+  api: SignetApi,
+  accountId: string,
+  prfOutput: Bytes,
+  credentialId: Bytes,
+): Promise<Session> {
   const wrapKey = await deriveWrapKey(prfOutput);
   const kem = await generateKemKeypair();
   // The hybrid PQ half (PQR §7): a fresh ML-KEM-1024 identity. The 64-byte
@@ -125,6 +175,8 @@ export async function registerSignupPasskey(deps: AuthDeps, accountId: string): 
   await api.keysInitialize({
     kem_pubkey: kemPubkeyX963,
     kem_pq_pubkey: kemPqPubkeyEk,
+    // bug245: bind the key material to the passkey that produced its wrap key.
+    credential_id: b64uEncode(credentialId),
     wrapped_kem_privkey_blob: blob,
   });
 
@@ -162,7 +214,19 @@ export async function signIn(deps: AuthDeps, email: string): Promise<Session> {
     credential: serializeAssertionResponse(assertion),
   });
   if (!result.wrapped_kem_privkey_blob || !result.kem_pubkey) {
-    throw new InvalidInputError('account has no initialized KEM key material');
+    // bug244: an UNFINISHED signup — the passkey exists (the server just verified
+    // an assertion on it) but the key material was never initialised, because
+    // the second signup prompt was dismissed. Sign-in holds exactly what the
+    // signup unlock holds — this passkey's PRF output — so finish here rather
+    // than refuse: the server's set-once initialise is the guard against a race
+    // with a concurrent unlock. This is the safety net under the /verify
+    // interstitial; there is no state a user can reach that leaves them locked out.
+    return initializeKeysFromPrf(
+      api,
+      result.account_id,
+      prfOutput,
+      new Uint8Array(assertion.rawId),
+    );
   }
 
   const wrappedKemPrivkeyBlob = result.wrapped_kem_privkey_blob as KemPrivkeyWrap;

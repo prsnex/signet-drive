@@ -86,6 +86,8 @@ test('walk every human-web screen and state', async ({ page, browser }) => {
   const token = verificationToken(email);
   await page.goto(`/verify?token=${token}`);
   await page.getByRole('button', { name: 'Create my passkey' }).click(); // bug062
+  // bug244: the second prompt sits behind its own screen; the user's click fires it.
+  await page.getByRole('button', { name: 'Continue to unlock' }).click();
   await expect(page.getByRole('heading', { name: 'Share folders' })).toBeVisible({
     timeout: 15_000,
   });

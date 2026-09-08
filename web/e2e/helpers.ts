@@ -134,6 +134,8 @@ export async function signUp(page: Page): Promise<{ handle: string; email: strin
   // bug062: the passkey ceremony is user-triggered now — the page explains the OS
   // credential dialog first, and the user's own click fires it.
   await page.getByRole('button', { name: 'Create my passkey' }).click();
+  // bug244: the second prompt sits behind its own screen; the user's click fires it.
+  await page.getByRole('button', { name: 'Continue to unlock' }).click();
 
   // Signed in → the file browser's sidebar renders once /v1/me + listing load.
   await expect(page.getByRole('heading', { name: 'Share folders' })).toBeVisible({

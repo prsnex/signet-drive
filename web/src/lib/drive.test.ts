@@ -437,6 +437,7 @@ class FakeDrive implements DriveApi {
       read_only: false,
       needs_activation: false,
       trial_card_added: false,
+      has_passkey: true,
       max_upload_size_bytes: 2_147_483_648,
     };
   }

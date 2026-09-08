@@ -4,7 +4,14 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { beforeAll, describe, expect, it } from 'vitest';
 import type { BeginResponse, SigninResponse, SignetApi, VerifyEmailResponse } from './api';
-import { completeSignup, registerSignupPasskey, signIn, type AuthDeps } from './auth';
+import {
+  completeSignup,
+  registerSignupCredential,
+  registerSignupPasskey,
+  signIn,
+  type AuthDeps,
+  unlockSignupKeys,
+} from './auth';
 import { b64uDecode, b64uEncode, hexDecode, hexEncode } from './crypto/bytes';
 import { deriveZ, generateEphemeralKeypair, importEcdhPublicX963 } from './crypto/ecdh';
 import { initMlkem, mlkemEncapsulate, mlkemDecapsulate } from './crypto/mlkem';
@@ -65,9 +72,9 @@ function mockGateway(): WebAuthnGateway {
 function fakeServer(): {
   api: SignetApi;
   captured: { signinCredential?: unknown };
-  store: { blob?: unknown; pubkey?: string; pqPubkey?: string };
+  store: { blob?: unknown; pubkey?: string; pqPubkey?: string; credentialId?: string };
 } {
-  const store: { blob?: unknown; pubkey?: string; pqPubkey?: string } = {};
+  const store: { blob?: unknown; pubkey?: string; pqPubkey?: string; credentialId?: string } = {};
   const captured: { signinCredential?: unknown } = {};
   const regOptions: BeginResponse = {
     ceremony_id: 'reg-1',
@@ -133,6 +140,7 @@ function fakeServer(): {
       store.blob = body.wrapped_kem_privkey_blob;
       store.pubkey = body.kem_pubkey;
       store.pqPubkey = body.kem_pq_pubkey;
+      store.credentialId = body.credential_id;
     },
     getPublicConfig: async () => ({ turnstile_sitekey: null }),
   };
@@ -218,9 +226,73 @@ describe('auth flows — keystone round-trip (mock authenticator + fake server)'
     expect(cred.clientExtensionResults?.prf).toBeUndefined();
   });
 
-  it('sign-in fails cleanly when no key material is initialized', async () => {
-    const { api } = fakeServer(); // store empty — no signup ran
+  it('bug244: sign-in FINISHES an unfinished signup — no key material → initialise it, and a second sign-in recovers the same key', async () => {
+    const { api, store } = fakeServer(); // store empty — the unlock never ran
     const deps: AuthDeps = { api, gateway: mockGateway() };
-    await expect(signIn(deps, 'alice@test.example')).rejects.toThrow();
+    expect(store.blob).toBeUndefined();
+
+    const first = await signIn(deps, 'alice@test.example');
+    expect(first.accountId).toBe('acct-1');
+    expect(store.blob).toBeDefined();
+    // bug245: the initialise names the passkey the assertion was made with.
+    expect(store.credentialId).toBe(b64uEncode(CREDENTIAL_ID));
+    expect(store.pubkey).toBe(first.kemPubkeyX963);
+    expect(store.pqPubkey).toBe(first.kemPqPubkeyEk);
+
+    const second = await signIn(deps, 'alice@test.example');
+    expect(second.kemPubkeyX963).toBe(first.kemPubkeyX963);
+    expect(second.kemPqPubkeyEk).toBe(first.kemPqPubkeyEk);
+    expect(hexEncode(second.mlkemSeed)).toBe(hexEncode(first.mlkemSeed));
+  });
+
+  it('bug244: a cancelled unlock retries the unlock ALONE — zero further registration requests', async () => {
+    const { api, store } = fakeServer();
+    let beginRegistrationCalls = 0;
+    let completeRegistrationCalls = 0;
+    const countingApi: SignetApi = {
+      ...api,
+      beginRegistration: async (id) => {
+        beginRegistrationCalls += 1;
+        return api.beginRegistration(id);
+      },
+      completeRegistration: async (id, body) => {
+        completeRegistrationCalls += 1;
+        return api.completeRegistration(id, body);
+      },
+    };
+    // The authenticator cancels the FIRST assertion (the user dismissed the second
+    // prompt), then answers the retry.
+    const real = mockGateway();
+    let gets = 0;
+    const gateway: WebAuthnGateway = {
+      create: real.create,
+      get: async (options) => {
+        gets += 1;
+        if (gets === 1) return null;
+        return real.get(options);
+      },
+    };
+    const deps: AuthDeps = { api: countingApi, gateway };
+
+    const credential = await registerSignupCredential(deps, 'acct-1');
+    expect(hexEncode(credential.credentialId)).toBe(hexEncode(CREDENTIAL_ID));
+    expect(beginRegistrationCalls).toBe(1);
+    expect(completeRegistrationCalls).toBe(1);
+    expect(store.blob).toBeUndefined();
+
+    await expect(unlockSignupKeys(deps, 'acct-1', credential)).rejects.toThrow(/cancelled/);
+    expect(store.blob).toBeUndefined();
+
+    const session = await unlockSignupKeys(deps, 'acct-1', credential);
+    expect(session.accountId).toBe('acct-1');
+    expect(store.blob).toBeDefined();
+    expect(store.credentialId).toBe(b64uEncode(CREDENTIAL_ID));
+    expect(gets).toBe(2);
+    expect(beginRegistrationCalls).toBe(1);
+    expect(completeRegistrationCalls).toBe(1);
+
+    // And the key the unlock wrapped is the one sign-in recovers.
+    const signedIn = await signIn({ api: countingApi, gateway: real }, 'alice@test.example');
+    expect(signedIn.kemPubkeyX963).toBe(session.kemPubkeyX963);
   });
 });

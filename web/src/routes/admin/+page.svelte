@@ -54,7 +54,7 @@
   // ⚠ The headers are disabled while `accountsDone` is false, so this can never
   // rank a partial list. Three-state toggle (asc → desc → unsorted) and the
   // arrow/`.sort` markup follow FileList.svelte, the house precedent.
-  type SortCol = 'name' | 'email' | 'type' | 'status' | 'paid' | 'comp';
+  type SortCol = 'name' | 'email' | 'type' | 'status' | 'paid' | 'setup' | 'comp';
 
   const sortCols: { key: SortCol; label: () => string }[] = [
     { key: 'name', label: () => m.admin_col_account() },
@@ -62,6 +62,7 @@
     { key: 'type', label: () => m.admin_col_type() },
     { key: 'status', label: () => m.admin_col_status() },
     { key: 'paid', label: () => m.admin_col_paid_until() },
+    { key: 'setup', label: () => m.admin_col_setup() },
     { key: 'comp', label: () => m.admin_col_comp() },
   ];
 
@@ -96,6 +97,11 @@
         break;
       case 'paid':
         c = a.paid_until - b.paid_until;
+        break;
+      // bug244: unfinished first under asc, so the rows an operator must act on
+      // surface together.
+      case 'setup':
+        c = Number(a.keys_initialized) - Number(b.keys_initialized);
         break;
       case 'comp':
         c = Number(a.active_grant !== null) - Number(b.active_grant !== null);
@@ -138,9 +144,11 @@
   let grantNote = $state('');
   let grantGb = $state<number | null>(null);
   let extendDays = $state(365);
+  let deleteHandle = $state('');
 
   $effect(() => {
     const d = store.dialog;
+    if (d?.kind === 'delete') deleteHandle = '';
     if (d?.kind === 'editConfig') configValue = d.entry.value;
     if (d?.kind === 'grant') {
       grantDays = 365;
@@ -395,6 +403,9 @@
               <span>{a.account_type}</span>
               <span>{a.status}</span>
               <span>{formatDate(a.paid_until)}</span>
+              <span class:unfinished={!a.keys_initialized}
+                >{a.keys_initialized ? '—' : m.admin_setup_unfinished()}</span
+              >
               <span>{a.active_grant ? m.admin_comped() : '—'}</span>
               <span class="acct-actions">
                 {#if a.active_grant}
@@ -407,6 +418,11 @@
                 {:else}
                   <button class="ghost sm" onclick={() => store.openGrant(a)}
                     >{m.admin_grant_comp()}</button
+                  >
+                {/if}
+                {#if a.account_type === 'human' && a.status === 'active' && !a.admin_role}
+                  <button class="danger-text sm" onclick={() => store.openDelete(a)}
+                    >{m.admin_delete()}</button
                   >
                 {/if}
               </span>
@@ -556,6 +572,37 @@
       >
       <button class="danger" onclick={() => store.revoke(a)} disabled={store.busy}
         >{m.admin_revoke()}</button
+      >
+    {/snippet}
+  </Modal>
+{:else if store.dialog?.kind === 'delete'}
+  {@const a = store.dialog.account}
+  {@const handle = a.handle ?? ''}
+  <Modal title={m.admin_delete_title()} onClose={() => store.closeDialog()}>
+    <p class="hint">
+      {m.admin_delete_hint_1()} <strong>{handle || a.account_id}</strong>
+      {m.admin_delete_hint_2()}
+    </p>
+    <p class="hint">{m.admin_delete_hint_3()}</p>
+    <label class="lbl" for="delete-handle">{m.admin_delete_confirm_label()}</label>
+    <input
+      id="delete-handle"
+      class="field"
+      type="text"
+      autocomplete="off"
+      bind:value={deleteHandle}
+      disabled={store.busy}
+    />
+    {#if store.error}<p class="dialog-error">{store.error}</p>{/if}
+    {#snippet footer()}
+      <button class="ghost" onclick={() => store.closeDialog()} disabled={store.busy}
+        >{m.admin_cancel()}</button
+      >
+      <button
+        class="danger"
+        onclick={() => store.deleteAccount(a, deleteHandle.trim())}
+        disabled={store.busy || !handle || deleteHandle.trim() !== handle}
+        >{m.admin_delete_confirm()}</button
       >
     {/snippet}
   </Modal>
@@ -712,7 +759,7 @@
   .acct-head,
   .acct-row {
     display: grid;
-    grid-template-columns: 1.6fr 2fr 0.7fr 0.9fr 1fr 0.8fr 1.4fr;
+    grid-template-columns: 1.6fr 2fr 0.7fr 0.9fr 1fr 0.9fr 0.8fr 1.4fr;
     align-items: center;
     gap: 0.75rem;
     padding: 0.6rem 0.9rem;
@@ -759,6 +806,11 @@
   .email {
     color: var(--muted);
     overflow-wrap: anywhere;
+  }
+  /* bug244: the one cell an operator must act on reads as a warning, not a dash. */
+  .acct-row .unfinished {
+    color: var(--danger, #b42318);
+    font-weight: 500;
   }
   .acct-row {
     border-bottom: 1px solid var(--border);

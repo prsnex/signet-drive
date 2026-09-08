@@ -46,6 +46,7 @@ describe('api client', () => {
       createApiClient({ fetch: f204 }).keysInitialize({
         kem_pubkey: 'x',
         kem_pq_pubkey: 'y',
+        credential_id: 'Y29mZmVl',
         wrapped_kem_privkey_blob: {},
       }),
     ).resolves.toBeUndefined();

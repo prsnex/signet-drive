@@ -28,6 +28,7 @@ export type AdminDialog =
   | { kind: 'grant'; account: AdminAccount }
   | { kind: 'extend'; account: AdminAccount }
   | { kind: 'revoke'; account: AdminAccount }
+  | { kind: 'delete'; account: AdminAccount }
   | null;
 
 export class AdminStore {
@@ -216,6 +217,10 @@ export class AdminStore {
     this.dialog = { kind: 'revoke', account };
     this.error = '';
   }
+  openDelete(account: AdminAccount): void {
+    this.dialog = { kind: 'delete', account };
+    this.error = '';
+  }
   closeDialog(): void {
     this.dialog = null;
     this.error = '';
@@ -263,6 +268,16 @@ export class AdminStore {
     if (!grant) return;
     await this.run(async () => {
       await this.deps.api.revokeGrant(grant.grant_id);
+      await this.reloadAccounts();
+    });
+  }
+
+  /** v1.0.3: delete a human account from the dashboard. The typed handle travels
+   *  to the server, which is the guard; the dialog only enables the button once it
+   *  matches, so a mistyped confirmation never leaves the browser as a request. */
+  async deleteAccount(account: AdminAccount, confirmationHandle: string): Promise<void> {
+    await this.run(async () => {
+      await this.deps.api.deleteAccount(account.account_id, confirmationHandle);
       await this.reloadAccounts();
     });
   }

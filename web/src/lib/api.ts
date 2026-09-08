@@ -189,6 +189,10 @@ export interface SignetApi {
     /** The ML-KEM-1024 encapsulation key (1568 B, base64url) — the PQ half of
      *  the hybrid KEM directory pair (PQR §7; accounts.kem_pq_pubkey). */
     kem_pq_pubkey: string;
+    /** bug245: the WebAuthn credential id (base64url) of the passkey whose PRF
+     *  derived the wrap key. The server commits the key material only if that
+     *  passkey is ACTIVE for the account. */
+    credential_id: string;
     wrapped_kem_privkey_blob: unknown;
   }): Promise<void>;
   /** Public runtime config served by the env-agnostic image (Option C): the
@@ -451,6 +455,10 @@ export interface MeResponse {
    *  (S135). The billing section hides "Add a card to extend" once true — a carded
    *  trial cannot re-extend (one-time bound), only upgrade. False otherwise. */
   trial_card_added: boolean;
+  /** bug244: true when an ACTIVE passkey exists. With `kem_pubkey_fingerprint`
+   *  null it separates the two unfinished-signup states: no passkey yet (resume
+   *  registration) vs a passkey and no keys (finish at sign-in). */
+  has_passkey: boolean;
   /** The server's current single-file upload ceiling in bytes
    *  (system_config.max_upload_size_bytes). The upload UI reads it to guard file
    *  size + message, so a runtime bump takes effect without a client redeploy. */
@@ -1060,6 +1068,9 @@ export interface AdminAccount {
   created_at: number;
   paid_until: number;
   active_grant: ActiveGrant | null;
+  /** bug244: false while a human account has no key material — signup never
+   *  finished; the account cannot sign in and holds no data. Always true for PRSNs. */
+  keys_initialized: boolean;
 }
 
 export interface ListAdminAccountsResponse {
@@ -1093,6 +1104,13 @@ export interface AdminApi {
   createGrant(body: CreateGrantBody): Promise<Grant>;
   extendGrant(grantId: string, durationDays: number): Promise<Grant>;
   revokeGrant(grantId: string): Promise<Grant>;
+  /** v1.0.3: an operator puts a HUMAN account into the deletion pipeline — the
+   *  holder's own deletion with a second actor. Refused for PRSNs, admins, a human
+   *  who guards a PRSN, a wrong confirmation handle, or a non-active account. */
+  deleteAccount(
+    accountId: string,
+    confirmationHandle: string,
+  ): Promise<{ account_id: string; status: string; pending_deletion_at: number }>;
 }
 
 export interface ApiOptions {
@@ -1574,6 +1592,12 @@ export function createApiClient(
       }),
     revokeGrant: (grantId) =>
       request<Grant>('DELETE', `/v1/admin/grants/${encodeURIComponent(grantId)}`),
+    deleteAccount: (accountId, confirmationHandle) =>
+      request<{ account_id: string; status: string; pending_deletion_at: number }>(
+        'POST',
+        `/v1/admin/accounts/${encodeURIComponent(accountId)}/delete`,
+        { confirmation_handle: confirmationHandle },
+      ),
   };
 }
 
