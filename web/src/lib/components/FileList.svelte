@@ -10,7 +10,7 @@
   // never a bare date. A modified time is not a deadline, so the caller moves and
   // the helper stays.
   import { formatBytes, formatDateTime, formatElapsed } from '$lib/format';
-  import { uploadPhase, showUploadBar } from '$lib/upload-phase';
+  import { uploadPhase, showUploadBar, uploadInFlightNote } from '$lib/upload-phase';
   import { tooltip } from '$lib/tooltip';
   import { m } from '$lib/paraglide/messages.js';
   import { IconFolder } from '$lib/components/icons';
@@ -425,6 +425,10 @@
          both statically, because the render-level promise ("no bar, no percent")
          cannot be proven by a unit test of the decision alone. -->
       {@const showBar = showUploadBar(p)}
+      <!-- F3: the in-flight note is a pure function of transfer state too: nothing,
+         a neutral count, or count + MEASURED rate + "about N left" — the rate only
+         once a part has completed on this Drive (the bootstrap seed never shows). -->
+      {@const inflight = uploadInFlightNote(p)}
       <div class="transfer-progress" role="status" aria-live="polite">
         <div class="transfer-progress-label">
           {#if p.paused}
@@ -455,6 +459,34 @@
                part refused with `503 relay-at-capacity` is exactly the case a user
                cannot otherwise distinguish from a hang. That is bug075's own defect,
                reintroduced by the change meant to fix it. -->
+            {#if inflight.kind === 'neutral'}
+              <!-- F3: parts are being sent and nothing has completed yet on this Drive
+                 (or a rate is not yet a fact): the COUNT is true, so say only that.
+                 This is the two-minute silence of a single 16 MiB first part, made
+                 legible without inventing a rate. -->
+              <span class="part-note"
+                >{m.filelist_upload_inflight({
+                  count: inflight.inFlight,
+                  total: inflight.total,
+                })}</span
+              >
+            {:else if inflight.kind === 'measured'}
+              <span class="part-note"
+                >{m.filelist_upload_inflight_measured({
+                  count: inflight.inFlight,
+                  total: inflight.total,
+                  mbps: inflight.mbps,
+                  eta: formatElapsed(inflight.etaSeconds * 1000),
+                })}</span
+              >
+            {/if}
+            {#if p.suspensions > 0}
+              <!-- F4: the page was suspended with parts in flight (display sleep, a
+                 hidden tab) and the transfer resumed on wake — a fact, stated. -->
+              <span class="part-note"
+                >{m.filelist_upload_suspended_resumed({ count: p.suspensions })}</span
+              >
+            {/if}
             {#if p.totalParts > 1 && p.completedParts > 0}
               <!-- bug075 §5.1: honest DETERMINATE progress at part granularity — on a
                  slow link the byte bar can sit at 0% for a whole first part while

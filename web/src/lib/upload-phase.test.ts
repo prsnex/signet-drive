@@ -27,7 +27,12 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
-import { showUploadBar, uploadPhase, type UploadPhaseInput } from './upload-phase';
+import {
+  showUploadBar,
+  uploadPhase,
+  type UploadPhaseInput,
+  uploadInFlightNote,
+} from './upload-phase';
 
 describe('bug075 item 1 — the readout derives from transfer state, never a clock', () => {
   // ── (a) the decision, against the shape the real path emits ────────────────
@@ -97,5 +102,72 @@ describe('bug075 item 1 — the readout derives from transfer state, never a clo
     // phase strings for `encrypting` and `starting` must carry no `pct`.
     expect(uploadBlock).not.toMatch(/filelist_upload_encrypting\([^)]*pct/);
     expect(uploadBlock).not.toMatch(/filelist_upload_starting\([^)]*pct/);
+  });
+});
+
+describe('F3 — the in-flight note is a fact or nothing (2026-09-21)', () => {
+  const base = { totalParts: 4, inFlightParts: 0, measuredRateBytesPerSec: null, etaSeconds: null };
+
+  it('says nothing when no part is in flight', () => {
+    expect(uploadInFlightNote(base)).toEqual({ kind: 'none' });
+    expect(
+      uploadInFlightNote({ ...base, measuredRateBytesPerSec: 1_000_000, etaSeconds: 10 }),
+    ).toEqual({
+      kind: 'none',
+    });
+  });
+
+  it('stays NEUTRAL until a rate is a measurement — a count, no rate, no ETA', () => {
+    // The seeded case, which used to be the null case: the transfer layer reports
+    // `measuredRateBytesPerSec: null` while the governor holds only the bootstrap
+    // seed, so a rate cannot be printed by construction.
+    expect(uploadInFlightNote({ ...base, inFlightParts: 1 })).toEqual({
+      kind: 'neutral',
+      inFlight: 1,
+      total: 4,
+    });
+    expect(
+      uploadInFlightNote({ ...base, inFlightParts: 4, measuredRateBytesPerSec: 0, etaSeconds: 0 }),
+    ).toEqual({ kind: 'neutral', inFlight: 4, total: 4 });
+  });
+
+  it('prints count · measured Mbps · about-N-left once a part has been measured', () => {
+    // 125,000 B/s measured (a 1.0 Mbps stream), 100 s of plaintext left.
+    expect(
+      uploadInFlightNote({
+        ...base,
+        inFlightParts: 1,
+        measuredRateBytesPerSec: 125_000,
+        etaSeconds: 100,
+      }),
+    ).toEqual({ kind: 'measured', inFlight: 1, total: 4, mbps: 1, etaSeconds: 100 });
+    // One decimal, never more: 337,500 B/s = 2.7 Mbps.
+    const note = uploadInFlightNote({
+      ...base,
+      inFlightParts: 4,
+      measuredRateBytesPerSec: 337_500,
+      etaSeconds: 7,
+    });
+    expect(note.kind).toBe('measured');
+    if (note.kind === 'measured') expect(note.mbps).toBe(2.7);
+  });
+
+  it('the component renders the note from this decision, and the XHR upload-progress event is never read', () => {
+    const component = readFileSync(
+      fileURLToPath(new URL('./components/FileList.svelte', import.meta.url)),
+      'utf8',
+    );
+    const uploadBlock = component.slice(
+      component.indexOf('{#if browser.uploadProgress}'),
+      component.indexOf('{#if browser.downloadProgress}'),
+    );
+    expect(uploadBlock).toContain('{@const inflight = uploadInFlightNote(p)}');
+    expect(uploadBlock).not.toMatch(/onprogress/);
+    // And in the transport itself: `xhr.upload.onprogress` may appear only inside
+    // the bug060 comment that explains why it must not be used — never in code.
+    const api = readFileSync(fileURLToPath(new URL('./api.ts', import.meta.url)), 'utf8');
+    const mentions = api.split('\n').filter((line) => line.includes('upload.onprogress'));
+    expect(mentions.length).toBeGreaterThan(0);
+    for (const line of mentions) expect(line.trim().startsWith('//')).toBe(true);
   });
 });

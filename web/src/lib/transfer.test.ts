@@ -374,21 +374,73 @@ describe('TransferGovernor (bug060)', () => {
   it('sizes parts to the target duration and never below the storage floor', () => {
     const g = new TransferGovernor();
     g.observePart(6 * MB, 8000); // ~0.75 MB/s, the measured Starlink path
-    const size = g.partSize(500 * MB, 16 * MB, 10_000);
+    const size = g.partSize(500 * MB, 10_000);
     expect(size).toBeGreaterThanOrEqual(5 * MB);
     expect(size).toBeLessThanOrEqual(64 * MB);
     // Even a dire link must not produce a sub-floor part: object storage rejects
     // those only at completion, after the whole file has been uploaded.
     const dire = new TransferGovernor();
     dire.observePart(1 * MB, 60_000);
-    expect(dire.partSize(100 * MB, 16 * MB, 10_000)).toBe(5 * MB);
+    expect(dire.partSize(100 * MB, 10_000)).toBe(5 * MB);
+  });
+
+  it("F1: with nothing measured yet, plans at the FLOOR — a fresh page's first 20 MB file is 4 parts, not 2", () => {
+    // The Drive's first file is planned BEFORE the bootstrap seed and before any
+    // part has completed, so `rateEst` is null here. It used to fall back to the
+    // caller's 16 MiB default: one 16 MiB stream carrying 82% of a 20 MB file,
+    // measured 2:10 on the travel link against ~50 s once the rate was known.
+    const fresh = new TransferGovernor();
+    expect(fresh.rateEstimate).toBeNull();
+    const twentyMB = 20_000_000;
+    const size = fresh.partSize(twentyMB, 10_000);
+    expect(size).toBe(5 * MB);
+    expect(Math.ceil(twentyMB / size)).toBe(4);
+    // The bound, named: a fresh page's first file of ANY size plans at the floor
+    // (a 10 GB first file is ~2,000 parts, under the 10,000 cap).
+    expect(fresh.partSize(10 * 1024 * MB, 10_000)).toBe(5 * MB);
+    expect(Math.ceil((10 * 1024 * MB) / (5 * MB))).toBeLessThanOrEqual(10_000);
+    // And the floor is the served knob, not a literal: a served part_min_bytes
+    // of 8 MiB plans 8 MiB parts with nothing measured.
+    const served = new TransferGovernor({ ...DEFAULT_GOVERNOR_KNOBS, partMinBytes: 8 * MB });
+    expect(served.partSize(twentyMB, 10_000)).toBe(8 * MB);
+  });
+
+  it('F1: once a part is measured, sizing follows rate × target seconds again (unchanged behaviour)', () => {
+    const g = new TransferGovernor();
+    g.observePart(5 * MB, 2000); // 2.5 MiB/s × 10 s = 25 MiB, inside the clamp
+    expect(g.partSize(500 * MB, 10_000)).toBe(Math.floor(((5 * MB) / 2000) * 1000 * 10));
+  });
+
+  it('F1: with nothing measured, a file too big for the floor still enlarges to fit the part-count ceiling', () => {
+    // 100 GB at 5 MiB would be ~20,480 parts; the planner must enlarge from the
+    // floor exactly as it enlarges from a measured size.
+    const fresh = new TransferGovernor();
+    const fileSize = 100 * 1024 * MB;
+    const size = fresh.partSize(fileSize, 10_000);
+    expect(size).toBeGreaterThan(5 * MB);
+    expect(Math.ceil(fileSize / size)).toBeLessThanOrEqual(10_000);
+    expect(size + MULTIPART_CHUNK_OVERHEAD).toBeLessThanOrEqual(64 * MB);
+  });
+
+  it('F3: `measured` is false until a part completes — the bootstrap seed never counts as a measurement', () => {
+    const g = new TransferGovernor();
+    expect(g.measured).toBe(false);
+    g.seedBootstrap(125_000);
+    // The seed is a stall-ceiling constant: the estimate exists, the measurement does not.
+    expect(g.rateEstimate).toBe(125_000);
+    expect(g.measured).toBe(false);
+    // A non-credible observation (below MIN_CREDIBLE_RATE) does not count either.
+    g.observePart(10, 60_000);
+    expect(g.measured).toBe(false);
+    g.observePart(5 * MB, 2000);
+    expect(g.measured).toBe(true);
   });
 
   it('enlarges parts so a huge file still fits the part-count ceiling', () => {
     const g = new TransferGovernor();
     g.observePart(1 * MB, 10_000);
     const fileSize = 100 * 1024 * MB; // 100 GB
-    const size = g.partSize(fileSize, 16 * MB, 10_000);
+    const size = g.partSize(fileSize, 10_000);
     expect(Math.ceil(fileSize / size)).toBeLessThanOrEqual(10_000);
   });
 
@@ -401,10 +453,10 @@ describe('TransferGovernor (bug060)', () => {
     // once the governor's learned rate pushed `base` past the clamp.
     const g = new TransferGovernor();
     g.observePart(64 * MB, 1000); // 64 MB/s — any fast link; clamp must bind
-    const size = g.partSize(10 * 1024 * MB, 16 * MB, 10_000);
+    const size = g.partSize(10 * 1024 * MB, 10_000);
     expect(size + MULTIPART_CHUNK_OVERHEAD).toBeLessThanOrEqual(64 * MB);
     // And the `needed`-to-fit-maxParts branch must obey the same bound.
-    const enlarged = g.partSize(100 * 1024 * MB, 16 * MB, 1_700);
+    const enlarged = g.partSize(100 * 1024 * MB, 1_700);
     expect(enlarged + MULTIPART_CHUNK_OVERHEAD).toBeLessThanOrEqual(64 * MB);
   });
 

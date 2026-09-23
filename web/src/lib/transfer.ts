@@ -147,6 +147,13 @@ export function governorKnobsFromResponse(response: {
  *  completed part into an EWMA, halve on every stall). */
 export class TransferGovernor {
   private rateEst: number | null = null;
+  /** F3 (2026-09-21): parts that have COMPLETED on this governor and been folded
+   *  into the estimate. Until it is > 0, `rateEst` is null or the bootstrap
+   *  SEED — a stall-ceiling constant (125,000 B/s), not a measurement of the
+   *  link — and the panel must not show it as a rate. Gus's catch at design
+   *  review: a panel reading the governor "state only" would have printed
+   *  "~1.0 Mbps measured" on a 9 Mbps link. */
+  private observedParts = 0;
   /** 3a-i (S175): the estimate's epoch, advanced on every halving. Each attempt
    *  stamps the epoch it started under (`generation`); a stall penalises only if
    *  the epoch is unchanged since — so one link event tripping N concurrent
@@ -175,6 +182,13 @@ export class TransferGovernor {
     return this.rateEst;
   }
 
+  /** F3: true once at least one part has completed and been measured on THIS
+   *  governor. `rateEstimate` is a measurement of the link only when this is
+   *  true; before that it is null or the bootstrap seed. */
+  get measured(): boolean {
+    return this.observedParts > 0;
+  }
+
   /** Seed from a conservative bootstrap. Unlike the CLI — whose rate-free gap
    *  detector is complete without any estimate — the web has no other detector,
    *  so its first part MUST have some ceiling. A deliberately pessimistic seed
@@ -191,6 +205,7 @@ export class TransferGovernor {
     if (bytes <= 0 || elapsedMs <= 0) return;
     const observed = (bytes / elapsedMs) * 1000;
     if (observed < MIN_CREDIBLE_RATE) return;
+    this.observedParts += 1;
     this.rateEst = this.rateEst === null ? observed : ALPHA * observed + (1 - ALPHA) * this.rateEst;
   }
 
@@ -225,15 +240,32 @@ export class TransferGovernor {
    *  and enlarged if necessary so the file fits `maxParts`.
    *
    *  Load-bearing on this surface: part duration sets dead-flow detection
-   *  latency, because the ceiling is the only detector XHR permits. */
-  partSize(fileSize: number, defaultSize: number, maxParts: number): number {
+   *  latency, because the ceiling is the only detector XHR permits.
+   *
+   *  ⭐ F1 (2026-09-21, from Chris's travel uploads): with NO measurement yet
+   *  (`rateEst === null`, i.e. before this Drive's first observed part) the plan
+   *  is the FLOOR, `partMinBytes`, by rule. It used to be the caller's 16 MiB
+   *  default, so a fresh page's first 20 MB file went as one 16 MiB part on ONE
+   *  stream — 2:10 measured against ~50 s for the same file once the rate was
+   *  known, and the two-minute silence that produced a cancel. Four 5 MiB parts
+   *  engage the fan-out from the first byte. The bound, named: a fresh page's
+   *  first file of ANY size plans at 5 MiB parts (a 10 GB first file is ~2,000
+   *  parts, each paying the relay's per-part reads, milliseconds against minutes
+   *  of transfer); the second file re-plans from the measured rate as before.
+   *  ⚠ NOT "seed before planning": the bootstrap seed is a stall-ceiling
+   *  constant (125,000 B/s) that would reach the floor only by the coincidence
+   *  of two constants tuned for other jobs (125,000 × 10 s = 1.25 MB, clamped).
+   *  A rule that does not depend on that coincidence is the fix. */
+  partSize(fileSize: number, maxParts: number): number {
     // bug192: `partMaxBytes` is a WIRE limit; this method sizes PLAINTEXT. The
     // clamp must land at the converted maximum, never at the served value —
     // a part sized AT `partMaxBytes` seals to `partMaxBytes + 34` and the relay
     // refuses it (413 at part 1). `maxPlaintextPerPart` is the one conversion.
     const maxPlain = maxPlaintextPerPart(this.knobs.partMaxBytes);
     const base =
-      this.rateEst === null ? defaultSize : Math.floor(this.rateEst * this.knobs.targetPartSeconds);
+      this.rateEst === null
+        ? this.knobs.partMinBytes
+        : Math.floor(this.rateEst * this.knobs.targetPartSeconds);
     let size = Math.min(maxPlain, Math.max(this.knobs.partMinBytes, base));
     if (maxParts > 0) {
       const needed = Math.ceil(fileSize / maxParts);

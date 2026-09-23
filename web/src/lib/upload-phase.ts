@@ -59,3 +59,44 @@ export function uploadPhase(p: UploadPhaseInput): UploadPhase {
 export function showUploadBar(p: UploadPhaseInput): boolean {
   return p.completedParts > 0;
 }
+
+/**
+ * F3 (2026-09-21) — the IN-FLIGHT note: what may be said about parts that are being
+ * sent right now, derived only from transfer state.
+ *
+ * ⭐ THE PROPERTY, extended: a RATE is a fact only once a part has COMPLETED and been
+ * measured on this Drive. Before that the governor holds the bootstrap SEED, a
+ * stall-ceiling constant, and printing it as "measured" would be an invented number
+ * (Gus's catch at design review). So the note has exactly three shapes: nothing
+ * (no part in flight), a NEUTRAL count (parts in flight, no rate, no ETA), or the
+ * measured line (count · rate · "about N left"). The count is a count, never which
+ * part numbers — with fan-out and retries the numbers are not contiguous.
+ */
+export interface UploadInFlightInput {
+  totalParts: number;
+  inFlightParts: number;
+  /** `null` until a part has completed and been measured on this Drive. */
+  measuredRateBytesPerSec: number | null;
+  etaSeconds: number | null;
+}
+
+export type UploadInFlightNote =
+  | { kind: 'none' }
+  | { kind: 'neutral'; inFlight: number; total: number }
+  | { kind: 'measured'; inFlight: number; total: number; mbps: number; etaSeconds: number };
+
+export function uploadInFlightNote(p: UploadInFlightInput): UploadInFlightNote {
+  if (p.inFlightParts <= 0) return { kind: 'none' };
+  const inFlight = p.inFlightParts;
+  const total = p.totalParts;
+  if (
+    p.measuredRateBytesPerSec === null ||
+    !(p.measuredRateBytesPerSec > 0) ||
+    p.etaSeconds === null
+  ) {
+    return { kind: 'neutral', inFlight, total };
+  }
+  // Mbps to one decimal: what a person compares with a speed test.
+  const mbps = Math.round(((p.measuredRateBytesPerSec * 8) / 1_000_000) * 10) / 10;
+  return { kind: 'measured', inFlight, total, mbps, etaSeconds: Math.max(0, p.etaSeconds) };
+}

@@ -183,13 +183,20 @@ class FakeDrive implements DriveApi {
       // every existing upload test — including the resume and stall-injection
       // cases that REBUILD THE QUEUE mid-flight — exercises the PIPELINED path.
       // A staleness bug then surfaces in tests that already exist.
-      governor: { upload_prepare_ahead: this.uploadPrepareAheadServed },
+      governor: {
+        upload_prepare_ahead: this.uploadPrepareAheadServed,
+        concurrency_upload: this.uploadConcurrencyServed,
+      },
     };
   }
 
   /** What the server serves as upload seal-ahead (S174). 1 = the seeded value;
    *  0 exercises the retraction position. */
   uploadPrepareAheadServed: number | undefined = 1;
+  /** F4: what the server serves as upload send concurrency. `undefined` keeps
+   *  every existing test on the serial path (the resolver's off-position); the
+   *  fan-out tests set 4. */
+  uploadConcurrencyServed: number | undefined = undefined;
 
   /** bug047 fault injection: part_number → how many of its next PUT attempts
    *  stall (each consumed attempt throws StallError, the real watchdog's
@@ -240,7 +247,10 @@ class FakeDrive implements DriveApi {
       // every existing upload test — including the resume and stall-injection
       // cases that REBUILD THE QUEUE mid-flight — exercises the PIPELINED path.
       // A staleness bug then surfaces in tests that already exist.
-      governor: { upload_prepare_ahead: this.uploadPrepareAheadServed },
+      governor: {
+        upload_prepare_ahead: this.uploadPrepareAheadServed,
+        concurrency_upload: this.uploadConcurrencyServed,
+      },
     };
   }
 
@@ -794,6 +804,196 @@ describe('Drive (data-plane crypto orchestration)', () => {
     expect(Array.from(downloaded)).toEqual(Array.from(content));
   });
 
+  it('F4: a page suspension with parts in flight — the errors land BEFORE the visibility event, and no stored part is re-sent', async () => {
+    // The record (09-17/18, three suspensions): the four in-flight PUTs' bytes
+    // reached storage, the page froze before their 200s arrived, and on wake
+    // they surfaced as network errors and were re-sent — 4 × 5 MiB per wake.
+    // The order of those errors against `visibilitychange` is the browser's;
+    // this test takes the harder order: the errors FIRST, the visibility event
+    // after. The retries must park, the wake must refresh from the server's
+    // `uploaded_parts`, and the four stored parts must NOT be re-sent.
+    api.uploadConcurrencyServed = 4;
+    const realPutPart = api.putPart.bind(api);
+    const realResume = api.resumeMultipart.bind(api);
+    try {
+      const chunked = new Drive(api, session, 8);
+      const folder = await chunked.createFolder('Sleep');
+      const content = utf8Encode('the quick brown fox jumps over the lazy dog'); // 43 bytes -> 6 parts
+      const controller = new UploadController();
+      const putCalls = new Map<number, number>();
+      const sequence: string[] = [];
+      let hiddenSet = false;
+      api.putPart = async (...args: Parameters<typeof api.putPart>) => {
+        const n = Number(args[0].split('/part/')[1]);
+        putCalls.set(n, (putCalls.get(n) ?? 0) + 1);
+        sequence.push(`put:${n}`);
+        if (n <= 4 && putCalls.get(n) === 1) {
+          // Stored on the server, then the page is suspended before the 200
+          // reaches the script: on wake the connection is gone.
+          await realPutPart(...args);
+          await new Promise((r) => setTimeout(r, 5)); // let all four workers enter
+          if (!hiddenSet) {
+            hiddenSet = true;
+            controller.setVisibility(false);
+          }
+          throw new SignetApiError(0, 'network', 'connection lost while the page was suspended');
+        }
+        return realPutPart(...args);
+      };
+      api.resumeMultipart = async (...args: Parameters<typeof api.resumeMultipart>) => {
+        sequence.push('resume');
+        return realResume(...args);
+      };
+      const reports: number[] = [];
+      const done = chunked.uploadFile(
+        { folderId: folder.folder_id, rootFolderId: folder.folder_id, shareFolder: false },
+        'sleep.txt',
+        new Blob([content]),
+        (p) => reports.push(p.suspensions),
+        controller,
+      );
+      // While hidden: the four retries do NOT park (fold 1). Each sees the page
+      // was hidden during its attempt, so ONE refresh runs (shared), the four
+      // stored parts are skipped, and the batch carries on — no re-send.
+      await new Promise((r) => setTimeout(r, 40));
+      expect(controller.isVisible).toBe(false);
+      for (const n of [1, 2, 3, 4]) expect(putCalls.get(n)).toBe(1);
+      // Wake (in the real browser this may land before or after those errors;
+      // here it lands after, the harder order).
+      controller.setVisibility(true);
+      const file = await done;
+      // The refresh ran exactly once for this hide, before any PUT after it;
+      // parts 1–4 were sent exactly once (never re-sent); 5 and 6 once each.
+      const resumeAt = sequence.indexOf('resume');
+      expect(resumeAt).toBeGreaterThan(0);
+      expect(
+        sequence
+          .slice(resumeAt + 1)
+          .filter((s) => ['put:1', 'put:2', 'put:3', 'put:4'].includes(s)),
+      ).toEqual([]);
+      for (const n of [1, 2, 3, 4, 5, 6]) expect(putCalls.get(n)).toBe(1);
+      expect(sequence.filter((s) => s === 'resume')).toHaveLength(1);
+      expect(Math.max(...reports)).toBe(1); // one suspension, counted once, stated to the panel
+      expect(file.size_bytes).toBeGreaterThan(content.length);
+      const reader = new Drive(api, session);
+      expect(Array.from(await reader.downloadFile(file.file_id))).toEqual(Array.from(content));
+    } finally {
+      api.putPart = realPutPart;
+      api.resumeMultipart = realResume;
+      api.uploadConcurrencyServed = undefined;
+    }
+  });
+
+  it('F4 (third arm): hidden but only throttled — a NON-stored part fails and its retry proceeds with no visibility event', async () => {
+    // Gus, fold 1: a background tab that is merely throttled must keep
+    // re-sending on its own. The page hides with a part in flight; that part
+    // genuinely fails (nothing stored); the retry refreshes once (the server
+    // reports nothing for it) and sends it again — without anyone looking.
+    const realPutPart = api.putPart.bind(api);
+    const realResume = api.resumeMultipart.bind(api);
+    try {
+      const chunked = new Drive(api, session, 8);
+      const folder = await chunked.createFolder('Throttled');
+      const content = utf8Encode('the quick brown fox jumps over the lazy dog'); // 6 parts, serial
+      const controller = new UploadController();
+      let resumes = 0;
+      const putCalls = new Map<number, number>();
+      api.putPart = async (...args: Parameters<typeof api.putPart>) => {
+        const n = Number(args[0].split('/part/')[1]);
+        putCalls.set(n, (putCalls.get(n) ?? 0) + 1);
+        if (n === 3 && putCalls.get(3) === 1) {
+          controller.setVisibility(false); // hidden while part 3 is in flight
+          throw new SignetApiError(0, 'network', 'dropped, nothing stored');
+        }
+        return realPutPart(...args);
+      };
+      api.resumeMultipart = async (...args: Parameters<typeof api.resumeMultipart>) => {
+        resumes += 1;
+        return realResume(...args);
+      };
+      const reports: number[] = [];
+      const file = await chunked.uploadFile(
+        { folderId: folder.folder_id, rootFolderId: folder.folder_id, shareFolder: false },
+        'throttled.txt',
+        new Blob([content]),
+        (p) => reports.push(p.suspensions),
+        controller,
+      );
+      expect(controller.isVisible).toBe(false); // nobody looked; the upload finished anyway
+      expect(putCalls.get(3)).toBe(2); // sent, failed, sent again
+      expect(resumes).toBe(1); // one refresh for the hidden interval
+      for (const n of [1, 2, 4, 5, 6]) expect(putCalls.get(n)).toBe(1);
+      expect(file.size_bytes).toBeGreaterThan(content.length);
+    } finally {
+      api.putPart = realPutPart;
+      api.resumeMultipart = realResume;
+    }
+  });
+
+  it('F4 (hidden start): a batch begun while the page is hidden counts its wake', async () => {
+    // Gus, fold 2: no hide transition ever happens, so the controller must
+    // start from the document's state; shown with parts in flight, that is a
+    // wake — counted once, refreshed once.
+    const realPutPart = api.putPart.bind(api);
+    const realResume = api.resumeMultipart.bind(api);
+    try {
+      const chunked = new Drive(api, session, 8);
+      const folder = await chunked.createFolder('HiddenStart');
+      const content = utf8Encode('the quick brown fox jumps over the lazy dog');
+      const controller = new UploadController();
+      controller.initVisibility(false);
+      let resumes = 0;
+      api.putPart = async (...args: Parameters<typeof api.putPart>) => {
+        await new Promise((r) => setTimeout(r, 15));
+        return realPutPart(...args);
+      };
+      api.resumeMultipart = async (...args: Parameters<typeof api.resumeMultipart>) => {
+        resumes += 1;
+        return realResume(...args);
+      };
+      const reports: number[] = [];
+      const done = chunked.uploadFile(
+        { folderId: folder.folder_id, rootFolderId: folder.folder_id, shareFolder: false },
+        'hidden-start.txt',
+        new Blob([content]),
+        (p) => reports.push(p.suspensions),
+        controller,
+      );
+      await new Promise((r) => setTimeout(r, 20)); // a part is in flight
+      controller.setVisibility(true);
+      await done;
+      expect(Math.max(...reports)).toBe(1);
+      expect(resumes).toBe(1);
+    } finally {
+      api.putPart = realPutPart;
+      api.resumeMultipart = realResume;
+    }
+  });
+
+  it('F1: a FRESH Drive plans its first file at the 5 MiB floor — 20 MB is 4 parts, and the initiate declares it', async () => {
+    // Before F1 a fresh page's first file was planned at the 16 MiB default and a
+    // 20 MB file went as one 16 MiB stream (2:10 measured on the travel link, the
+    // cancel that produced bug F3). The planner is what `uploadFile` calls, and
+    // the initiate body is what the server stores, so both are asserted.
+    const fresh = new Drive(api, session);
+    expect(fresh.uploadPlan(20_000_000)).toMatchObject({
+      chunkSize: 5 * 1024 * 1024,
+      chunkCount: 4,
+    });
+    // A real upload of 6 MiB: two parts at the floor, declared to the server.
+    const folder = await fresh.createFolder('First');
+    const content = new Uint8Array(6 * 1024 * 1024);
+    content[0] = 7;
+    const file = await fresh.uploadFile(
+      { folderId: folder.folder_id, rootFolderId: folder.folder_id, shareFolder: false },
+      'first.bin',
+      new Blob([content]),
+    );
+    const stored = await api.getDownloadUrl(file.file_id);
+    expect(stored.chunk_size).toBe(5 * 1024 * 1024);
+    expect(stored.multipart_chunks).toBe(2);
+  });
+
   // ⭐ KNOB RULE 4 (bug178, S174): the retraction position must produce IDENTICAL
   // bytes, not merely "work". This is the 2 a.m. path — an operator sets the knob
   // to 1 and the product must behave exactly as it did before S174.
@@ -1038,12 +1238,37 @@ describe('Drive (data-plane crypto orchestration)', () => {
     const folder = await chunked.createFolder('Prog');
     const content = utf8Encode('the quick brown fox jumps over the lazy dog'); // 43 bytes -> 6 chunks
     const calls: Array<[number, number, number, number]> = [];
+    // F3: the in-flight count and the MEASURED rate ride the same reports. The
+    // fake bucket answers instantly, which would make every observed rate
+    // non-credible (0 ms) and `measured` never true; a 3 ms delay per part keeps
+    // the timing real without slowing the suite.
+    const realPutPart = api.putPart.bind(api);
+    api.putPart = async (...args: Parameters<typeof api.putPart>) => {
+      await new Promise((r) => setTimeout(r, 3));
+      return realPutPart(...args);
+    };
+    const f3: Array<[number, number | null, number | null]> = [];
     await chunked.uploadFile(
       { folderId: folder.folder_id, rootFolderId: folder.folder_id, shareFolder: false },
       'p.txt',
       new Blob([content]),
-      (p) => calls.push([p.completedParts, p.totalParts, p.sentBytes, p.totalBytes]),
+      (p) => {
+        calls.push([p.completedParts, p.totalParts, p.sentBytes, p.totalBytes]);
+        f3.push([p.inFlightParts, p.measuredRateBytesPerSec, p.etaSeconds]);
+      },
     );
+    api.putPart = realPutPart;
+    // F3: the first report has nothing in flight and NO rate (the bootstrap seed
+    // never leaks as a measurement); a report exists with a part in flight before
+    // any part completed and still no rate; the last report has nothing in flight
+    // and a measured rate with a zero ETA.
+    expect(f3[0]).toEqual([0, null, null]);
+    const silentStretch = f3.findIndex((r, i) => r[0] > 0 && calls[i][0] === 0);
+    expect(silentStretch).toBeGreaterThan(0);
+    expect(f3[silentStretch][1]).toBeNull();
+    expect(f3.at(-1)?.[0]).toBe(0);
+    expect(f3.at(-1)?.[1]).not.toBeNull();
+    expect(f3.at(-1)?.[2]).toBe(0);
     // The initial 0-state, then a tick per landed part: completedParts climbs
     // to 6 and sentBytes tracks accounted plaintext (8 per full part, 3 for
     // the last), never regressing, never past totalBytes (bug046: the bar is

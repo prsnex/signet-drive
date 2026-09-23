@@ -74,9 +74,15 @@ import {
 // stores this label verbatim in files.algorithm.
 const FILE_ALGORITHM = 'A256GCM';
 
-// Default per-chunk plaintext size for the §4.2 multipart transport (16 MB). Every
-// upload goes through multipart (the unified path); a file at or under one chunk is
-// a 1-part upload. Overridable per Drive so tests exercise multi-chunk without
+// ⚠ F1 (2026-09-21): this constant is now a SENTINEL, not a part size. A Drive
+// constructed without an explicit chunk size gets this value, and
+// `explicitChunkSize` is defined as "the caller passed something else" — that is
+// the only thing it governs. Production part sizes come from
+// `TransferGovernor.partSize`: the 5 MiB floor before any part has been measured
+// on this Drive, then `rate × target_part_seconds` clamped. Before F1 the value
+// was also the plan for a fresh page's first file (one 16 MiB stream for a 20 MB
+// file — the two-minute upload that produced a cancel); no production path plans
+// with it any more. Overridable per Drive so tests exercise multi-chunk without
 // large fixtures.
 const DEFAULT_CHUNK_SIZE = 16 * 1024 * 1024;
 
@@ -352,6 +358,27 @@ export interface UploadProgress {
    *  user to act, which is the bug075 shape (a frozen bar a person cannot read
    *  as either healthy or broken) with a wrong instruction added on top. */
   waitingForCapacitySeconds: number | null;
+  /** F3 (2026-09-21): parts whose PUT is in flight right now — a COUNT, never
+   *  which part numbers (with fan-out and retries the numbers are not
+   *  contiguous, and a claim about numbers could be false). Lets the panel say
+   *  something true during the silent stretch a single big part used to be:
+   *  the two minutes of "nothing" that produced Chris's cancel on 09-17. */
+  inFlightParts: number;
+  /** F3: the governor's link estimate, bytes/s, ONLY once a part has completed
+   *  and been measured on this Drive; `null` before that. ⛔ Never the bootstrap
+   *  seed: that is a stall-ceiling constant, and showing it as a rate would be
+   *  an invented number in the wrong direction (Gus). */
+  measuredRateBytesPerSec: number | null;
+  /** F3: remaining plaintext ÷ the measured rate, whole seconds; `null`
+   *  whenever the rate is. An estimate labelled "about", derived from
+   *  completed parts only — never from `xhr.upload.onprogress` (bug060). */
+  etaSeconds: number | null;
+  /** F4 (2026-09-21): times this file's transfer was paused by a PAGE
+   *  SUSPENSION (display sleep, a hidden tab) with parts in flight and then
+   *  resumed. A fact the panel may state; measured three times in one evening
+   *  batch on 09-17/18, each pausing the batch silently until the tab was
+   *  visible again. */
+  suspensions: number;
 }
 
 /** Live download progress (bug061): reported per fetched-and-decrypted chunk —
@@ -506,6 +533,35 @@ export class UploadController {
   get cancelled(): boolean {
     return this.cancelRequested;
   }
+
+  // F4 (2026-09-21): page visibility, as the store reports it. The transfer
+  // layer has no `document`; the store forwards `visibilitychange`.
+  private visible = true;
+  /** Drive-internal: uploadFile installs this to learn of each transition. */
+  onVisibility: ((visible: boolean) => void) | null = null;
+
+  /** The store calls this once, right after construction, with the document's
+   *  CURRENT state — a batch begun while the page is hidden (files picked, tab
+   *  switched before the first part lands) has no hide transition to learn
+   *  from, and without this it would never count its wake (Gus, fold 2). No
+   *  transition is signalled. */
+  initVisibility(visible: boolean): void {
+    this.visible = visible;
+  }
+
+  /** Called by the store on every `visibilitychange`. Nothing waits on this:
+   *  retries decide from "was the page hidden during my attempt" (see
+   *  uploadFile), so a background tab that is merely throttled keeps sending
+   *  and re-sending on its own. */
+  setVisibility(visible: boolean): void {
+    if (visible === this.visible) return;
+    this.visible = visible;
+    this.onVisibility?.(visible);
+  }
+
+  get isVisible(): boolean {
+    return this.visible;
+  }
 }
 
 /** Parse a UUID string into its 16 raw bytes — the form used in the §7.3 name AAD
@@ -658,7 +714,7 @@ export class Drive {
   } {
     const chunkSize = this.explicitChunkSize
       ? this.chunkSize
-      : this.governor.partSize(plaintextSize, this.chunkSize, MAX_PARTS);
+      : this.governor.partSize(plaintextSize, MAX_PARTS);
     const chunkCount = Math.max(1, Math.ceil(plaintextSize / chunkSize));
     return {
       chunkSize,
@@ -821,17 +877,40 @@ export class Drive {
     // hook — which `transfer.ts` has always fired and nothing has ever consumed
     // — and cleared the moment bytes move again.
     let waitingForCapacitySeconds: number | null = null;
+    // F3: a count of PUTs in flight, maintained at the two send sites below.
+    let inFlightParts = 0;
+    // F4: page suspensions, and the wake's refresh (the barrier a retry awaits
+    // before re-sending). `hideEpoch` advances on every hide transition; an
+    // attempt stamps the epoch it started under, so a retry can tell whether
+    // the page was hidden at any point during the attempt that failed.
+    let suspensions = 0;
+    let hideEpoch = 0;
+    let lastRefreshedEpoch = -1;
+    let countedEpoch = -1;
+    let wakeRefresh: Promise<void> | null = null;
     const report = (paused = false) => {
       let doneBytes = 0;
       for (const partNumber of etags.keys()) doneBytes += plainSize(partNumber);
+      const sentBytes = Math.min(totalBytes, doneBytes);
+      // F3: the rate is a fact only once a part has completed on this Drive;
+      // the governor's `measured` flag is what keeps the bootstrap seed out.
+      const measuredRateBytesPerSec = governor.measured ? governor.rateEstimate : null;
+      const etaSeconds =
+        measuredRateBytesPerSec !== null && measuredRateBytesPerSec > 0
+          ? Math.ceil((totalBytes - sentBytes) / measuredRateBytesPerSec)
+          : null;
       onProgress?.({
         completedParts: etags.size,
         totalParts: chunkCount,
-        sentBytes: Math.min(totalBytes, doneBytes),
+        sentBytes,
         totalBytes,
         retries,
         paused,
         waitingForCapacitySeconds,
+        inFlightParts,
+        measuredRateBytesPerSec,
+        etaSeconds,
+        suspensions,
       });
     };
 
@@ -849,6 +928,75 @@ export class Drive {
         queue = [...resumed.part_urls];
         report();
       };
+      // F4: on wake, learn which in-flight parts the server already STORED, so
+      // their retries return the stored etag instead of re-sending. The server's
+      // `uploaded_parts` is the truth this relies on (an etag per part, the
+      // resume path). ⚠ The queue is deliberately NOT rebuilt here — that
+      // happens only between pool runs (see the pool comment below); in-flight
+      // workers skip stored parts at the barrier instead, so no part can be
+      // pulled twice.
+      const refreshStoredFromResume = async () => {
+        const resumed = await this.api.resumeMultipart(fileId, initiate.upload_id);
+        for (const part of resumed.uploaded_parts) etags.set(part.part_number, part.etag);
+      };
+      // F4: ONE refresh per hide epoch, shared by whoever asks first — the wake
+      // (`onVisibility`) or a retry. ⚠ The fresh `part_urls` the resume returns
+      // are deliberately ignored here: URLs are stable on the relay path, and
+      // under presign this is the pre-existing behaviour of an in-flight part's
+      // retry (the queue is rebuilt only between pool runs). A failed refresh
+      // falls through to the ordinary retry: the part is re-sent, which is what
+      // happened before F4 — never worse.
+      const countSuspension = () => {
+        if (countedEpoch === hideEpoch) return;
+        countedEpoch = hideEpoch;
+        suspensions += 1;
+      };
+      const startWakeRefresh = (): Promise<void> => {
+        if (wakeRefresh) return wakeRefresh;
+        const epoch = hideEpoch;
+        wakeRefresh = refreshStoredFromResume()
+          .then(() => {
+            lastRefreshedEpoch = epoch;
+          })
+          .catch(() => undefined)
+          .finally(() => {
+            wakeRefresh = null;
+            report();
+          });
+        return wakeRefresh;
+      };
+      // F4: what a RETRY awaits before re-sending. The truth it needs is "was
+      // the page hidden at any point during the attempt that failed": then the
+      // server may already hold the part whose 200 died with the page, so
+      // refresh (once per epoch) and skip if stored. A throttled hidden tab can
+      // make that call itself; a truly suspended page surfaces its errors only
+      // on wake, when the refresh runs either way — whichever of the error
+      // callbacks and `visibilitychange` the browser fires first (Gus, fold 1).
+      // Nothing ever parks on visibility.
+      const refreshIfHiddenDuring = async (attemptEpoch: number, startedVisible: boolean) => {
+        const hiddenDuring = attemptEpoch !== hideEpoch || !startedVisible;
+        if (hiddenDuring) {
+          countSuspension();
+          if (lastRefreshedEpoch !== hideEpoch) await startWakeRefresh();
+          else if (wakeRefresh) await wakeRefresh;
+        } else if (wakeRefresh) {
+          await wakeRefresh;
+        }
+      };
+      if (controller) {
+        controller.onVisibility = (visible) => {
+          if (!visible) {
+            hideEpoch += 1;
+            return;
+          }
+          // Visible again with parts in flight: they were in flight across the
+          // hidden interval — count the wake, refresh eagerly, tell the panel.
+          if (inFlightParts === 0) return;
+          countSuspension();
+          if (lastRefreshedEpoch !== hideEpoch) void startWakeRefresh();
+          report();
+        };
+      }
       report();
       // bug178 phase 2 (S174): SEAL AHEAD. Reading + encrypting a part is CPU
       // work that used to happen with the network idle — the relay's own counter
@@ -903,10 +1051,29 @@ export class Drive {
               const { envelope } = await prepare(entry);
               let attemptGeneration = governor.generation;
               let myAbort: (() => void) | null = null;
+              // F3: the part is in flight from here until it lands or fails.
+              inFlightParts += 1;
+              report();
+              let skippedStored = false;
+              let attemptEpoch = hideEpoch;
+              let attemptStartedVisible = controller?.isVisible ?? true;
               try {
                 const startedAt = Date.now();
                 const etag = await transferWithRetry(
-                  () => {
+                  async (attempt) => {
+                    // F4: a retry after an attempt during which the page was
+                    // hidden refreshes from the server and skips a part it
+                    // already stored (its 200 died with the page).
+                    if (attempt > 1) {
+                      await refreshIfHiddenDuring(attemptEpoch, attemptStartedVisible);
+                      const stored = etags.get(part_number);
+                      if (stored !== undefined) {
+                        skippedStored = true;
+                        return stored;
+                      }
+                    }
+                    attemptEpoch = hideEpoch;
+                    attemptStartedVisible = controller?.isVisible ?? true;
                     attemptGeneration = governor.generation;
                     return this.api.putPart(url, envelope, {
                       ceilingMs: governor.ceilingMs(envelope.byteLength) ?? undefined,
@@ -937,11 +1104,15 @@ export class Drive {
                 );
                 if (myAbort) liveAborts.delete(myAbort);
                 waitingForCapacitySeconds = null;
-                governor.observePart(envelope.byteLength, Date.now() - startedAt);
+                // A skipped (already-stored) part is not a transfer measurement.
+                if (!skippedStored)
+                  governor.observePart(envelope.byteLength, Date.now() - startedAt);
                 etags.set(part_number, etag);
+                inFlightParts -= 1;
                 report();
               } catch (error) {
                 if (myAbort) liveAborts.delete(myAbort);
+                inFlightParts -= 1;
                 stopPulling = true;
                 throw error;
               }
@@ -1006,6 +1177,12 @@ export class Drive {
             // if this part throws first; the value is re-derived when needed.
             ahead.catch(() => undefined);
           }
+          // F3: in flight from here until it lands or fails (serial path).
+          inFlightParts += 1;
+          report();
+          let skippedStored = false;
+          let attemptEpoch = hideEpoch;
+          let attemptStartedVisible = controller?.isVisible ?? true;
           try {
             const startedAt = Date.now();
             // 3a-i (S175): stamp the estimate's epoch per ATTEMPT (re-stamped on
@@ -1014,7 +1191,19 @@ export class Drive {
             // the governor answers the burst once instead of N times.
             let attemptGeneration = governor.generation;
             const etag = await transferWithRetry(
-              () => {
+              async (attempt) => {
+                // F4: as in the pool — a retry after a hidden interval refreshes
+                // and skips a part the server already stored.
+                if (attempt > 1) {
+                  await refreshIfHiddenDuring(attemptEpoch, attemptStartedVisible);
+                  const stored = etags.get(part_number);
+                  if (stored !== undefined) {
+                    skippedStored = true;
+                    return stored;
+                  }
+                }
+                attemptEpoch = hideEpoch;
+                attemptStartedVisible = controller?.isVisible ?? true;
                 attemptGeneration = governor.generation;
                 return this.api.putPart(url, envelope, {
                   // Rate-derived, never a fixed number of seconds.
@@ -1059,11 +1248,13 @@ export class Drive {
             // on capacity. Cleared HERE — on observed progress — rather than on
             // a timer, so the state can never outlive the condition it names.
             waitingForCapacitySeconds = null;
-            governor.observePart(envelope.byteLength, Date.now() - startedAt);
+            if (!skippedStored) governor.observePart(envelope.byteLength, Date.now() - startedAt);
             etags.set(part_number, etag);
             queue.shift();
+            inFlightParts -= 1;
             report();
           } catch (error) {
+            inFlightParts -= 1;
             // bug076: an aborted-by-cancel attempt (TransferCancelledError, or any
             // failure while cancel is requested) is the user's decision, not a
             // network verdict — surface it as the cancel it is.
@@ -1120,7 +1311,10 @@ export class Drive {
         for (let attempt = 1; attempt <= finalizeAttempts_; attempt += 1) {
           try {
             const view = await this.api.completeMultipart(fileId, initiate.upload_id, { parts });
-            if (controller) controller.active = null;
+            if (controller) {
+              controller.active = null;
+              controller.onVisibility = null;
+            }
             return view;
           } catch (error) {
             finalizeError = error;
@@ -1172,7 +1366,10 @@ export class Drive {
       if (!inMergeConflict) {
         await this.api.abortMultipart(fileId, initiate.upload_id).catch(() => undefined);
       }
-      if (controller) controller.active = null;
+      if (controller) {
+        controller.active = null;
+        controller.onVisibility = null;
+      }
       throw error;
     }
   }

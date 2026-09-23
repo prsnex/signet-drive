@@ -10,7 +10,7 @@ members = ["crypto", "crypto-wasm", "channel", "cli"]
 # image tag matches, so `/v1/server-info` (env!("CARGO_PKG_VERSION")) honestly reports
 # what's deployed. Bump in lockstep with each release tag (S072 — converged from the
 # accidental 0.1.0 drift that made server-info report 0.1.0 for every release since).
-version = "1.0.3"
+version = "1.0.4"
 edition = "2024"
 # 1.85 (edition 2024's floor) → 1.88: the `time` ≥0.3.47 security bump
 # (RUSTSEC-2026-0009) needs it, and there is no 1.85-compatible fix. We build on

@@ -29,6 +29,7 @@ import {
   type DownloadSink,
 } from './drive';
 import { friendlyDriveError } from './errors';
+import { UploadWakeLock, type WakeLockApiLike } from './wake-lock';
 import { DownloadCancelledError, openSwStreamedSink } from './sw-download';
 import { groupSharedByOwner, type GroupedShares } from './grouping';
 import { dedupeName } from './names';
@@ -1112,6 +1113,24 @@ export class Browser {
     }
     const controller = new UploadController();
     this.uploadController = controller;
+    // F4 (2026-09-21): the transfer layer has no `document`. Forward page
+    // visibility so a retry after a suspension waits for the wake and its
+    // resume-refresh (drive.ts), and hold the screen awake for a long upload
+    // (the lock is gated on the transfer layer's own forecast, in wake-lock.ts).
+    const wakeLock = new UploadWakeLock(
+      typeof navigator !== 'undefined'
+        ? (navigator as Navigator & { wakeLock?: WakeLockApiLike }).wakeLock
+        : undefined,
+    );
+    // The document's CURRENT state first: a batch begun while hidden has no
+    // hide transition to learn from (Gus, fold 2).
+    controller.initVisibility(document.visibilityState === 'visible');
+    const onVisibilityChange = () => {
+      const visible = document.visibilityState === 'visible';
+      controller.setVisibility(visible);
+      if (visible) wakeLock.onVisible();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
     // Abandoning the page mid-upload is a ROLLBACK by design (the File handle
     // cannot survive a reload, so cross-reload resume is structurally out):
     // fire a best-effort keepalive abort so the reservation frees promptly —
@@ -1157,6 +1176,11 @@ export class Browser {
             retries: 0,
             paused: false,
             waitingForCapacitySeconds: null,
+            // F3: nothing in flight and no rate until the transfer layer says so.
+            inFlightParts: 0,
+            measuredRateBytesPerSec: null,
+            etaSeconds: null,
+            suspensions: 0,
           };
           // The File streams chunk-by-chunk inside Drive.uploadFile (peak memory is
           // one chunk); progress reports live bytes + retries + the paused state.
@@ -1181,6 +1205,7 @@ export class Browser {
                 sealing: false,
                 ...progress,
               };
+              wakeLock.consider(progress.etaSeconds);
             },
             controller,
           );
@@ -1191,6 +1216,8 @@ export class Browser {
       } finally {
         this.uploadProgress = null;
         this.uploadController = null;
+        document.removeEventListener('visibilitychange', onVisibilityChange);
+        void wakeLock.release();
         window.removeEventListener('pagehide', onPageHide);
       }
     });
