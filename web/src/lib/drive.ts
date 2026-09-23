@@ -69,6 +69,7 @@ import {
   backoffMs,
   sleep,
 } from './transfer';
+import { UploadSlots } from './upload-slots';
 
 // The file ciphertext envelope is AES-256-GCM (Envelope §4.1/§4.2); the server
 // stores this label verbatim in files.algorithm.
@@ -729,6 +730,7 @@ export class Drive {
     source: Blob,
     onProgress?: (progress: UploadProgress) => void,
     controller?: UploadController,
+    slots?: UploadSlots,
   ): Promise<FileView> {
     // bug189 — refuse a non-`Blob` source HERE, before any side effect.
     //
@@ -855,6 +857,17 @@ export class Drive {
         | undefined,
     );
     governor.seedBootstrap(BOOTSTRAP_RATE_BYTES_PER_SEC);
+    // F2 (2026-09-23): the send slots this file draws from. A batch passes ONE
+    // pool for all its files (the first to initiate teaches it the served N);
+    // a lone file gets a private pool of its own N — the pre-F2 behaviour
+    // exactly, so the CLI-parity path and every existing test are unchanged.
+    // ⚠ Both send sites below take a slot for ONE attempt and release it in
+    // that attempt's `finally` — so a part sleeping through a backoff, or
+    // waiting the relay's `Retry-After`, holds no slot (Gus, v01 delta 2): a
+    // part waiting on a full relay must not pin the pool exactly when the relay
+    // is asking for less.
+    const pool = slots ?? new UploadSlots(sendConcurrency);
+    pool.learn(sendConcurrency);
     if (controller) controller.active = { fileId, uploadId: initiate.upload_id };
 
     const totalBytes = source.size;
@@ -895,9 +908,16 @@ export class Drive {
       // F3: the rate is a fact only once a part has completed on this Drive;
       // the governor's `measured` flag is what keeps the bootstrap seed out.
       const measuredRateBytesPerSec = governor.measured ? governor.rateEstimate : null;
+      // F3-a (2026-09-23, filed at the v1.0.4 staging test): the governor's rate
+      // is ONE STREAM's — each part is timed on its own while N are in flight —
+      // so the remaining bytes divide by rate × the streams carrying them, not
+      // by the rate alone, which read ~N× too long. The multiplier is the count
+      // in flight NOW, a fact; "about" stays the label.
       const etaSeconds =
         measuredRateBytesPerSec !== null && measuredRateBytesPerSec > 0
-          ? Math.ceil((totalBytes - sentBytes) / measuredRateBytesPerSec)
+          ? Math.ceil(
+              (totalBytes - sentBytes) / (measuredRateBytesPerSec * Math.max(1, inFlightParts)),
+            )
           : null;
       onProgress?.({
         completedParts: etags.size,
@@ -1044,11 +1064,48 @@ export class Drive {
           const worker = async (): Promise<void> => {
             for (;;) {
               if (controller?.cancelled) throw new UploadCancelledError();
-              if (stopPulling) return;
-              const entry = queue.shift();
-              if (!entry) return;
+              if (stopPulling || queue.length === 0) return;
+              // F2: SLOT FIRST, then seal, then PUT (Gus, v01 delta 1). With K
+              // files open, a worker that sealed and THEN waited for a slot
+              // would hold a sealed part per worker — K × N parts in memory,
+              // 80 MB on the shipped defaults, the phone hazard bug075 lived
+              // in. Taking the slot before reading the chunk keeps the peak at
+              // N × chunk across the whole batch, as it is for one file.
+              let held: (() => void) | null = await pool.acquire();
+              // The wait may have outlived the reason to pull.
+              if (controller?.cancelled) {
+                held();
+                throw new UploadCancelledError();
+              }
+              const entry = stopPulling ? undefined : queue.shift();
+              if (!entry) {
+                held();
+                return;
+              }
               const { part_number, url } = entry;
-              const { envelope } = await prepare(entry);
+              // F2 (Gus, review fold at b3ef83ce): SEALED ⇒ HOLDING A SLOT,
+              // everywhere. The envelope lives exactly as long as the slot: it
+              // is sealed under the slot, sent, and DROPPED with the slot at
+              // the end of every attempt, success or failure. A retry takes a
+              // fresh slot and re-seals — byte-identical, since `sealChunk`
+              // derives the IV from the DEK and the chunk index and the AAD
+              // from the file id, index and is_last; nothing random. Without
+              // this, a worker whose PUT failed kept its envelope through the
+              // backoff sleep while a fresh slot-holder sealed another, and on
+              // a dropped link (every attempt failing) the sealed count could
+              // climb to N² — the bug075 number, in exactly the case the bound
+              // exists for. A re-seal costs one chunk read and one AES-GCM,
+              // milliseconds against a backoff of seconds.
+              let envelope: Prepared['envelope'] | null;
+              let partBytes: number;
+              try {
+                ({ envelope } = await prepare(entry));
+                partBytes = envelope.byteLength;
+              } catch (error) {
+                held();
+                stopPulling = true;
+                throw error;
+              }
               let attemptGeneration = governor.generation;
               let myAbort: (() => void) | null = null;
               // F3: the part is in flight from here until it lands or fails.
@@ -1075,16 +1132,30 @@ export class Drive {
                     attemptEpoch = hideEpoch;
                     attemptStartedVisible = controller?.isVisible ?? true;
                     attemptGeneration = governor.generation;
-                    return this.api.putPart(url, envelope, {
-                      ceilingMs: governor.ceilingMs(envelope.byteLength) ?? undefined,
-                      onAbortReady: controller
-                        ? (abort) => {
-                            if (myAbort) liveAborts.delete(myAbort);
-                            myAbort = abort;
-                            liveAborts.add(abort);
-                          }
-                        : undefined,
-                    });
+                    // F2: the slot is held for THIS attempt only. The first
+                    // attempt inherits the one taken before the seal; a retry
+                    // (after a backoff or a relay-busy wait, during which it
+                    // held nothing and had dropped its envelope) takes a fresh
+                    // slot here and re-seals under it.
+                    if (!held) held = await pool.acquire();
+                    if (!envelope) ({ envelope } = await prepare(entry));
+                    try {
+                      return await this.api.putPart(url, envelope, {
+                        ceilingMs: governor.ceilingMs(partBytes) ?? undefined,
+                        onAbortReady: controller
+                          ? (abort) => {
+                              if (myAbort) liveAborts.delete(myAbort);
+                              myAbort = abort;
+                              liveAborts.add(abort);
+                            }
+                          : undefined,
+                      });
+                    } finally {
+                      // The slot and the envelope go together.
+                      held();
+                      held = null;
+                      envelope = null;
+                    }
                   },
                   knobs,
                   'upload',
@@ -1105,13 +1176,21 @@ export class Drive {
                 if (myAbort) liveAborts.delete(myAbort);
                 waitingForCapacitySeconds = null;
                 // A skipped (already-stored) part is not a transfer measurement.
-                if (!skippedStored)
-                  governor.observePart(envelope.byteLength, Date.now() - startedAt);
+                if (!skippedStored) governor.observePart(partBytes, Date.now() - startedAt);
                 etags.set(part_number, etag);
                 inFlightParts -= 1;
                 report();
               } catch (error) {
                 if (myAbort) liveAborts.delete(myAbort);
+                // F2: every attempt releases in its own `finally`; this is the
+                // belt for a throw between the slot and the PUT (a re-seal that
+                // fails), so a failed part can never keep a slot from the rest
+                // of the batch.
+                if (held) {
+                  held();
+                  held = null;
+                }
+                envelope = null;
                 inFlightParts -= 1;
                 stopPulling = true;
                 throw error;
@@ -1205,14 +1284,22 @@ export class Drive {
                 attemptEpoch = hideEpoch;
                 attemptStartedVisible = controller?.isVisible ?? true;
                 attemptGeneration = governor.generation;
-                return this.api.putPart(url, envelope, {
-                  // Rate-derived, never a fixed number of seconds.
-                  ceilingMs: governor.ceilingMs(envelope.byteLength) ?? undefined,
-                  // bug076: a user cancel aborts THIS attempt's socket promptly.
-                  onAbortReady: controller
-                    ? (abort) => controller.registerInFlightAbort(abort)
-                    : undefined,
-                });
+                // F2: one slot per attempt on the serial path too — a private
+                // pool of 1 here is a no-op, a shared pool bounds this file's
+                // single stream against the batch's other files.
+                const release = await pool.acquire();
+                try {
+                  return await this.api.putPart(url, envelope, {
+                    // Rate-derived, never a fixed number of seconds.
+                    ceilingMs: governor.ceilingMs(envelope.byteLength) ?? undefined,
+                    // bug076: a user cancel aborts THIS attempt's socket promptly.
+                    onAbortReady: controller
+                      ? (abort) => controller.registerInFlightAbort(abort)
+                      : undefined,
+                  });
+                } finally {
+                  release();
+                }
               },
               knobs,
               'upload',

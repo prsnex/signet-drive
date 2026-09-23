@@ -74,6 +74,7 @@ import {
   uuidToBytes,
 } from './drive';
 import { RelayBusyError, StallError } from './transfer';
+import { UploadSlots } from './upload-slots';
 import { SignetApiError, type ResumeMultipartResponse } from './api';
 
 beforeAll(async () => {
@@ -970,6 +971,377 @@ describe('Drive (data-plane crypto orchestration)', () => {
     }
   });
 
+  // ── F2 (2026-09-23): cross-file upload concurrency — the transfer layer's half ──
+  // Design note v02 §4. These tests drive `uploadFile` directly with one SHARED
+  // `UploadSlots` across concurrent calls (the store's scheduler is tested in
+  // upload-batch.test.ts); what they pin is the slot mechanics: the cap, the
+  // memory bound, the busy-wait release, and the discriminator against the old
+  // one-file-at-a-time path.
+
+  /** A put that takes measurable time and counts its own concurrency. */
+  function slowCountingPutPart(delayMs: number) {
+    const realPutPart = api.putPart.bind(api);
+    const gauge = {
+      now: 0,
+      max: 0,
+      starts: [] as string[],
+      ends: [] as string[],
+      /** Every start and end in WALL order: `start:<upload>/part/<n>` / `end:…`. */
+      events: [] as string[],
+    };
+    api.putPart = async (...args: Parameters<typeof api.putPart>) => {
+      const id = args[0].replace('fake://', '');
+      gauge.now += 1;
+      gauge.max = Math.max(gauge.max, gauge.now);
+      gauge.starts.push(id);
+      gauge.events.push(`start:${id}`);
+      try {
+        await new Promise((r) => setTimeout(r, delayMs));
+        return await realPutPart(...args);
+      } finally {
+        gauge.now -= 1;
+        gauge.ends.push(id);
+        gauge.events.push(`end:${id}`);
+      }
+    };
+    return { gauge, restore: () => (api.putPart = realPutPart) };
+  }
+
+  it('F2: eight one-part files on a SHARED pool of 4 run four at once and never more — the old path ran one', async () => {
+    // §4 test 1 + the discriminator. Gus's §7 measurement: a batch of photos at
+    // or under the floor is one part per file, so before F2 it ran on ONE stream
+    // while the link carried four.
+    api.uploadConcurrencyServed = 4;
+    const { gauge, restore } = slowCountingPutPart(15);
+    try {
+      const folder = await drive.createFolder('Photos');
+      const target = {
+        folderId: folder.folder_id,
+        rootFolderId: folder.folder_id,
+        shareFolder: false,
+      };
+      const files = Array.from({ length: 8 }, (_, i) => new Blob([utf8Encode(`photo ${i}`)]));
+      // The old path: one file after another, each with its own private pool.
+      for (const [i, f] of files.entries()) await drive.uploadFile(target, `old-${i}.jpg`, f);
+      expect(gauge.max).toBe(1);
+      // F2: the same eight, opened together on one shared pool of the served N.
+      gauge.max = 0;
+      const slots = new UploadSlots();
+      await Promise.all(
+        files.map((f, i) =>
+          drive.uploadFile(target, `new-${i}.jpg`, f, undefined, undefined, slots),
+        ),
+      );
+      expect(slots.size).toBe(4); // learned from the first initiate
+      expect(gauge.max).toBe(4); // at least four at some instant …
+      expect(gauge.now).toBe(0);
+      expect(slots.busy).toBe(0); // … and every slot handed back
+      expect(api.uploadsInFlight()).toBe(0);
+    } finally {
+      restore();
+      api.uploadConcurrencyServed = undefined;
+    }
+  });
+
+  it('F2: the cap invariant holds across a batch through retries and a mid-batch pause — never more than N PUTs in flight', async () => {
+    // §4 test 4. Three multi-part files on one pool of 4, stalls injected on two
+    // of them (attempts=2 in the fake, so one stall retries and two stalls
+    // exhaust → PAUSE); the paused file is resumed while the others run.
+    api.uploadConcurrencyServed = 4;
+    const { gauge, restore } = slowCountingPutPart(8);
+    try {
+      const chunked = new Drive(api, session, 8);
+      const folder = await chunked.createFolder('Cap');
+      const target = {
+        folderId: folder.folder_id,
+        rootFolderId: folder.folder_id,
+        shareFolder: false,
+      };
+      const slots = new UploadSlots();
+      const controllers = [new UploadController(), new UploadController(), new UploadController()];
+      // Stalls injected PER UPLOAD (the fake's budget is keyed by part number
+      // alone, and across a batch two files would each absorb one): the first
+      // upload to reach part 2 stalls once and retries; the first to reach part
+      // 3 stalls twice — the fake serves attempts=2 — and PAUSES.
+      const countingPut = api.putPart;
+      let retryUpload: string | null = null;
+      let pauseUpload: string | null = null;
+      const stallsLeft = new Map<string, number>();
+      // Gus's fold at b3ef83ce — SEALED ⇒ HOLDING A SLOT, through retries and
+      // the pause: a sealed envelope is alive from its chunk read until its
+      // attempt ends (success or failure), so `reads − attemptEnds` is the
+      // sealed-alive count, and it may never exceed N.
+      let reads = 0;
+      let attemptStarts = 0;
+      let attemptEnds = 0;
+      let maxSealedAlive = 0;
+      class CountingBlob extends Blob {
+        override slice(start?: number, end?: number, contentType?: string): Blob {
+          reads += 1;
+          maxSealedAlive = Math.max(maxSealedAlive, reads - attemptEnds);
+          return super.slice(start, end, contentType);
+        }
+      }
+      api.putPart = async (...args: Parameters<typeof api.putPart>) => {
+        attemptStarts += 1;
+        try {
+          const [, uploadId, part] = /^fake:\/\/(.+)\/part\/(\d+)$/.exec(args[0])!;
+          if (part === '2' && retryUpload === null) {
+            retryUpload = uploadId;
+            stallsLeft.set(`${uploadId}/2`, 1);
+          }
+          if (part === '3' && pauseUpload === null) {
+            pauseUpload = uploadId;
+            stallsLeft.set(`${uploadId}/3`, 2);
+          }
+          const key = `${uploadId}/${part}`;
+          const left = stallsLeft.get(key) ?? 0;
+          if (left > 0) {
+            stallsLeft.set(key, left - 1);
+            throw new StallError('injected stall');
+          }
+          return await countingPut(...args);
+        } finally {
+          attemptEnds += 1;
+        }
+      };
+      const contents = [40, 33, 25].map((n) => new Uint8Array(n).map((_, i) => i));
+      let resolvePaused!: (i: number) => void;
+      const pausedFile = new Promise<number>((resolve) => (resolvePaused = resolve));
+      const runs = contents.map((c, i) =>
+        chunked.uploadFile(
+          target,
+          `cap-${i}.bin`,
+          new CountingBlob([c]),
+          (p) => {
+            if (p.paused) resolvePaused(i);
+          },
+          controllers[i],
+          slots,
+        ),
+      );
+      // The pause lands (the others keep the pool meanwhile); resume it.
+      const pausedIndex = await pausedFile;
+      controllers[pausedIndex].resume();
+      const views = await Promise.all(runs);
+      expect(pauseUpload).not.toBeNull();
+      expect(retryUpload).not.toBeNull();
+      expect(gauge.max).toBeLessThanOrEqual(4);
+      expect(gauge.max).toBeGreaterThanOrEqual(3);
+      // The fold's bound, with its positive control: 14 parts, and every retried
+      // attempt re-sealed under its own slot (the part-2 retry, the part-3
+      // second attempt, the part-3 re-pull after the resume), so reads exceed
+      // the part count and equal the attempts — a re-seal per attempt, none
+      // kept across a backoff.
+      expect(reads).toBeGreaterThan(14);
+      expect(reads).toBe(attemptStarts);
+      expect(maxSealedAlive).toBeLessThanOrEqual(4);
+      expect(slots.busy).toBe(0);
+      expect(api.uploadsInFlight()).toBe(0);
+      const reader = new Drive(api, session);
+      for (const [i, view] of views.entries()) {
+        expect(Array.from(await reader.downloadFile(view.file_id))).toEqual(
+          Array.from(contents[i]),
+        );
+      }
+    } finally {
+      restore();
+      api.stallBudget.clear();
+      api.uploadConcurrencyServed = undefined;
+    }
+  });
+
+  it('F2: no drain — a 1-part file following a 5-part file starts its PUT while the 5-part file is still finishing', async () => {
+    // §4 test 2 (Gus's ask at review): the second measured cost was the tail of
+    // each multi-part file draining the slots — its last part running alone
+    // for ~a tenth of the batch's wall clock. On a shared pool the freed slots
+    // go to the next file at once; on the old path the next file waited for
+    // the last part to land.
+    api.uploadConcurrencyServed = 4;
+    const { gauge, restore } = slowCountingPutPart(20);
+    try {
+      const chunked = new Drive(api, session, 8);
+      const folder = await chunked.createFolder('Drain');
+      const target = {
+        folderId: folder.folder_id,
+        rootFolderId: folder.folder_id,
+        shareFolder: false,
+      };
+      const five = new Uint8Array(40).map((_, i) => i); // 5 parts of 8
+      const one = new Uint8Array(5).map((_, i) => 100 + i); // 1 part
+      // In wall order: where the 1-part file's PUT STARTS against where the
+      // 5-part file's last part ENDS. The first upload to PUT is the 5-part file.
+      const positions = (events: string[]) => {
+        const a = events[0].replace('start:', '').split('/')[0];
+        const b = [...new Set(events.map((e) => e.split(':')[1].split('/')[0]))].find(
+          (u) => u !== a,
+        )!;
+        return {
+          oneStarts: events.indexOf(`start:${b}/part/1`),
+          fiveLastEnds: events.indexOf(`end:${a}/part/5`),
+        };
+      };
+      // CONTROL — the old path, one file after another: the 1-part file's PUT
+      // begins only after the 5-part file's last part has ENDED.
+      await chunked.uploadFile(target, 'old-five.bin', new Blob([five]));
+      await chunked.uploadFile(target, 'old-one.bin', new Blob([one]));
+      const old = positions(gauge.events);
+      expect(old.oneStarts).toBeGreaterThan(old.fiveLastEnds);
+      // F2 — both files on one pool, the 1-part file opened a beat later (as the
+      // batch opens it): its PUT starts BEFORE the 5-part file's last part ends.
+      gauge.events.length = 0;
+      gauge.max = 0;
+      const slots = new UploadSlots();
+      const a = chunked.uploadFile(
+        target,
+        'five.bin',
+        new Blob([five]),
+        undefined,
+        undefined,
+        slots,
+      );
+      await new Promise((r) => setTimeout(r, 5));
+      const b = chunked.uploadFile(target, 'one.bin', new Blob([one]), undefined, undefined, slots);
+      await Promise.all([a, b]);
+      const now = positions(gauge.events);
+      expect(now.oneStarts).toBeGreaterThan(-1);
+      expect(now.fiveLastEnds).toBeGreaterThan(-1);
+      expect(now.oneStarts).toBeLessThan(now.fiveLastEnds);
+      expect(gauge.max).toBe(4);
+    } finally {
+      restore();
+      api.uploadConcurrencyServed = undefined;
+    }
+  });
+
+  it('F2 (delta 1): sealed-but-not-in-flight parts across the batch never exceed N — the slot is taken BEFORE the chunk is read', async () => {
+    // §4 memory-bound test. Eight files opened at once on a pool of 4: a worker
+    // that sealed first and waited for a slot second would hold eight sealed
+    // parts (K × N in general, 80 MB on the shipped defaults); slot-first keeps
+    // it at N. The read of a chunk is the start of its seal, so "read started
+    // minus PUT started" bounds "sealed and waiting" from above.
+    api.uploadConcurrencyServed = 4;
+    const { gauge, restore } = slowCountingPutPart(15);
+    let reads = 0;
+    let puts = 0;
+    let maxSealedWaiting = 0;
+    // The control arm holds every PUT until all eight chunks have been read, so
+    // its "8" is a property of the pool and not of timing; the claim arm has no
+    // gate (on a pool of 4 such a gate would deadlock, which is the point).
+    let allRead: { promise: Promise<void>; resolve: () => void } | null = null;
+    class CountingBlob extends Blob {
+      override slice(start?: number, end?: number, contentType?: string): Blob {
+        reads += 1;
+        maxSealedWaiting = Math.max(maxSealedWaiting, reads - puts);
+        if (allRead && reads === 8) allRead.resolve();
+        return super.slice(start, end, contentType);
+      }
+    }
+    const realPut = api.putPart;
+    api.putPart = async (...args: Parameters<typeof api.putPart>) => {
+      if (allRead) await allRead.promise;
+      puts += 1;
+      return realPut(...args);
+    };
+    try {
+      const folder = await drive.createFolder('Bound');
+      const target = {
+        folderId: folder.folder_id,
+        rootFolderId: folder.folder_id,
+        shareFolder: false,
+      };
+      const batch = (slots: UploadSlots, tag: string) =>
+        Promise.all(
+          Array.from({ length: 8 }, (_, i) =>
+            drive.uploadFile(
+              target,
+              `${tag}-${i}.bin`,
+              new CountingBlob([utf8Encode(`bound ${i}`)]),
+              undefined,
+              undefined,
+              slots,
+            ),
+          ),
+        );
+      // CONTROL first: a pool wide enough for all eight proves the gauge can
+      // see eight sealed parts at once — so the bound below is not an artefact
+      // of the gauge missing them (ROOTS §B-2.7).
+      let releaseReads!: () => void;
+      allRead = {
+        promise: new Promise<void>((resolve) => (releaseReads = resolve)),
+        resolve: () => releaseReads(),
+      };
+      await batch(new UploadSlots(8), 'wide');
+      expect(reads).toBe(8);
+      expect(maxSealedWaiting).toBe(8);
+      allRead = null;
+      // The claim: the served pool of 4 holds it at 4.
+      reads = 0;
+      puts = 0;
+      maxSealedWaiting = 0;
+      gauge.max = 0;
+      await batch(new UploadSlots(), 'bound');
+      expect(reads).toBe(8);
+      expect(maxSealedWaiting).toBeLessThanOrEqual(4);
+      expect(gauge.max).toBe(4);
+    } finally {
+      api.putPart = realPut;
+      restore();
+      api.uploadConcurrencyServed = undefined;
+    }
+  });
+
+  it('F2 (delta 2): a part answered 503 relay_at_capacity frees its slot during its wait, and another file takes it', async () => {
+    // §4 busy-release test, on a pool of ONE so the discriminator is exact: file
+    // A's only part is refused once (the fake waits the server's 1 s Retry-After
+    // without spending budget); if A kept its slot through that wait, B could not
+    // move until A landed. It must move DURING the wait.
+    api.uploadConcurrencyServed = 1;
+    const { gauge, restore } = slowCountingPutPart(1);
+    api.busyBudget.set(1, 1);
+    try {
+      const folder = await drive.createFolder('Busy');
+      const target = {
+        folderId: folder.folder_id,
+        rootFolderId: folder.folder_id,
+        shareFolder: false,
+      };
+      const slots = new UploadSlots(1);
+      const a = drive.uploadFile(
+        target,
+        'a.bin',
+        new Blob([utf8Encode('aaaa')]),
+        undefined,
+        undefined,
+        slots,
+      );
+      // B opens a beat later, so A's refused attempt is the first PUT of all.
+      await new Promise((r) => setTimeout(r, 20));
+      const b = drive.uploadFile(
+        target,
+        'b.bin',
+        new Blob([utf8Encode('bbbb')]),
+        undefined,
+        undefined,
+        slots,
+      );
+      await Promise.all([a, b]);
+      // Order of PUT starts: A (refused), B (during A's wait), A again.
+      const order = gauge.starts.map((s) => s.split('/')[0]);
+      const uploads = [...new Set(order)];
+      expect(order).toHaveLength(3);
+      expect(order[0]).toBe(uploads[0]);
+      expect(order[1]).toBe(uploads[1]);
+      expect(order[2]).toBe(uploads[0]);
+      expect(gauge.max).toBe(1);
+      expect(slots.busy).toBe(0);
+    } finally {
+      restore();
+      api.busyBudget.clear();
+      api.uploadConcurrencyServed = undefined;
+    }
+  });
+
   it('F1: a FRESH Drive plans its first file at the 5 MiB floor — 20 MB is 4 parts, and the initiate declares it', async () => {
     // Before F1 a fresh page's first file was planned at the 16 MiB default and a
     // 20 MB file went as one 16 MiB stream (2:10 measured on the travel link, the
@@ -1231,6 +1603,50 @@ describe('Drive (data-plane crypto orchestration)', () => {
     // 3 chunks stored: 2 full (8 + 34) + 1 partial (3 + 34) = 121 stored, 19 plain.
     expect(plaintextLength(121, 3)).toBe(19);
     expect(plaintextLength(34 + 5, 1)).toBe(5);
+  });
+
+  it('F3-a: under fan-out the ETA divides by rate × streams in flight, not by one stream', async () => {
+    // Filed at the v1.0.4 staging test (2026-09-21): four parts in flight, the
+    // panel's "about N left" read ~4× the truth because it divided the remaining
+    // bytes by ONE stream's rate. The governor times each part on its own, so its
+    // rate is per stream; the ETA must multiply by what is carrying the bytes.
+    api.uploadConcurrencyServed = 4;
+    const realPutPart = api.putPart.bind(api);
+    api.putPart = async (...args: Parameters<typeof api.putPart>) => {
+      await new Promise((r) => setTimeout(r, 6));
+      return realPutPart(...args);
+    };
+    try {
+      // 64-byte parts over a 6 ms fake put: ~10 kB/s observed, ten times the
+      // governor's 1,024 B/s credibility floor, so a slow runner still measures.
+      const chunked = new Drive(api, session, 64);
+      const folder = await chunked.createFolder('Eta');
+      const content = new Uint8Array(64 * 12).map((_, i) => i % 251); // 12 parts
+      const checked: number[] = [];
+      let sawMany = false;
+      await chunked.uploadFile(
+        { folderId: folder.folder_id, rootFolderId: folder.folder_id, shareFolder: false },
+        'eta.bin',
+        new Blob([content]),
+        (p) => {
+          if (p.inFlightParts === 0 || p.measuredRateBytesPerSec === null) return;
+          const expected = Math.ceil(
+            (p.totalBytes - p.sentBytes) / (p.measuredRateBytesPerSec * p.inFlightParts),
+          );
+          checked.push(p.etaSeconds! - expected);
+          if (p.inFlightParts > 1) sawMany = true;
+        },
+      );
+      // The discriminator: reports with several streams in flight exist, and for
+      // every report the ETA is the multi-stream figure exactly (the old ÷ rate
+      // would differ by a factor of inFlight on those).
+      expect(sawMany).toBe(true);
+      expect(checked.length).toBeGreaterThan(0);
+      expect(checked.every((d) => d === 0)).toBe(true);
+    } finally {
+      api.putPart = realPutPart;
+      api.uploadConcurrencyServed = undefined;
+    }
   });
 
   it('reports live upload progress (bytes + parts) via the onProgress callback', async () => {

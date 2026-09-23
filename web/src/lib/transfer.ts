@@ -205,8 +205,17 @@ export class TransferGovernor {
     if (bytes <= 0 || elapsedMs <= 0) return;
     const observed = (bytes / elapsedMs) * 1000;
     if (observed < MIN_CREDIBLE_RATE) return;
+    // F3-b (2026-09-23, filed at the v1.0.4 staging test): the FIRST credible
+    // observation REPLACES whatever the estimate held, never blends with it.
+    // Before this, a 9 Mbps link's first part blended 0.4 × measured with
+    // 0.6 × the 125,000 B/s bootstrap seed and the panel read ~3.8 Mbps for the
+    // first several parts (Gus's alternative at review: replace, don't blend —
+    // the seed is a stall-ceiling constant, not a prior about the link). The
+    // EWMA takes over from the second part.
+    const first = this.observedParts === 0;
     this.observedParts += 1;
-    this.rateEst = this.rateEst === null ? observed : ALPHA * observed + (1 - ALPHA) * this.rateEst;
+    this.rateEst =
+      first || this.rateEst === null ? observed : ALPHA * observed + (1 - ALPHA) * this.rateEst;
   }
 
   /** Halve the estimate after a stalled attempt, so the retry gets a

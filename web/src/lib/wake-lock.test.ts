@@ -106,17 +106,26 @@ describe('F4 — the upload wake lock', () => {
       fileURLToPath(new URL('./browser.svelte.ts', import.meta.url)),
       'utf8',
     );
+    // F2 (2026-09-23): the seam moved one step — the store hands the BATCH the
+    // document's current state and every change; the batch hands each open
+    // file's controller both (upload-batch.ts). Both halves are pinned.
     const batch = store.slice(
-      store.indexOf('new UploadController()'),
+      store.indexOf('new UploadBatch<File>('),
       store.indexOf("removeEventListener('pagehide'"),
     );
     expect(batch.length).toBeGreaterThan(0);
     expect(batch).toContain("addEventListener('visibilitychange'");
-    expect(batch).toContain("controller.initVisibility(document.visibilityState === 'visible')");
-    expect(batch).toContain('controller.setVisibility(');
+    expect(batch).toContain("initiallyVisible: document.visibilityState === 'visible'");
+    expect(batch).toContain('batch.setVisibility(visible)');
     expect(batch).toContain('wakeLock.consider(');
     expect(batch).toContain('wakeLock.onVisible()');
     expect(batch).toContain("removeEventListener('visibilitychange'");
     expect(batch).toContain('wakeLock.release()');
+    const scheduler = readFileSync(
+      fileURLToPath(new URL('./upload-batch.ts', import.meta.url)),
+      'utf8',
+    );
+    expect(scheduler).toContain('controller.initVisibility(this.visible)');
+    expect(scheduler).toContain('entry.controller.setVisibility(visible)');
   });
 });

@@ -384,6 +384,29 @@ describe('TransferGovernor (bug060)', () => {
     expect(dire.partSize(100 * MB, 10_000)).toBe(5 * MB);
   });
 
+  it('F3-b: the first credible observation REPLACES the bootstrap seed; the second blends', () => {
+    // Filed at the v1.0.4 staging test (2026-09-21): a 9 Mbps link's first part
+    // blended 0.4 × measured with 0.6 × the 125,000 B/s seed and the panel read
+    // ~3.8 Mbps for the first several parts. The seed is a stall-ceiling
+    // constant, not a prior about the link (Gus: replace, don't blend).
+    const g = new TransferGovernor();
+    g.seedBootstrap(125_000);
+    expect(g.measured).toBe(false);
+    g.observePart(5 * MB, 5000); // 1 MB/s measured
+    expect(g.measured).toBe(true);
+    expect(g.rateEstimate).toBe(MB); // exactly the observation — no trace of the seed
+    // From the second part on, the EWMA tracks without chasing a single sample.
+    g.observePart(5 * MB, 2500); // 2 MB/s
+    expect(g.rateEstimate!).toBeGreaterThan(MB);
+    expect(g.rateEstimate!).toBeLessThan(2 * MB);
+    // A seed halved by a stall before any measurement is replaced all the same.
+    const stalled = new TransferGovernor();
+    stalled.seedBootstrap(125_000);
+    stalled.penalizeStall(stalled.generation);
+    stalled.observePart(5 * MB, 5000);
+    expect(stalled.rateEstimate).toBe(MB);
+  });
+
   it("F1: with nothing measured yet, plans at the FLOOR — a fresh page's first 20 MB file is 4 parts, not 2", () => {
     // The Drive's first file is planned BEFORE the bootstrap seed and before any
     // part has completed, so `rateEst` is null here. It used to fall back to the

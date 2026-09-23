@@ -432,7 +432,7 @@
       <div class="transfer-progress" role="status" aria-live="polite">
         <div class="transfer-progress-label">
           {#if p.paused}
-            {m.filelist_upload_paused({ fileName: p.fileName })}
+            {m.filelist_upload_paused({ fileName: p.pausedFiles[0]?.fileName ?? p.fileName })}
           {:else}
             {#if phase === 'encrypting'}
               {m.filelist_upload_encrypting({ fileName: p.fileName })}
@@ -442,10 +442,19 @@
               {m.filelist_upload_starting({ elapsed: formatElapsed(nowTick - p.startedAt) })}
             {:else if phase === 'completing'}
               {m.filelist_upload_completing({ fileName: p.fileName })}
+            {:else if p.filesOpen > 1}
+              <!-- F2: several files are open on the shared slots; the per-file rows
+                 collapse to the range ("files 3–6 of 31"). -->
+              {m.filelist_uploading_batch({
+                first: p.firstOpenIndex + 1,
+                last: p.lastOpenIndex + 1,
+                count: p.fileCount,
+                pct,
+              })}
             {:else}
               {p.fileCount > 1
                 ? m.filelist_uploading_multi({
-                    index: p.fileIndex + 1,
+                    index: p.firstOpenIndex + 1,
                     count: p.fileCount,
                     fileName: p.fileName,
                     pct,
@@ -524,26 +533,36 @@
             <div class="fill" class:paused={p.paused} style="width: {pct}%"></div>
           </div>
         {/if}
-        {#if p.paused}
+        {#each p.pausedFiles as pf (pf.fileIndex)}
+          <!-- F2 §2.7: a file paused on a bad window owes the user a decision for
+             THAT file; the batch's other files keep the slots meanwhile. When the
+             batch is one file this is the pre-F2 Resume row exactly. -->
           <div class="paused-actions">
-            <button class="primary" onclick={() => browser.resumeUpload()}>
+            {#if !p.paused || p.pausedFiles.length > 1}
+              <!-- The row carries its file's name whenever the label above cannot
+                 stand for it alone: the batch still moving, or two files paused
+                 at once (Gus, review). -->
+              <span class="part-note">{m.filelist_upload_paused({ fileName: pf.fileName })}</span>
+            {/if}
+            <button class="primary" onclick={() => browser.resumeUpload(pf.fileIndex)}>
               {m.filelist_upload_resume()}
             </button>
-            <button onclick={() => browser.cancelUpload()}>
-              {m.filelist_upload_cancel()}
-            </button>
+            {#if p.fileCount > 1}
+              <button onclick={() => browser.cancelUploadFile(pf.fileIndex)}>
+                {m.filelist_upload_cancel_file()}
+              </button>
+            {/if}
           </div>
-        {:else}
-          <!-- bug076: Cancel must exist DURING the active transfer — the prior UI
-             offered it only when paused, so on exactly the slow link where a user
-             reaches for Cancel there was no button at all. Cancel-only, no Pause
-             (Chris, S142). -->
-          <div class="paused-actions">
-            <button onclick={() => browser.cancelUpload()}>
-              {m.filelist_upload_cancel()}
-            </button>
-          </div>
-        {/if}
+        {/each}
+        <!-- bug076: Cancel must exist DURING the active transfer — the prior UI
+           offered it only when paused, so on exactly the slow link where a user
+           reaches for Cancel there was no button at all. Cancel-only, no Pause
+           (Chris, S142). Under F2 it cancels the whole batch (§2.6). -->
+        <div class="paused-actions">
+          <button onclick={() => browser.cancelUpload()}>
+            {m.filelist_upload_cancel()}
+          </button>
+        </div>
       </div>
     {/if}
 

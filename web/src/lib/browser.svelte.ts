@@ -19,20 +19,13 @@ import {
   type SharedFolderView,
 } from './api';
 import type { Session } from './auth';
-import {
-  Drive,
-  UploadCancelledError,
-  UploadController,
-  capacityRefusal,
-  type UploadProgress,
-  type DownloadProgress,
-  type DownloadSink,
-} from './drive';
+import { Drive, capacityRefusal, type DownloadProgress, type DownloadSink } from './drive';
 import { friendlyDriveError } from './errors';
 import { UploadWakeLock, type WakeLockApiLike } from './wake-lock';
 import { DownloadCancelledError, openSwStreamedSink } from './sw-download';
 import { groupSharedByOwner, type GroupedShares } from './grouping';
 import { dedupeName } from './names';
+import { UploadBatch, type UploadBatchState } from './upload-batch';
 import { loadNavState, saveNavState } from './nav-persist';
 // Relative on purpose, matching errors.ts: the unit-test runner resolves no $lib aliases.
 import { m } from './paraglide/messages.js';
@@ -363,37 +356,19 @@ export class Browser {
     owned: boolean;
     deletable: boolean;
   } | null>(null);
-  /** Active upload progress, or null when idle. Live BYTES + resilience
-   *  signals (bug046/bug047): the FileList renders a determinate bytes-based
-   *  bar (a slow upload never reads as frozen), a retry note, and — when a bad
-   *  network window pauses the upload — the Resume/Cancel affordance. */
-  uploadProgress = $state<
-    | ({
-        fileName: string;
-        fileIndex: number;
-        fileCount: number;
-        /** Wall-clock start of THIS file's upload, for the honest elapsed readout
-         *  during the silent stretch before part 1 acknowledges (bug075 item 1).
-         *
-         *  ⚠ Deliberately held HERE and not in `UploadProgress`: the transfer layer
-         *  reports transfer facts, and a wall clock is not one of them. Keeping it
-         *  out of that interface is what stops a future reader treating elapsed
-         *  time as a progress signal, which is bug060's defect exactly. */
-        startedAt: number;
-        /** True from the moment the user drops the file until the transfer layer
-         *  makes its FIRST report. Everything before that first report is genuinely
-         *  on-device work (chunking, sealing), so it is the only interval we may
-         *  honestly label "Encrypting". */
-        sealing: boolean;
-      } & UploadProgress)
-    | null
-  >(null);
+  /** Active upload progress, or null when idle — the BATCH record (F2,
+   *  2026-09-23; `upload-batch.ts` owns its shape and its sums). Live BYTES +
+   *  resilience signals (bug046/bug047): the FileList renders a determinate
+   *  bytes-based bar (a slow upload never reads as frozen), the in-flight and
+   *  retry notes, and — when a bad network window pauses a file — that file's
+   *  Resume/Cancel affordance while the rest of the batch keeps moving. */
+  uploadProgress = $state<UploadBatchState | null>(null);
   /** Active download progress, or null when idle (bug061). The FileList renders
    *  a determinate per-chunk bar — the honest read-path analog of the upload
    *  bar, so a slow download no longer reads as a frozen screen. */
   downloadProgress = $state<({ fileName: string } & DownloadProgress) | null>(null);
-  /** The in-flight upload's control surface (resume/cancel); null when idle. */
-  private uploadController: UploadController | null = null;
+  /** The in-flight batch's control surface (resume/cancel, whole or per file); null when idle. */
+  private uploadBatch: UploadBatch<File> | null = null;
 
   constructor(session: Session) {
     this.drive = new Drive(createApiClient(), session);
@@ -1111,111 +1086,103 @@ export class Browser {
       this.error = preflight;
       return;
     }
-    const controller = new UploadController();
-    this.uploadController = controller;
     // F4 (2026-09-21): the transfer layer has no `document`. Forward page
-    // visibility so a retry after a suspension waits for the wake and its
-    // resume-refresh (drive.ts), and hold the screen awake for a long upload
-    // (the lock is gated on the transfer layer's own forecast, in wake-lock.ts).
+    // visibility so a retry after a suspension refreshes from the server
+    // (drive.ts), and hold the screen awake for a long upload (the lock is
+    // gated on the transfer layer's own forecast, in wake-lock.ts).
     const wakeLock = new UploadWakeLock(
       typeof navigator !== 'undefined'
         ? (navigator as Navigator & { wakeLock?: WakeLockApiLike }).wakeLock
         : undefined,
     );
-    // The document's CURRENT state first: a batch begun while hidden has no
-    // hide transition to learn from (Gus, fold 2).
-    controller.initVisibility(document.visibilityState === 'visible');
+    // bug048: the folder may already hold these names (names are ciphertext to
+    // the server — zero-access — so uniqueness is a CLIENT decision; the CLI
+    // applies the identical rule, names.ts ↔ names.rs). The taken-set also
+    // accumulates the batch's own choices, so dropping "a.txt" twice yields
+    // "a.txt" + "a (1).txt". The batch chooses names in file order, before any
+    // await (upload-batch.ts).
+    const takenNames = new Set(this.files.map((f) => f.name));
+    // F2 (2026-09-23): the batch keeps up to N files open on ONE slot pool —
+    // the scheduling and the record's sums live in upload-batch.ts, tested
+    // there; this store wires `document` in and the record out.
+    const batch = new UploadBatch<File>({
+      files,
+      dedupe: (desired) => {
+        const chosen = dedupeName(desired, takenNames);
+        takenNames.add(chosen);
+        return chosen;
+      },
+      // bug070: the SAME planner the pre-flight compared against.
+      forecastParts: (size) => this.drive.uploadPlan(size).chunkCount,
+      upload: (file, uploadName, onProgress, controller, slots) =>
+        // The File streams chunk-by-chunk inside Drive.uploadFile (peak memory is
+        // N chunks across the batch); progress reports live bytes + retries + the
+        // paused state per file, summed by the batch.
+        this.drive.uploadFile(
+          {
+            folderId: folder.folderId,
+            rootFolderId: folder.rootFolderId,
+            // A share-folder upload must wrap each file's DEK to the folder's
+            // recipients (S049); a private folder (null role) stays self-only.
+            shareFolder: this.currentShareRole !== null,
+          },
+          uploadName,
+          file,
+          onProgress,
+          controller,
+          slots,
+        ),
+      onState: (state) => {
+        this.uploadProgress = state;
+        wakeLock.consider(state.etaSeconds);
+      },
+      // The document's CURRENT state first: a batch begun while hidden has no
+      // hide transition to learn from (Gus, fold 2).
+      initiallyVisible: document.visibilityState === 'visible',
+    });
+    this.uploadBatch = batch;
     const onVisibilityChange = () => {
       const visible = document.visibilityState === 'visible';
-      controller.setVisibility(visible);
+      batch.setVisibility(visible);
       if (visible) wakeLock.onVisible();
     };
     document.addEventListener('visibilitychange', onVisibilityChange);
     // Abandoning the page mid-upload is a ROLLBACK by design (the File handle
     // cannot survive a reload, so cross-reload resume is structurally out):
-    // fire a best-effort keepalive abort so the reservation frees promptly —
-    // the server's expiry sweep is the backstop. A bfcache restore
-    // (`persisted`) keeps the page alive, so the upload is left alone.
+    // fire a best-effort keepalive abort for every open file so the
+    // reservations free promptly — the server's expiry sweep is the backstop. A
+    // bfcache restore (`persisted`) keeps the page alive, so the uploads are
+    // left alone.
     const onPageHide = (event: PageTransitionEvent) => {
       if (event.persisted) return;
-      const active = controller.active;
-      if (!active) return;
-      void fetch(
-        `/v1/files/${encodeURIComponent(active.fileId)}/multipart/${encodeURIComponent(active.uploadId)}`,
-        { method: 'DELETE', credentials: 'include', keepalive: true },
-      ).catch(() => undefined);
+      for (const active of batch.activeUploads()) {
+        void fetch(
+          `/v1/files/${encodeURIComponent(active.fileId)}/multipart/${encodeURIComponent(active.uploadId)}`,
+          { method: 'DELETE', credentials: 'include', keepalive: true },
+        ).catch(() => undefined);
+      }
     };
     window.addEventListener('pagehide', onPageHide);
-    // bug048: the folder may already hold these names (names are ciphertext to
-    // the server — zero-access — so uniqueness is a CLIENT decision; the CLI
-    // applies the identical rule, names.ts ↔ names.rs). The taken-set also
-    // accumulates the batch's own choices, so dropping "a.txt" twice yields
-    // "a.txt" + "a (1).txt".
-    const takenNames = new Set(this.files.map((f) => f.name));
     await this.mutate(async () => {
       try {
-        for (const [fileIndex, file] of files.entries()) {
-          // bug070: the per-file ceiling check that used to sit here has MOVED into
-          // preflightCapacity above — deliberately, not duplicated. It compared
-          // `file.size` (plaintext) against a ceiling the server applies to
-          // ciphertext, and keeping a second copy of the rule here is precisely the
-          // two-homes defect this change exists to remove.
-          const uploadName = dedupeName(file.name, takenNames);
-          takenNames.add(uploadName);
-          const startedAt = Date.now();
-          this.uploadProgress = {
-            fileName: uploadName,
-            fileIndex,
-            fileCount: files.length,
-            startedAt,
-            sealing: true,
-            completedParts: 0,
-            totalParts: 1,
-            sentBytes: 0,
-            totalBytes: file.size,
-            retries: 0,
-            paused: false,
-            waitingForCapacitySeconds: null,
-            // F3: nothing in flight and no rate until the transfer layer says so.
-            inFlightParts: 0,
-            measuredRateBytesPerSec: null,
-            etaSeconds: null,
-            suspensions: 0,
-          };
-          // The File streams chunk-by-chunk inside Drive.uploadFile (peak memory is
-          // one chunk); progress reports live bytes + retries + the paused state.
-          await this.drive.uploadFile(
-            {
-              folderId: folder.folderId,
-              rootFolderId: folder.rootFolderId,
-              // A share-folder upload must wrap each file's DEK to the folder's
-              // recipients (S049); a private folder (null role) stays self-only.
-              shareFolder: this.currentShareRole !== null,
-            },
-            uploadName,
-            file,
-            (progress) => {
-              // The first report ends the on-device phase by definition: the transfer
-              // layer only speaks once it is working the parts.
-              this.uploadProgress = {
-                fileName: uploadName,
-                fileIndex,
-                fileCount: files.length,
-                startedAt,
-                sealing: false,
-                ...progress,
-              };
-              wakeLock.consider(progress.etaSeconds);
-            },
-            controller,
+        const outcome = await batch.run();
+        // §2.7: a file that failed on a definitive verdict was rolled back and
+        // is reported HERE, at batch end, beside the ones that landed — never
+        // silently. One failure reads as it always has; several name the count
+        // and the first reason. The user's own cancel is not an error.
+        if (outcome.failures.length === 1) throw outcome.failures[0].error;
+        if (outcome.failures.length > 1) {
+          throw new Error(
+            m.filelist_upload_some_failed({
+              failed: outcome.failures.length,
+              count: files.length,
+              reason: friendlyDriveError(outcome.failures[0].error),
+            }),
           );
         }
-      } catch (error) {
-        // The user's own cancel is not an error — the upload was rolled back.
-        if (!(error instanceof UploadCancelledError)) throw error;
       } finally {
         this.uploadProgress = null;
-        this.uploadController = null;
+        this.uploadBatch = null;
         document.removeEventListener('visibilitychange', onVisibilityChange);
         void wakeLock.release();
         window.removeEventListener('pagehide', onPageHide);
@@ -1223,15 +1190,24 @@ export class Browser {
     });
   }
 
-  /** Resume a paused upload (the bug047 bad-window pause). */
-  resumeUpload(): void {
-    this.uploadController?.resume();
+  /** Resume a paused upload (the bug047 bad-window pause): one file by index,
+   *  or every paused file of the batch when none is named. */
+  resumeUpload(fileIndex?: number): void {
+    if (fileIndex === undefined) this.uploadBatch?.resumeAll();
+    else this.uploadBatch?.resumeFile(fileIndex);
   }
 
-  /** Cancel the in-flight/paused upload — aborts it server-side and frees the
-   *  reservation (a user action, never surfaced as an error). */
+  /** Cancel the whole in-flight/paused batch — aborts every open file
+   *  server-side, frees their reservations, keeps the files already landed
+   *  (a user action, never surfaced as an error). */
   cancelUpload(): void {
-    this.uploadController?.cancel();
+    this.uploadBatch?.cancel();
+  }
+
+  /** F2 §2.7: cancel ONE file of the batch (a paused one, typically); the
+   *  others keep going. */
+  cancelUploadFile(fileIndex: number): void {
+    this.uploadBatch?.cancelFile(fileIndex);
   }
 
   async download(file: NamedFile): Promise<boolean> {
