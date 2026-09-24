@@ -9,6 +9,7 @@
   import { friendlyAuthError } from '$lib/errors';
   import { normalizeHandle, validateHandle } from '$lib/handle';
   import Turnstile from '$lib/components/Turnstile.svelte';
+  import TermsConsent from '$lib/components/TermsConsent.svelte';
   import { m } from '$lib/paraglide/messages.js';
   import { onMount } from 'svelte';
 
@@ -57,6 +58,9 @@
   let handleError = $state('');
   let sent = $state(false);
   let turnstileToken = $state('');
+  // The Terms of Service + Privacy Policy checkbox (Chris, 2026-09-23): submit stays
+  // disabled until it is ticked, and the server refuses a begin-signup without it.
+  let acceptedTerms = $state(false);
   // Component handle for the Turnstile widget — lets us reset() it (a fresh,
   // single-use token) after a failed submit so the real error isn't masked (Bug015).
   let turnstileEl = $state<ReturnType<typeof Turnstile>>();
@@ -76,6 +80,7 @@
     event.preventDefault();
     if (busy || !configLoaded) return;
     if (turnstileSitekey && !turnstileToken) return;
+    if (!acceptedTerms) return;
     const trimmedHandle = normalizeHandle(handle);
     const problem = validateHandle(trimmedHandle);
     if (problem) {
@@ -90,6 +95,7 @@
         handle: trimmedHandle,
         email: email.trim(),
         turnstileToken: turnstileSitekey ? turnstileToken : undefined,
+        acceptedTerms,
       });
       sent = true;
     } catch (err) {
@@ -145,6 +151,7 @@
         placeholder={m.signup_email_placeholder()}
         disabled={busy}
       />
+      <TermsConsent bind:checked={acceptedTerms} disabled={busy} />
       {#if turnstileSitekey}
         <Turnstile
           sitekey={turnstileSitekey}
@@ -156,7 +163,7 @@
       <Button
         type="submit"
         loading={busy}
-        disabled={!configLoaded || (!!turnstileSitekey && !turnstileToken)}
+        disabled={!configLoaded || !acceptedTerms || (!!turnstileSitekey && !turnstileToken)}
       >
         {busy ? m.signup_sending() : m.signup_continue()}
       </Button>

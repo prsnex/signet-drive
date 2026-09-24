@@ -444,8 +444,11 @@
               {m.filelist_upload_completing({ fileName: p.fileName })}
             {:else if p.filesOpen > 1}
               <!-- F2: several files are open on the shared slots; the per-file rows
-                 collapse to the range ("files 3–6 of 31"). -->
+                 collapse to the range. F3-d: the COUNT leads, because files finish
+                 out of order and "12–16" alone reads as five when four are open
+                 ("Uploading 4 files (12–16 of 30)"). -->
               {m.filelist_uploading_batch({
+                open: p.filesOpen,
                 first: p.firstOpenIndex + 1,
                 last: p.lastOpenIndex + 1,
                 count: p.fileCount,

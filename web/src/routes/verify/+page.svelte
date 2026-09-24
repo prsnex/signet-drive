@@ -5,6 +5,8 @@
   import { goto } from '$app/navigation';
   import AuthCard from '$lib/components/AuthCard.svelte';
   import Button from '$lib/components/Button.svelte';
+  import TermsConsent from '$lib/components/TermsConsent.svelte';
+  import { SignetApiError } from '$lib/api';
   import { authDeps } from '$lib/deps';
   import {
     registerSignupCredential,
@@ -36,6 +38,7 @@
   // never registration, which the server refuses once a passkey is stored.
   type Status =
     | 'verifying'
+    | 'terms'
     | 'ready'
     | 'registering'
     | 'registered'
@@ -51,6 +54,11 @@
   let accountId = $state('');
   let email = $state('');
   let credential = $state<SignupCredential | null>(null);
+  // An admin invitee never saw the sign-up form, so the server answers
+  // `terms_not_accepted` until they tick the box here; the token is left unconsumed
+  // by that refusal, so the same link completes (Chris, 2026-09-23).
+  let verifyToken = $state('');
+  let acceptedTerms = $state(false);
 
   /** A cancelled, timed-out, or unavailable-authenticator credential ceremony —
    *  the WebAuthn `NotAllowedError`. Deliberately narrow: every other failure
@@ -85,8 +93,26 @@
       }
       return;
     }
+    verifyToken = token;
     try {
       accountId = (await verifySignupEmail(authDeps(), token)).accountId;
+      status = 'ready';
+    } catch (err) {
+      if (err instanceof SignetApiError && err.code === 'terms_not_accepted') {
+        status = 'terms';
+        return;
+      }
+      status = 'error';
+      error = friendlyAuthError(err);
+    }
+  }
+
+  /** The invitee ticked the box: verify again, carrying the acceptance. */
+  async function acceptAndVerify() {
+    if (!acceptedTerms) return;
+    status = 'verifying';
+    try {
+      accountId = (await verifySignupEmail(authDeps(), verifyToken, true)).accountId;
       status = 'ready';
     } catch (err) {
       status = 'error';
@@ -167,6 +193,16 @@
 {#if status === 'verifying'}
   <AuthCard title={m.verify_title()} subtitle={m.verify_subtitle()}>
     <div class="center"><span class="spinner-lg" aria-hidden="true"></span></div>
+  </AuthCard>
+{:else if status === 'terms'}
+  <AuthCard title={m.verify_terms_title()}>
+    <div class="prep">
+      <p class="lead">{m.verify_terms_lead()}</p>
+    </div>
+    <div class="consent-row">
+      <TermsConsent bind:checked={acceptedTerms} />
+    </div>
+    <Button onclick={acceptAndVerify} disabled={!acceptedTerms}>{m.verify_terms_continue()}</Button>
   </AuthCard>
 {:else if status === 'ready'}
   <AuthCard title={m.verify_prep_title()}>
@@ -259,6 +295,9 @@
     margin-top: 0.6rem;
     font-size: 0.9em;
     color: var(--muted);
+  }
+  .consent-row {
+    margin: 0 0 1rem;
   }
   .alt {
     margin: 0.85rem 0 0;

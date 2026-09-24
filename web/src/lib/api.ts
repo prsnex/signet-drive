@@ -172,8 +172,16 @@ export interface SignupCohort {
 }
 
 export interface SignetApi {
-  beginSignup(input: { handle: string; email: string; turnstileToken?: string }): Promise<void>;
-  verifyEmail(token: string): Promise<VerifyEmailResponse>;
+  beginSignup(input: {
+    handle: string;
+    email: string;
+    turnstileToken?: string;
+    /** The Terms of Service + Privacy Policy checkbox; the server refuses without it. */
+    acceptedTerms: boolean;
+  }): Promise<void>;
+  /** `acceptTerms` — the email-link page's checkbox, for an admin invitee whose pending
+   *  sign-up carries no acceptance (the server answers `terms_not_accepted` until it is sent). */
+  verifyEmail(token: string, acceptTerms?: boolean): Promise<VerifyEmailResponse>;
   beginRegistration(accountId: string): Promise<BeginResponse>;
   completeRegistration(
     accountId: string,
@@ -1150,11 +1158,12 @@ export function createApiClient(
         handle: input.handle,
         email: input.email,
         turnstile_token: input.turnstileToken ?? null,
+        accepted_terms: input.acceptedTerms,
       }),
-    verifyEmail: (token) =>
+    verifyEmail: (token, acceptTerms) =>
       request<VerifyEmailResponse>(
         'GET',
-        `/v1/accounts/verify-email?token=${encodeURIComponent(token)}`,
+        `/v1/accounts/verify-email?token=${encodeURIComponent(token)}${acceptTerms ? '&accept_terms=true' : ''}`,
       ),
     beginRegistration: (accountId) =>
       request<BeginResponse>(

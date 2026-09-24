@@ -62,7 +62,7 @@ export interface Session {
  *  stubbed server-side until Phase 4.) */
 export function beginSignup(
   api: SignetApi,
-  input: { handle: string; email: string; turnstileToken?: string },
+  input: { handle: string; email: string; turnstileToken?: string; acceptedTerms: boolean },
 ): Promise<void> {
   return api.beginSignup(input);
 }
@@ -77,8 +77,9 @@ export function beginSignup(
 export async function verifySignupEmail(
   deps: AuthDeps,
   token: string,
+  acceptTerms = false,
 ): Promise<{ accountId: string; handle: string }> {
-  const verified = await deps.api.verifyEmail(token);
+  const verified = await deps.api.verifyEmail(token, acceptTerms);
   return { accountId: verified.account_id, handle: verified.handle };
 }
 

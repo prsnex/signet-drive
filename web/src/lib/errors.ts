@@ -32,6 +32,8 @@ export function friendlyAuthError(error: unknown): string {
         return m.err_auth_signin_failed();
       case 'email_unavailable':
         return m.err_auth_email_unavailable();
+      case 'terms_not_accepted':
+        return m.err_auth_terms_not_accepted();
       case 'handle_unavailable':
         return m.err_auth_username_taken();
       case 'email_verification_invalid':

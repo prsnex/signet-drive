@@ -35,6 +35,7 @@ test('lapse → read-only gate: writes blocked, reads + billing recovery allowed
   await page.goto('/signup');
   await page.getByLabel('Username').fill(`ro-${id}`);
   await page.getByLabel('Email').fill(email);
+  await page.getByRole('checkbox', { name: /Terms of Service/ }).check();
   await page.getByRole('button', { name: 'Continue' }).click();
   await expect(page.getByText('Check your email')).toBeVisible();
   const token = psql(

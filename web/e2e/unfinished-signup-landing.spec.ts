@@ -23,6 +23,7 @@ test('an unfinished signup is offered finish-setup on the landing, not a dead-en
   await page.goto('/signup');
   await page.getByLabel('Username').fill(handle);
   await page.getByLabel('Email').fill(email);
+  await page.getByRole('checkbox', { name: /Terms of Service/ }).check();
   await page.getByRole('button', { name: 'Continue' }).click();
   await expect(page.getByText('Check your email')).toBeVisible();
 

@@ -38,6 +38,7 @@ test('subscribe → hosted checkout (4242) → active webhook grant', async ({ p
   await page.goto('/signup');
   await page.getByLabel('Username').fill(handle);
   await page.getByLabel('Email').fill(email);
+  await page.getByRole('checkbox', { name: /Terms of Service/ }).check();
   await page.getByRole('button', { name: 'Continue' }).click();
   await expect(page.getByText('Check your email')).toBeVisible();
   const token = verificationToken(email);

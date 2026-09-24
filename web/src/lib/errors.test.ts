@@ -21,6 +21,11 @@ describe('friendlyAuthError', () => {
     expect(friendlyAuthError(new SignetApiError(409, 'handle_unavailable', 'x'))).toContain(
       'taken',
     );
+    // The Terms checkbox (Chris, 2026-09-23): a stale page submitting without it gets
+    // told what to do, not a generic failure.
+    expect(friendlyAuthError(new SignetApiError(400, 'terms_not_accepted', 'x'))).toContain(
+      'Terms of Service',
+    );
     expect(friendlyAuthError(new SignetApiError(400, 'prf_not_supported', 'x'))).toContain(
       'passkey',
     );

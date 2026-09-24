@@ -79,6 +79,7 @@ test('walk every human-web screen and state', async ({ page, browser }) => {
   await page.getByLabel('Username').fill(handle);
   await page.getByLabel('Email').fill(email);
   await shot(page, 'signup-filled');
+  await page.getByRole('checkbox', { name: /Terms of Service/ }).check();
   await page.getByRole('button', { name: 'Continue' }).click();
   await expect(page.getByText('Check your email')).toBeVisible();
   await shot(page, 'signup-check-your-email');
@@ -164,6 +165,7 @@ test('walk every human-web screen and state', async ({ page, browser }) => {
   await rPage.goto('/signup');
   await rPage.getByLabel('Username').fill(rHandle);
   await rPage.getByLabel('Email').fill(rEmail);
+  await rPage.getByRole('checkbox', { name: /Terms of Service/ }).check();
   await rPage.getByRole('button', { name: 'Continue' }).click();
   await expect(rPage.getByText('Check your email')).toBeVisible();
   await rPage.goto(`/verify?token=${verificationToken(rEmail)}`);

@@ -41,6 +41,7 @@ test('signup explains the passkey prompt first, and a cancelled ceremony offers 
   await page.goto('/signup');
   await page.getByLabel('Username').fill(handle);
   await page.getByLabel('Email').fill(email);
+  await page.getByRole('checkbox', { name: /Terms of Service/ }).check();
   await page.getByRole('button', { name: 'Continue' }).click();
   await expect(page.getByText('Check your email')).toBeVisible();
 

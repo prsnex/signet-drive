@@ -1113,7 +1113,7 @@ export class Browser {
         return chosen;
       },
       // bug070: the SAME planner the pre-flight compared against.
-      forecastParts: (size) => this.drive.uploadPlan(size).chunkCount,
+      planParts: (size) => this.drive.uploadPlan(size),
       upload: (file, uploadName, onProgress, controller, slots) =>
         // The File streams chunk-by-chunk inside Drive.uploadFile (peak memory is
         // N chunks across the batch); progress reports live bytes + retries + the

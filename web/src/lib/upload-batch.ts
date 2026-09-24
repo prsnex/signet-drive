@@ -39,7 +39,10 @@ export interface BatchFile {
  *  with the batch facts added. Every number is a FACT about transfer state, never
  *  a clock or a guess (bug060, bug075): bytes and parts are sums of what the
  *  transfer layer reported per file, plus the planner's part-count forecast for
- *  files not yet opened. */
+ *  files not yet opened — taken from the planner's current rate, held inside a
+ *  dead band, so the total settles once the link is measured instead of
+ *  shrinking file by file as each initiate replaces a floor-sized guess, and
+ *  does not jitter with the rate estimate (F3-c). */
 export interface UploadBatchState {
   fileCount: number;
   /** Files whose finalize returned — their rows land in the listing at batch end. */
@@ -89,8 +92,15 @@ export interface UploadBatchDeps<F extends BatchFile> {
   files: F[];
   /** bug048: the folder's taken-name rule, mutating its set as the batch chooses. */
   dedupe: (desired: string) => string;
-  /** The planner's part count for a file not yet opened (`Drive.uploadPlan`). */
-  forecastParts: (size: number) => number;
+  /** The planner's plan for a file not yet opened (`Drive.uploadPlan`): the part
+   *  size it would choose now, and the resulting count.
+   *  ⚠ Consulted at every `state()` read, not once at batch start (F3-c): the
+   *  planner sizes parts from the governor's LIVE rate, so a forecast frozen
+   *  before the first measurement is the floor's count for every file, and the
+   *  total then shrinks as each file opens (v1.0.5 staging: 161 → 108 → 51).
+   *  The part size is what the dead band compares (see `forecastFor`). Must stay
+   *  cheap and side-effect free — it is pure arithmetic today. */
+  planParts: (size: number) => { chunkSize: number; chunkCount: number };
   /** Open one file: the store binds this to `Drive.uploadFile` with the folder. */
   upload: (
     file: F,
@@ -114,11 +124,19 @@ export interface UploadBatchOutcome {
 interface OpenFile {
   name: string;
   size: number;
-  forecastParts: number;
   controller: UploadController;
   progress: UploadProgress | null;
   settled: Promise<void>;
 }
+
+/** F3-c dead band (Gus, review at c1f5fecb): a file's forecast is recomputed only
+ *  when the planner's part size has moved by more than this fraction from the
+ *  size that forecast used. The count is `ceil(size / partSize)` and flips at every
+ *  `size / k`; on a 5–20 Mbps link a photo's count sits across those boundaries,
+ *  so a forecast that followed every EWMA wobble would move the total by the
+ *  number of pending files and back. The first measurement is a large move from
+ *  the floor and always recomputes; a real change (a link halving) moves it once. */
+export const FORECAST_DEAD_BAND = 0.2;
 
 export class UploadBatch<F extends BatchFile> {
   /** The batch's one pool; its size is learned from the first file's initiate. */
@@ -141,14 +159,14 @@ export class UploadBatch<F extends BatchFile> {
   private readonly startedAt: number;
   private readonly now: () => number;
   private readonly totalBytesAll: number;
-  private readonly forecast: number[];
+  /** Each file's held forecast, by index — the plan the dead band compares to. */
+  private readonly held = new Map<number, { chunkSize: number; chunkCount: number }>();
 
   constructor(private readonly deps: UploadBatchDeps<F>) {
     this.now = deps.now ?? (() => Date.now());
     this.startedAt = this.now();
     this.visible = deps.initiallyVisible;
     this.totalBytesAll = deps.files.reduce((n, f) => n + f.size, 0);
-    this.forecast = deps.files.map((f) => deps.forecastParts(f.size));
   }
 
   /** Run the batch to its end: every file done, failed or cancelled. Never
@@ -223,7 +241,6 @@ export class UploadBatch<F extends BatchFile> {
     const entry: OpenFile = {
       name,
       size: file.size,
-      forecastParts: this.forecast[fileIndex],
       controller,
       progress: null,
       settled: Promise.resolve(),
@@ -244,7 +261,7 @@ export class UploadBatch<F extends BatchFile> {
         () => {
           this.done += 1;
           this.doneBytes += file.size;
-          this.doneParts += entry.progress?.totalParts ?? entry.forecastParts;
+          this.doneParts += entry.progress?.totalParts ?? this.forecastFor(fileIndex);
           this.doneRetries += entry.progress?.retries ?? 0;
         },
         (error: unknown) => {
@@ -254,7 +271,7 @@ export class UploadBatch<F extends BatchFile> {
             this.failures.push({ fileIndex, fileName: name, error });
           }
           this.failedBytes += file.size;
-          this.failedParts += entry.progress?.totalParts ?? entry.forecastParts;
+          this.failedParts += entry.progress?.totalParts ?? this.forecastFor(fileIndex);
           this.doneRetries += entry.progress?.retries ?? 0;
         },
       )
@@ -276,6 +293,18 @@ export class UploadBatch<F extends BatchFile> {
     this.deps.onState(this.state());
   }
 
+  /** A file's forecast part count: the held plan, unless the planner's part size
+   *  has moved outside the dead band from it (or nothing is held yet). */
+  private forecastFor(fileIndex: number): number {
+    const now = this.deps.planParts(this.deps.files[fileIndex].size);
+    const held = this.held.get(fileIndex);
+    if (held && Math.abs(now.chunkSize - held.chunkSize) <= FORECAST_DEAD_BAND * held.chunkSize) {
+      return held.chunkCount;
+    }
+    this.held.set(fileIndex, now);
+    return now.chunkCount;
+  }
+
   /** The batch record, summed from the per-file reports. Exposed for tests. */
   state(): UploadBatchState {
     const { files } = this.deps;
@@ -294,7 +323,7 @@ export class UploadBatch<F extends BatchFile> {
     for (const i of indexes) {
       const entry = this.open.get(i)!;
       const p = entry.progress;
-      openTotalParts += p?.totalParts ?? entry.forecastParts;
+      openTotalParts += p?.totalParts ?? this.forecastFor(i);
       if (!p) continue;
       openSent += p.sentBytes;
       openCompleted += p.completedParts;
@@ -308,11 +337,11 @@ export class UploadBatch<F extends BatchFile> {
         pausedFiles.push({ fileIndex: i, fileName: entry.name });
       }
     }
-    // Files not yet opened: the planner's forecast, replaced by the initiate's
-    // count once each opens.
+    // Files not yet opened: the planner's forecast at its current rate, held in the
+    // dead band (F3-c), replaced by the initiate's count once each opens.
     let pendingParts = 0;
     const opened = this.done + this.cancelledFiles + this.failures.length + indexes.length;
-    for (let i = opened; i < files.length; i += 1) pendingParts += this.forecast[i];
+    for (let i = opened; i < files.length; i += 1) pendingParts += this.forecastFor(i);
     const totalBytes = this.totalBytesAll - this.failedBytes;
     const sentBytes = Math.min(totalBytes, this.doneBytes + openSent);
     const totalParts = this.doneParts + openTotalParts + pendingParts;

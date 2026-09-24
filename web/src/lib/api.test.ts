@@ -53,7 +53,11 @@ describe('api client', () => {
 
     const { fetch: f202 } = fakeFetch(() => new Response(null, { status: 202 }));
     await expect(
-      createApiClient({ fetch: f202 }).beginSignup({ handle: 'h', email: 'a@test.example' }),
+      createApiClient({ fetch: f202 }).beginSignup({
+        handle: 'h',
+        email: 'a@test.example',
+        acceptedTerms: true,
+      }),
     ).resolves.toBeUndefined();
   });
 
@@ -80,21 +84,30 @@ describe('api client', () => {
     });
   });
 
-  it('begin-signup maps turnstileToken -> turnstile_token; verify-email url-encodes the token', async () => {
+  it('begin-signup maps turnstileToken -> turnstile_token and acceptedTerms -> accepted_terms; verify-email url-encodes the token and adds accept_terms only when asked', async () => {
     const { fetch, calls } = fakeFetch((url) =>
       url.startsWith('/v1/accounts/verify-email')
         ? json(200, { account_id: 'a1', handle: 'h' })
         : new Response(null, { status: 202 }),
     );
     const api = createApiClient({ fetch });
-    await api.beginSignup({ handle: 'alice', email: 'a@test.example', turnstileToken: 'tok' });
+    await api.beginSignup({
+      handle: 'alice',
+      email: 'a@test.example',
+      turnstileToken: 'tok',
+      acceptedTerms: true,
+    });
     expect(bodyOf(calls[0])).toEqual({
       handle: 'alice',
       email: 'a@test.example',
       turnstile_token: 'tok',
+      accepted_terms: true,
     });
     await api.verifyEmail('ab cd&ef');
     expect(calls[1].url).toBe('/v1/accounts/verify-email?token=ab%20cd%26ef');
+    // An admin invitee's email-link page carries the checkbox as accept_terms=true.
+    await api.verifyEmail('ab cd&ef', true);
+    expect(calls[2].url).toBe('/v1/accounts/verify-email?token=ab%20cd%26ef&accept_terms=true');
   });
 
   it('getPublicConfig GETs /v1/config and returns the turnstile sitekey', async () => {

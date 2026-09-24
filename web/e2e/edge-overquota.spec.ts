@@ -32,6 +32,7 @@ test('over-quota: upload refused 413, succeeds after quota raised', async ({ pag
   await page.goto('/signup');
   await page.getByLabel('Username').fill(`oq-${id}`);
   await page.getByLabel('Email').fill(email);
+  await page.getByRole('checkbox', { name: /Terms of Service/ }).check();
   await page.getByRole('button', { name: 'Continue' }).click();
   await expect(page.getByText('Check your email')).toBeVisible();
   const token = psql(
