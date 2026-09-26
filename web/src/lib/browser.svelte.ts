@@ -26,6 +26,18 @@ import { DownloadCancelledError, openSwStreamedSink } from './sw-download';
 import { groupSharedByOwner, type GroupedShares } from './grouping';
 import { dedupeName } from './names';
 import { UploadBatch, type UploadBatchState } from './upload-batch';
+import {
+  DropReadError,
+  FolderCreateError,
+  createPlannedFolders,
+  nameFolders,
+  perFolderDedupe,
+  planFromRelativePaths,
+  resolveEntries,
+  type DropCapture,
+  type FolderTarget,
+  type FolderUploadPlan,
+} from './folder-drop';
 import { loadNavState, saveNavState } from './nav-persist';
 // Relative on purpose, matching errors.ts: the unit-test runner resolves no $lib aliases.
 import { m } from './paraglide/messages.js';
@@ -61,6 +73,20 @@ export interface NamedFile {
 /** One step in the navigation path. `rootFolderId` is constant within a path
  *  (the top-level folder's id) — it binds the §7.2/§7.3 crypto for everything
  *  in this hierarchy. */
+/** One file of an upload plan, as the batch sees it (`folder`: an index into the
+ *  plan's folders, or null for the folder the upload was started in). */
+interface PlanItem {
+  name: string;
+  size: number;
+  file: File;
+  folder: number | null;
+}
+
+/** A folder upload's preparation, shown before the batch exists. */
+export type FolderPrep =
+  | { kind: 'reading'; files: number }
+  | { kind: 'creating'; done: number; total: number };
+
 export interface Crumb {
   folderId: string;
   rootFolderId: string;
@@ -368,7 +394,14 @@ export class Browser {
    *  bar, so a slow download no longer reads as a frozen screen. */
   downloadProgress = $state<({ fileName: string } & DownloadProgress) | null>(null);
   /** The in-flight batch's control surface (resume/cancel, whole or per file); null when idle. */
-  private uploadBatch: UploadBatch<File> | null = null;
+  private uploadBatch: UploadBatch<PlanItem> | null = null;
+  /** A folder drop's preparation, before the batch exists (folder-upload design
+   *  note §2.4): the tree walk (`reading`, files found so far) or the folder
+   *  creation (`creating`, n of m). Null otherwise. */
+  folderPrep = $state<FolderPrep | null>(null);
+  /** The batch-end note for skipped OS clutter (Gus, v01 review answer 2); empty
+   *  when there is nothing to say. Cleared when the next upload starts. */
+  uploadNotice = $state('');
 
   constructor(session: Session) {
     this.drive = new Drive(createApiClient(), session);
@@ -1071,21 +1104,118 @@ export class Browser {
     return capacityRefusal(candidates, cap ?? null, remaining);
   }
 
+  /** The Upload button: plain files into the current folder. */
   async uploadFiles(fileList: FileList | File[]): Promise<void> {
-    const folder = this.current;
-    if (!folder) return;
     const files = Array.from(fileList);
     if (files.length === 0) return;
+    await this.uploadPlan({
+      folders: [],
+      files: files.map((file) => ({ file, folder: null })),
+      skipped: 0,
+    });
+  }
+
+  /** A DROP: files, folders, or both (folder-upload design note §2.2). The capture
+   *  was taken synchronously inside the drop event; this resolves the whole tree
+   *  BEFORE anything is created, so an unreadable entry refuses the drop with
+   *  nothing done (refuse before acting, bug070). */
+  async uploadDrop(capture: DropCapture): Promise<void> {
+    if (!this.current || this.busy) return;
+    this.error = '';
+    this.uploadNotice = '';
+    // ⛔ An item the browser gave no entry for is refused, never uploaded: it is
+    // the class that produced the dead `RAW` file (Chris, 2026-09-25).
+    if (capture.unreadable.length > 0) {
+      this.error = m.err_drop_not_readable({ names: capture.unreadable.join(', ') });
+      return;
+    }
+    if (capture.entries.length === 0) return;
+    // ⛔ Folder creation is owner-only (see `uploadPlan`). The capture already
+    // knows which entries are folders, so a non-owner's folder drop is refused
+    // HERE, before the walk reads a single file (Gus, code review note a).
+    if (capture.entries.some((e) => e.isDirectory) && !this.ownsCurrentRoot) {
+      this.error = m.err_drop_folders_not_owner();
+      return;
+    }
+    // Busy for the walk too, so a second drop cannot start alongside it.
+    this.busy = true;
+    this.folderPrep = { kind: 'reading', files: 0 };
+    let plan: FolderUploadPlan;
+    try {
+      plan = await resolveEntries(capture.entries, (files) => {
+        this.folderPrep = { kind: 'reading', files };
+      });
+    } catch (e) {
+      this.error =
+        e instanceof DropReadError
+          ? m.err_drop_unreadable({ path: e.path })
+          : friendlyDriveError(e);
+      return;
+    } finally {
+      this.folderPrep = null;
+      this.busy = false;
+    }
+    await this.uploadPlan(plan);
+  }
+
+  /** The Upload menu's "Folder…" (§2.6; Chris, 2026-09-25): a folder chosen with
+   *  `<input webkitdirectory>`. */
+  async uploadPickedFolder(fileList: FileList | File[]): Promise<void> {
+    if (!this.current || fileList.length === 0) return;
+    this.error = '';
+    this.uploadNotice = '';
+    await this.uploadPlan(planFromRelativePaths(fileList));
+  }
+
+  /** Upload a plan into the current folder: create its folders parent-first, then
+   *  ONE batch over every file, each file carrying its own target (§2.4). A plain
+   *  file upload is the plan with no folders, so it runs the identical path. */
+  private async uploadPlan(plan: FolderUploadPlan): Promise<void> {
+    const folder = this.current;
+    if (!folder) return;
+    this.uploadNotice = '';
+    if (plan.files.length === 0 && plan.folders.length === 0) {
+      this.showUploadSkipped(plan.skipped);
+      return;
+    }
+    // ⛔ Creating a folder is OWNER-only on the server (folders.rs resolves the
+    // parent with `account_id = you`; bug223), while uploading files is open to a
+    // read_write recipient. So a folder upload into someone else's share folder
+    // would fail at its first folder — refuse it here, before anything is created.
+    if (plan.folders.length > 0 && !this.ownsCurrentRoot) {
+      this.error = m.err_drop_folders_not_owner();
+      return;
+    }
     const cap = this.me?.max_upload_size_bytes;
-    // bug070: refuse before a single byte moves, on the two grounds the server
-    // will refuse on. This runs against STORED sizes from `Drive.uploadPlan` — the
-    // same function the upload declares from — because the server's ceiling and its
-    // quota reservation both apply to ciphertext, not to `File.size`.
-    const preflight = await this.preflightCapacity(files, cap);
+    // bug070: refuse before a single byte moves — and, for a folder upload, before a
+    // single folder is created — on the two grounds the server will refuse on. This
+    // runs against STORED sizes from `Drive.uploadPlan` — the same function the
+    // upload declares from — because the server's ceiling and its quota reservation
+    // both apply to ciphertext, not to `File.size`.
+    const preflight = await this.preflightCapacity(
+      plan.files.map((f) => f.file),
+      cap,
+    );
     if (preflight) {
       this.error = preflight;
       return;
     }
+    // A share-folder upload must wrap each file's DEK to the folder's recipients
+    // (S049); a private folder (null role) stays self-only. Read ONCE: every target
+    // of a folder upload sits under the drop target's root, so they all share it.
+    const shareFolder = this.currentShareRole !== null;
+    // §2.3: a dropped folder whose name is taken among the target's SUBFOLDERS is
+    // created as "RAW (1)" by bug048's rule — never merged. Folder names dedupe
+    // against folders only, file names against files only (today's client
+    // namespace; the server stores names opaquely), so a folder may share a
+    // file's name (Gus, v01 review). Nested folders are new, so they keep theirs.
+    const folderNames = nameFolders(
+      plan.folders,
+      this.childFolders.map((f) => f.name),
+      dedupeName,
+    );
+    // Filled once the folders are created; index = the plan's folder index.
+    let targets: FolderTarget[] = [];
     // F4 (2026-09-21): the transfer layer has no `document`. Forward page
     // visibility so a retry after a suspension refreshes from the server
     // (drive.ts), and hold the screen awake for a long upload (the lock is
@@ -1095,43 +1225,46 @@ export class Browser {
         ? (navigator as Navigator & { wakeLock?: WakeLockApiLike }).wakeLock
         : undefined,
     );
-    // bug048: the folder may already hold these names (names are ciphertext to
+    // bug048: the target may already hold these names (names are ciphertext to
     // the server — zero-access — so uniqueness is a CLIENT decision; the CLI
-    // applies the identical rule, names.ts ↔ names.rs). The taken-set also
-    // accumulates the batch's own choices, so dropping "a.txt" twice yields
-    // "a.txt" + "a (1).txt". The batch chooses names in file order, before any
-    // await (upload-batch.ts).
-    const takenNames = new Set(this.files.map((f) => f.name));
+    // applies the identical rule, names.ts ↔ names.rs). Each target folder keeps
+    // its own taken-set, which also accumulates the batch's own choices, so
+    // dropping "a.txt" twice yields "a.txt" + "a (1).txt". The batch chooses names
+    // in file order, before any await (upload-batch.ts). A new folder starts empty.
+    const items: PlanItem[] = plan.files.map((p) => ({
+      name: p.file.name,
+      size: p.file.size,
+      file: p.file,
+      folder: p.folder,
+    }));
     // F2 (2026-09-23): the batch keeps up to N files open on ONE slot pool —
     // the scheduling and the record's sums live in upload-batch.ts, tested
     // there; this store wires `document` in and the record out.
-    const batch = new UploadBatch<File>({
-      files,
-      dedupe: (desired) => {
-        const chosen = dedupeName(desired, takenNames);
-        takenNames.add(chosen);
-        return chosen;
-      },
+    const batch = new UploadBatch<PlanItem>({
+      files: items,
+      dedupe: perFolderDedupe(
+        this.files.map((f) => f.name),
+        dedupeName,
+      ),
       // bug070: the SAME planner the pre-flight compared against.
       planParts: (size) => this.drive.uploadPlan(size),
-      upload: (file, uploadName, onProgress, controller, slots) =>
+      upload: (item, uploadName, onProgress, controller, slots) => {
+        const target =
+          item.folder === null
+            ? { folderId: folder.folderId, rootFolderId: folder.rootFolderId }
+            : targets[item.folder];
         // The File streams chunk-by-chunk inside Drive.uploadFile (peak memory is
         // N chunks across the batch); progress reports live bytes + retries + the
         // paused state per file, summed by the batch.
-        this.drive.uploadFile(
-          {
-            folderId: folder.folderId,
-            rootFolderId: folder.rootFolderId,
-            // A share-folder upload must wrap each file's DEK to the folder's
-            // recipients (S049); a private folder (null role) stays self-only.
-            shareFolder: this.currentShareRole !== null,
-          },
+        return this.drive.uploadFile(
+          { folderId: target.folderId, rootFolderId: target.rootFolderId, shareFolder },
           uploadName,
-          file,
+          item.file,
           onProgress,
           controller,
           slots,
-        ),
+        );
+      },
       onState: (state) => {
         this.uploadProgress = state;
         wakeLock.consider(state.etaSeconds);
@@ -1165,6 +1298,12 @@ export class Browser {
     window.addEventListener('pagehide', onPageHide);
     await this.mutate(async () => {
       try {
+        // §2.4 step 3: every folder exists before the first file opens; a creation
+        // failure stops here, so no file is sent into a half-built tree.
+        if (plan.folders.length > 0) {
+          targets = await this.createFolders(plan, folderNames, folder);
+        }
+        if (items.length === 0) return;
         const outcome = await batch.run();
         // §2.7: a file that failed on a definitive verdict was rolled back and
         // is reported HERE, at batch end, beside the ones that landed — never
@@ -1175,12 +1314,13 @@ export class Browser {
           throw new Error(
             m.filelist_upload_some_failed({
               failed: outcome.failures.length,
-              count: files.length,
+              count: items.length,
               reason: friendlyDriveError(outcome.failures[0].error),
             }),
           );
         }
       } finally {
+        this.folderPrep = null;
         this.uploadProgress = null;
         this.uploadBatch = null;
         document.removeEventListener('visibilitychange', onVisibilityChange);
@@ -1188,6 +1328,52 @@ export class Browser {
         window.removeEventListener('pagehide', onPageHide);
       }
     });
+    // Gus (v01 review, answer 2): skipped OS clutter is silent while running and
+    // counted HERE, in one place, whatever the batch's outcome.
+    this.showUploadSkipped(plan.skipped);
+  }
+
+  /** §2.4 step 3, wired: `createPlannedFolders` over `Drive.createFolder` (nested
+   *  folders reuse the root's metadata key there, exactly as "New folder" does),
+   *  with the panel's `Creating folders n of m`. A failure becomes the message that
+   *  names the folder that failed and the top-level folders it left (Gus, note b). */
+  private async createFolders(
+    plan: FolderUploadPlan,
+    names: string[],
+    dropTarget: FolderTarget,
+  ): Promise<FolderTarget[]> {
+    try {
+      return await createPlannedFolders(
+        plan.folders,
+        names,
+        dropTarget,
+        (name, parent) => this.drive.createFolder(name, parent),
+        (done, total) => {
+          this.folderPrep = { kind: 'creating', done, total };
+        },
+      );
+    } catch (e) {
+      if (!(e instanceof FolderCreateError)) throw e;
+      const reason = friendlyDriveError(e.reason);
+      throw new Error(
+        e.createdRoots.length > 0
+          ? m.err_folder_create_failed_partial({
+              name: e.folderPath,
+              reason,
+              created: e.createdRoots.join(', '),
+            })
+          : m.err_folder_create_failed({ name: e.folderPath, reason }),
+      );
+    }
+  }
+
+  /** The batch-end count of skipped OS clutter; nothing when there was none. */
+  private showUploadSkipped(skipped: number): void {
+    if (skipped <= 0) return;
+    this.uploadNotice =
+      skipped === 1
+        ? m.filelist_upload_skipped_one()
+        : m.filelist_upload_skipped_many({ count: skipped });
   }
 
   /** Resume a paused upload (the bug047 bad-window pause): one file by index,

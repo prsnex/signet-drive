@@ -44,6 +44,21 @@
     pos = { left, top };
   });
 
+  // Focus the first enabled item once the menu is visible, the way a keyboard
+  // user expects a menu to open (Gus, folder-upload review, 2026-09-25): the
+  // Upload menu is the keyboard path for folders, and Enter then lands on
+  // "Files…" rather than back on the button. Only after `pos` is set: the menu is
+  // `visibility: hidden` for its first frame, and a hidden element cannot take
+  // focus. Once per opening — not on every re-position.
+  let focused = false;
+  $effect(() => {
+    if (!pos || !menuEl || focused) return;
+    focused = true;
+    menuEl
+      .querySelector<HTMLButtonElement>('button.item:not(:disabled)')
+      ?.focus({ preventScroll: true });
+  });
+
   function choose(item: ActionMenuItem) {
     if (item.disabled) return;
     // Fire the action BEFORE closing. onClose() nulls browser.contextMenu, and the

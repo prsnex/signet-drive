@@ -110,7 +110,10 @@ describe('F4 — the upload wake lock', () => {
     // document's current state and every change; the batch hands each open
     // file's controller both (upload-batch.ts). Both halves are pinned.
     const batch = store.slice(
-      store.indexOf('new UploadBatch<File>('),
+      // Anchored on the construction, not its type argument: the item type became
+      // `PlanItem` with folder upload (2026-09-25), and a guard that names a type
+      // goes false when the type moves.
+      store.indexOf('new UploadBatch<'),
       store.indexOf("removeEventListener('pagehide'"),
     );
     expect(batch.length).toBeGreaterThan(0);

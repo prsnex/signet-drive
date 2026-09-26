@@ -12,6 +12,8 @@
   import { formatBytes, formatDateTime, formatElapsed } from '$lib/format';
   import { uploadPhase, showUploadBar, uploadInFlightNote } from '$lib/upload-phase';
   import { tooltip } from '$lib/tooltip';
+  import { captureDrop } from '$lib/folder-drop';
+  import ActionMenu from './ActionMenu.svelte';
   import { m } from '$lib/paraglide/messages.js';
   import { IconFolder } from '$lib/components/icons';
   import { iconForFile } from '$lib/components/icons/iconForFile';
@@ -106,6 +108,37 @@
     const input = event.currentTarget as HTMLInputElement;
     if (input.files && input.files.length) {
       void browser.uploadFiles(input.files);
+    }
+    input.value = '';
+  }
+
+  // Folder-upload design note §2.6, as Chris ruled it (2026-09-25): ONE Upload
+  // button opening a two-item menu, "Files…" and "Folder…" — the shape Google
+  // Drive, Dropbox and OneDrive use, because a web page can open only a files
+  // picker OR a folder picker, never one that mixes them. Dragging is the mixed
+  // path. The folder picker is the keyboard path for folders, since dragging has
+  // none. Files arrive with `webkitRelativePath`; empty folders are invisible to
+  // this input (a browser limit), so only a drop creates them.
+  let folderInput = $state<HTMLInputElement | null>(null);
+  let uploadMenu = $state<{ x: number; y: number } | null>(null);
+  function openUploadMenu(e: MouseEvent) {
+    // A phone or tablet has no folder picker to offer (iOS ignores
+    // webkitdirectory) and no drag: Upload opens the files picker directly there.
+    const touchOrNarrow =
+      typeof window !== 'undefined' &&
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(max-width: 720px), (hover: none)').matches;
+    if (touchOrNarrow) {
+      fileInput?.click();
+      return;
+    }
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    uploadMenu = { x: r.left, y: r.bottom + 2 };
+  }
+  function onPickFolder(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    if (input.files && input.files.length) {
+      void browser.uploadPickedFolder(input.files);
     }
     input.value = '';
   }
@@ -214,8 +247,19 @@
     // have fixed one of two surfaces — the per-surface lesson, again.
     if (!inFolder || browser.busy || !browser.canWriteCurrentRoot) return;
     e.preventDefault();
-    const files = e.dataTransfer?.files;
-    if (files && files.length) void browser.uploadFiles(files);
+    // ⛔ THE DROP IS READ THROUGH ENTRIES, NEVER `dataTransfer.files` (Chris,
+    // production, 2026-09-25): there a dropped FOLDER arrives as a nameable File
+    // with no content, and uploading it made a 0-byte file `RAW` in place of a
+    // folder of photos. Captured SYNCHRONOUSLY — the item list is emptied once
+    // this handler returns. No entries API ⇒ refuse, never fall back.
+    const items = e.dataTransfer?.items;
+    if (!items || items.length === 0) return;
+    const capture = captureDrop(items);
+    if (!capture) {
+      browser.error = m.err_drop_unsupported();
+      return;
+    }
+    void browser.uploadDrop(capture);
   }
 
   // ── bug196 item 1: the toolbar stays, the list scrolls ────────────────────
@@ -278,11 +322,32 @@
       <button
         class="primary"
         disabled={!inFolder || browser.busy || !browser.canWriteCurrentRoot}
-        onclick={() => fileInput?.click()}
+        aria-haspopup="menu"
+        aria-expanded={uploadMenu !== null}
+        onclick={openUploadMenu}
       >
         {m.filelist_upload()}
       </button>
     </span>
+    {#if uploadMenu}
+      <!-- "Folder…" gates on OWNERSHIP, like New folder, not on write authority
+           like "Files…": creating folders is owner-only on the server (folders.rs,
+           bug223), so a read_write recipient may add files, never folders. -->
+      <ActionMenu
+        x={uploadMenu.x}
+        y={uploadMenu.y}
+        onClose={() => (uploadMenu = null)}
+        items={[
+          { label: m.filelist_upload_menu_files(), onSelect: () => fileInput?.click() },
+          {
+            label: m.filelist_upload_menu_folder(),
+            onSelect: () => folderInput?.click(),
+            disabled: !browser.ownsCurrentRoot,
+            tip: m.filelist_new_folder_not_owner(),
+          },
+        ]}
+      />
+    {/if}
     <!-- bug223: the server refuses a non-owner's folder-create (folders.rs resolves
          the parent with `account_id = you`, so a recipient gets 404 "parent folder
          not found"). Offering the button anyway produced a dialog that always failed,
@@ -392,6 +457,34 @@
       aria-hidden="true"
       tabindex="-1"
     />
+    <input
+      bind:this={folderInput}
+      type="file"
+      webkitdirectory
+      class="hidden-input"
+      onchange={onPickFolder}
+      aria-hidden="true"
+      tabindex="-1"
+    />
+
+    {#if browser.folderPrep}
+      <!-- §2.4: the preparation a folder upload does before its batch exists, made
+         visible (Gus): the tree walk counts as it goes, then folders n of m. -->
+      <div class="transfer-progress" role="status" aria-live="polite">
+        <div class="transfer-progress-label">
+          {browser.folderPrep.kind === 'reading'
+            ? m.filelist_folder_reading({ count: browser.folderPrep.files })
+            : m.filelist_folder_creating({
+                done: browser.folderPrep.done,
+                total: browser.folderPrep.total,
+              })}
+        </div>
+      </div>
+    {/if}
+
+    {#if browser.uploadNotice && !browser.dialog}
+      <p class="notice" role="status" aria-live="polite">{browser.uploadNotice}</p>
+    {/if}
 
     {#if browser.error && !browser.dialog}
       <p class="error">{browser.error}</p>
@@ -476,17 +569,15 @@
                  (or a rate is not yet a fact): the COUNT is true, so say only that.
                  This is the two-minute silence of a single 16 MiB first part, made
                  legible without inventing a rate. -->
-              <span class="part-note"
-                >{m.filelist_upload_inflight({
-                  count: inflight.inFlight,
-                  total: inflight.total,
-                })}</span
-              >
+              <span class="part-note">{m.filelist_upload_inflight()}</span>
             {:else if inflight.kind === 'measured'}
+              <!-- Chris (2026-09-25): once a rate is measured the parts-in-flight
+                 count goes — beside "part N of M transferred" it read as a second,
+                 contradicting count of the same parts, and users want overall
+                 progress. The neutral note above keeps a sign of life for F3's
+                 first-part stretch, where nothing else on the line moves. -->
               <span class="part-note"
                 >{m.filelist_upload_inflight_measured({
-                  count: inflight.inFlight,
-                  total: inflight.total,
                   mbps: inflight.mbps,
                   eta: formatElapsed(inflight.etaSeconds * 1000),
                 })}</span
@@ -918,10 +1009,18 @@
   .transfer-progress .retry-note,
   .transfer-progress .waiting-note,
   .transfer-progress .part-note {
-    margin-left: 0.5rem;
     color: var(--ink-soft);
     font-size: 0.8rem;
   }
+  /* Chris (2026-09-25): every note joins the line with " · ", so the status reads
+     as one sentence instead of runs of words spaced apart. */
+  .transfer-progress .retry-note::before,
+  .transfer-progress .waiting-note::before,
+  .transfer-progress .part-note::before {
+    content: '· ';
+    margin-left: 0.3rem;
+  }
+
   .transfer-progress .paused-actions {
     display: flex;
     gap: 0.5rem;

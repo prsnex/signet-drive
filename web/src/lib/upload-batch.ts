@@ -90,8 +90,10 @@ export interface UploadBatchState {
 
 export interface UploadBatchDeps<F extends BatchFile> {
   files: F[];
-  /** bug048: the folder's taken-name rule, mutating its set as the batch chooses. */
-  dedupe: (desired: string) => string;
+  /** bug048: the folder's taken-name rule, mutating its set as the batch chooses.
+   *  The file is passed too: a folder upload's files land in different folders,
+   *  each with its own taken-name set (folder-upload design note §2.4). */
+  dedupe: (desired: string, file: F) => string;
   /** The planner's plan for a file not yet opened (`Drive.uploadPlan`): the part
    *  size it would choose now, and the resulting count.
    *  ⚠ Consulted at every `state()` read, not once at batch start (F3-c): the
@@ -235,7 +237,7 @@ export class UploadBatch<F extends BatchFile> {
   private openFile(fileIndex: number): void {
     const file = this.deps.files[fileIndex];
     // Sequential and synchronous: the name is chosen in order, before any await.
-    const name = this.deps.dedupe(file.name);
+    const name = this.deps.dedupe(file.name, file);
     const controller = new UploadController();
     controller.initVisibility(this.visible);
     const entry: OpenFile = {

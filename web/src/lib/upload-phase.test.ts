@@ -171,3 +171,42 @@ describe('F3 — the in-flight note is a fact or nothing (2026-09-21)', () => {
     for (const line of mentions) expect(line.trim().startsWith('//')).toBe(true);
   });
 });
+
+// Chris (production, 2026-09-25): once a rate is measured the line carries no
+// parts-in-flight count — beside "part N of M transferred" it read as a second,
+// contradicting count of the same parts. The neutral note keeps a sign of life
+// (F3's first-part stretch), and every note joins the line with " · ".
+describe('the status line, as Chris ruled it', () => {
+  const messages = JSON.parse(
+    readFileSync(fileURLToPath(new URL('../../messages/en.json', import.meta.url)), 'utf8'),
+  ) as Record<string, string>;
+  const component = readFileSync(
+    fileURLToPath(new URL('./components/FileList.svelte', import.meta.url)),
+    'utf8',
+  );
+
+  it('the measured note says rate and time left, and no count of parts in flight', () => {
+    const measured = messages.filelist_upload_inflight_measured;
+    expect(measured).toContain('{mbps}');
+    expect(measured).toContain('{eta}');
+    expect(measured).not.toMatch(/\{count\}|\{total\}|in flight/);
+  });
+
+  it('the neutral note is a sign of life, with no count either', () => {
+    expect(messages.filelist_upload_inflight).toBe('sending…');
+  });
+
+  it('the component passes no count to either note', () => {
+    expect(component).toMatch(/m\.filelist_upload_inflight\(\)/);
+    const call = component.slice(component.indexOf('m.filelist_upload_inflight_measured('));
+    const args = call.slice(0, call.indexOf('})'));
+    expect(args).not.toMatch(/count:|total:/);
+  });
+
+  it('every note is preceded by the " · " separator', () => {
+    for (const cls of ['part-note', 'retry-note', 'waiting-note']) {
+      expect(component).toContain(`.transfer-progress .${cls}::before`);
+    }
+    expect(component).toMatch(/::before\s*\{\s*content: '· ';/);
+  });
+});
