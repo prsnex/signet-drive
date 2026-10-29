@@ -8,7 +8,7 @@ name: audit
 # ─────────────────────────────────────────────────────────────────────────────
 # WHAT THIS AUDITS, AND WHAT IT DOES NOT (S184 — write the empty column down)
 #
-# COVERED — two items, both keyed on PUBLISHED advisories:
+# COVERED — three items, all keyed on PUBLISHED advisories:
 #   1. Rust dependency graph (Cargo.lock, all workspace members) vs the RustSec DB.
 #      FAILS on any vulnerability advisory WITH a fixed version that is not listed
 #      in `.cargo/audit.toml`. "unmaintained"/"unsound"/"yanked" are reported, not
@@ -16,8 +16,15 @@ name: audit
 #   2. Web npm dependency graph (web/package-lock.json, prod + dev) vs the GitHub
 #      Advisory DB. FAILS on any HIGH/CRITICAL advisory not in
 #      `web/audit-baseline.txt`; moderate/low are reported below the gate.
-#   Both waiver files carry a written rationale per entry, and every applied waiver
-#   is PRINTED at runtime — waived, never hidden.
+#   3. Rust dependency graph (Cargo.lock) vs OSV, which merges RustSec with the GitHub
+#      Advisory DB (v1.0.12). cargo-audit reads RustSec only, so a GHSA-only Rust
+#      advisory never failed item 1 (GHSA-8ffr-xgwf-xj56 on aws-smithy-json sat on main
+#      unseen). FAILS on any advisory not in `.cargo/osv-scanner.toml`, whose entries
+#      expire (ignoreUntil) and so fail the job again until re-read.
+#   Every waiver file carries a written rationale per entry, and every applied waiver
+#   is PRINTED at runtime — waived, never hidden. (Item 1's printing was a claim until
+#   v1.0.12: cargo-audit is silent about ignored advisories, so the job now prints
+#   `.cargo/audit.toml`'s ignore list itself.)
 #
 # ⚠ NOT COVERED — no check here looks at any of these, and a green run says
 # NOTHING about them:
@@ -41,6 +48,8 @@ on:
       - '**/Cargo.toml'
       - 'web/package-lock.json'
       - 'web/package.json'
+      - '.cargo/audit.toml'
+      - '.cargo/osv-scanner.toml'
       - '.github/workflows/audit.yml'
   pull_request:
     paths:
@@ -48,6 +57,8 @@ on:
       - '**/Cargo.toml'
       - 'web/package-lock.json'
       - 'web/package.json'
+      - '.cargo/audit.toml'
+      - '.cargo/osv-scanner.toml'
       - '.github/workflows/audit.yml'
   schedule:
     # ⭐ THE FREQUENCY KNOB — this one line is the cadence control (S184).
@@ -105,7 +116,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1 (ref no longer selects the toolchain; see with.toolchain)
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (ref no longer selects the toolchain; see with.toolchain)
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -119,6 +130,13 @@ jobs:
       # ignored-with-rationale in `.cargo/audit.toml` (S063 D2; burn-down tracked on the
       # Launch Punch-List), so this gate's live job is to fail on a NEWLY introduced
       # advisory. Warnings (unmaintained / yanked) are reported, not fatal.
+      # cargo-audit says nothing about the advisories it ignores, so the waivers are
+      # printed here, rationale and all: waived, never hidden.
+      - name: Applied Rust waivers (.cargo/audit.toml)
+        run: |
+          set -euo pipefail
+          echo "Waived by .cargo/audit.toml ($(grep -cE '^\s*"RUSTSEC-' .cargo/audit.toml) advisories):"
+          awk '/^ignore = \[/{p=1} p{print} p && /^\]/{exit}' .cargo/audit.toml
       - name: cargo audit
         run: cargo audit
 
@@ -130,9 +148,9 @@ jobs:
         working-directory: web
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '22'
+          node-version: '24.21.0'
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci
@@ -157,6 +175,30 @@ jobs:
       # still-moderate runtime advisories as having crossed the threshold.
       - run: ../infrastructure/scripts/npm-audit-gate.sh
 
+  # OSV for Cargo.lock: RustSec + the GitHub Advisory DB in one source (item 3 above).
+  # The scanner is the pinned upstream release, not a marketplace action: version and
+  # sha256 below; its SLSA provenance was verified with cosign against google/osv-scanner's
+  # release workflow when the pin was set (v1.0.12, 2026-10-28). It prints each waiver it
+  # applies with its reason, and fails on anything else.
+  osv-scanner:
+    name: osv-scanner (Cargo.lock vs OSV)
+    runs-on: ubuntu-latest
+    env:
+      OSV_VERSION: "2.7.0"
+      OSV_SHA256: 160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install osv-scanner (pinned release, checksum-verified)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o osv-scanner \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SHA256}  osv-scanner" | sha256sum -c -
+          chmod +x osv-scanner
+          ./osv-scanner --version
+      - name: osv-scanner (fails on any advisory not waived in .cargo/osv-scanner.toml)
+        run: ./osv-scanner scan source --config .cargo/osv-scanner.toml --lockfile Cargo.lock
+
   # ─────────────────────────────────────────────────────────────────────────────
   # THE ALARM (S184). Cadence shrinks the exposure window; only an alarm CLOSES it
   # — a red run at 06:17 with nobody watching is still silent, and that silence is
@@ -176,7 +218,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   alarm:
     name: alarm on unattended failure
-    needs: [cargo-audit, npm-audit]
+    needs: [cargo-audit, npm-audit, osv-scanner]
     # ⚠⚠ THE REPOSITORY GUARD IS A DISCLOSURE CONTROL, not tidiness (Gus, S184).
     # This file is slated to EXPORT to the public repo, and these jobs post issues
     # to whatever repository runs them. A public "⚠ Dependency audit FAILED" issue
@@ -239,7 +281,8 @@ jobs:
           **What to do.**
           1. Open the run above and read which advisory fired.
           2. Either bump the dependency past the fixed version, **or** add the advisory to
-             \`.cargo/audit.toml\` (Rust) / \`web/audit-baseline.txt\` (npm) **with a written
+             \`.cargo/audit.toml\` (RustSec) / \`.cargo/osv-scanner.toml\` (OSV) /
+             \`web/audit-baseline.txt\` (npm) **with a written
              rationale and a revisit condition**. Never waive silently.
           3. Close this issue once the audit is green again.
 
@@ -280,7 +323,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   heartbeat:
     name: heartbeat (run log)
-    needs: [cargo-audit, npm-audit]
+    needs: [cargo-audit, npm-audit, osv-scanner]
     # ⚠⚠ Same repository guard as `alarm`, same reason — see its comment. The run
     # log is OUR proof-of-life channel; a fork must not append to it, and a public
     # repo must not grow a run-log issue of its own.
@@ -304,13 +347,14 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           CARGO_RESULT: ${{ needs.cargo-audit.result }}
           NPM_RESULT: ${{ needs.npm-audit.result }}
+          OSV_RESULT: ${{ needs.osv-scanner.result }}
         run: |
           set -euo pipefail
 
           LABEL="audit-heartbeat"
           TITLE="🔁 Dependency audit — run log"
 
-          if [ "$CARGO_RESULT" = "success" ] && [ "$NPM_RESULT" = "success" ]; then
+          if [ "$CARGO_RESULT" = "success" ] && [ "$NPM_RESULT" = "success" ] && [ "$OSV_RESULT" = "success" ]; then
             VERDICT="✅ PASS"
           else
             VERDICT="❌ FAIL"
@@ -320,6 +364,7 @@ jobs:
           COMMENT="**${VERDICT}** — ${STAMP} · \`${REF_NAME}\` · trigger \`${EVENT}\`
           - cargo audit (RustSec): \`${CARGO_RESULT}\`
           - npm audit (web): \`${NPM_RESULT}\`
+          - osv-scanner (Cargo.lock vs OSV): \`${OSV_RESULT}\`
           - [run log](${RUN_URL})"
           COMMENT="$(printf '%s\n' "$COMMENT" | sed 's/^          //')"
 

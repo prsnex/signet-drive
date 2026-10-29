@@ -17,7 +17,7 @@
 
 import type { AccountApi } from './api';
 import { b64uEncode } from './crypto/bytes';
-import { InvalidInputError } from './crypto/errors';
+import { InvalidInputError, PrfNotSupportedError } from './crypto/errors';
 import {
   deriveWrapKey,
   prfSalt,
@@ -73,7 +73,7 @@ export async function rotatePasskey(
   );
   if (!newCredential) throw new InvalidInputError('the rotation was cancelled');
   if (!registrationReportsPrfEnabled(newCredential)) {
-    throw new InvalidInputError('this authenticator does not support the required PRF extension');
+    throw new PrfNotSupportedError();
   }
 
   // Gesture 3 — assert the NEW passkey locally (not posted; just to harvest its

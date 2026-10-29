@@ -15,6 +15,7 @@
 // translate.
 
 import { SignetApiError } from './api';
+import { PrfNotSupportedError } from './crypto/errors';
 import { StallError, TransferExhaustedError } from './transfer';
 // Relative on purpose: the unit-test runner resolves no $lib aliases (vite.config's
 // stated design), and the compiled catalog is a sibling directory either way.
@@ -51,6 +52,12 @@ export function friendlyAuthError(error: unknown): string {
       default:
         return error.message || m.err_common_generic();
     }
+  }
+  // bug252: the browser-side PRF refusal at sign-up (auth.ts) is not a server code,
+  // so the `prf_not_supported` arm above never saw it and the fall-through below put
+  // its developer string on the page.
+  if (error instanceof PrfNotSupportedError) {
+    return m.err_auth_prf_not_supported();
   }
   if (error instanceof Error && error.message) {
     return error.message;

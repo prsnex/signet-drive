@@ -13,6 +13,8 @@ import {
   unlockSignupKeys,
 } from './auth';
 import { b64uDecode, b64uEncode, hexDecode, hexEncode } from './crypto/bytes';
+import { friendlyAuthError } from './errors';
+import { m } from './paraglide/messages.js';
 import { deriveZ, generateEphemeralKeypair, importEcdhPublicX963 } from './crypto/ecdh';
 import { initMlkem, mlkemEncapsulate, mlkemDecapsulate } from './crypto/mlkem';
 import type {
@@ -294,5 +296,42 @@ describe('auth flows — keystone round-trip (mock authenticator + fake server)'
     // And the key the unlock wrapped is the one sign-in recovers.
     const signedIn = await signIn({ api: countingApi, gateway: real }, 'alice@test.example');
     expect(signedIn.kemPubkeyX963).toBe(session.kemPubkeyX963);
+  });
+});
+
+describe('bug252: a passkey without PRF at sign-up', () => {
+  it('is refused before complete-registration and shows the catalog copy, not the developer string', async () => {
+    const { api } = fakeServer();
+    let completeRegistrationCalls = 0;
+    const real = mockGateway();
+    // A passkey manager that creates the credential but reports no PRF (1Password,
+    // as Chris observed on both boxes).
+    const gateway: WebAuthnGateway = {
+      ...real,
+      create: async (options) => {
+        const created = await real.create(options);
+        return created && { ...created, getClientExtensionResults: () => ({}) };
+      },
+    };
+    const deps: AuthDeps = {
+      api: {
+        ...api,
+        completeRegistration: async () => {
+          completeRegistrationCalls += 1;
+        },
+      },
+      gateway,
+    };
+
+    const refusal = await registerSignupCredential(deps, 'acct-1').then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+
+    expect(refusal).toBeDefined();
+    expect(completeRegistrationCalls).toBe(0);
+    const shown = friendlyAuthError(refusal);
+    expect(shown).toBe(m.err_auth_prf_not_supported());
+    expect(shown).not.toMatch(/PRF extension/);
   });
 });

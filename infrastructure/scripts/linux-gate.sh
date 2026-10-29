@@ -20,6 +20,10 @@
 #
 # Prereqs: the dev compose stack up on the host (Postgres :5432, MinIO :9000):
 #     docker compose up -d
+# ⚠ SHARED MAC (2026-10-19): another project's Postgres may hold :5432 (meridian's did,
+# and every DB test then failed on ITS password, 28P01, before running). Point the gate
+# at a Signet stack on other host ports instead; the defaults are unchanged:
+#     SIGNET_GATE_PG_PORT=55432 SIGNET_GATE_S3_PORT=59000 infrastructure/scripts/linux-gate.sh
 #
 # Usage:
 #     infrastructure/scripts/linux-gate.sh                 # full workspace suite
@@ -173,6 +177,23 @@ RS
     echo "FAIL  verdict line is not the last non-blank line — a piped tail would hide it"
     fails=$((fails+1))
   fi
+  # TEST-SERVICE PORTS (2026-10-19, Bob's review): unset ⇒ the default; a valid value ⇒
+  # itself; empty, non-numeric or out of range ⇒ REFUSED with exit 2 before any work.
+  # Driven through the real script on `--clippy`, which a refused port stops before Docker.
+  n="$( (unset SIGNET_GATE_PG_PORT; _gate_port SIGNET_GATE_PG_PORT 5432) )"
+  [ "$n" = "5432" ] && echo "PASS  ports: unset ⇒ the default 5432" || { echo "FAIL  ports: unset gave '$n' (want 5432)"; fails=$((fails+1)); }
+  n="$(SIGNET_GATE_PG_PORT=55432 _gate_port SIGNET_GATE_PG_PORT 5432)"
+  [ "$n" = "55432" ] && echo "PASS  ports: 55432 ⇒ 55432" || { echo "FAIL  ports: 55432 gave '$n'"; fails=$((fails+1)); }
+  for _bad in "" "abc" "70000"; do
+    _out="$(SIGNET_GATE_PG_PORT="$_bad" bash "$_self" --clippy 2>&1 || true)"
+    if printf '%s' "$_out" | grep -qF "REFUSING — SIGNET_GATE_PG_PORT='$_bad'" && \
+       printf '%s' "$_out" | grep -q "LINUX-GATE VERDICT: FAIL (exit 2)"; then
+      echo "PASS  ports: SIGNET_GATE_PG_PORT='$_bad' refused, exit 2 (never the 5432 fallback)"
+    else
+      echo "FAIL  ports: SIGNET_GATE_PG_PORT='$_bad' was not refused; got: $(printf '%s' "$_out" | tail -2 | tr '\n' ' ')"
+      fails=$((fails+1))
+    fi
+  done
   echo "---"
   if [ "$fails" -eq 0 ]; then echo "self-test: ALL PASS"; return 0; else echo "self-test: $fails FAIL"; return 1; fi
 }
@@ -204,7 +225,26 @@ _gate_verdict() {
 }
 trap _gate_verdict EXIT
 
+# ⛔ TEST-SERVICE PORTS (2026-10-19, Bob's review). The default applies ONLY when the
+# variable is UNSET. An empty or non-numeric value is REFUSED, never read as the default:
+# on this shared Mac :5432 may be another project's Postgres (meridian's was), and a
+# silent fallback would point the suite at it. Validated before any work, so a bad
+# value fails loud even under --clippy.
+_gate_port() {  # <variable name> <default> → prints the port, or refuses (rc 1)
+  local _name="$1" _def="$2" _val
+  if ! declare -p "$_name" >/dev/null 2>&1; then printf '%s\n' "$_def"; return 0; fi
+  eval "_val=\"\${$_name}\""
+  if [[ "$_val" =~ ^[0-9]{1,5}$ ]] && [ "$_val" -ge 1 ] && [ "$_val" -le 65535 ]; then
+    printf '%s\n' "$_val"; return 0
+  fi
+  echo "linux-gate: REFUSING — $_name='$_val' is not a port (1-65535); unset it to use the default $_def" >&2
+  return 1
+}
+
 if [ "${1:-}" = "--self-test" ]; then self_test; exit $?; fi
+
+GATE_PG_PORT="$(_gate_port SIGNET_GATE_PG_PORT 5432)" || exit 2
+GATE_S3_PORT="$(_gate_port SIGNET_GATE_S3_PORT 9000)" || exit 2
 
 # --allow-empty (C1) is the deliberate escape for a genuinely-empty run (e.g. a crate
 # with no tests) — same design as the CI gate's 6/7-vs-8 override: default-refuse, with
@@ -307,6 +347,7 @@ fi
 # on the artifact clock (see container-freshness.sh). HOST_NOW is captured
 # host-side immediately before the run so the skew measurement is honest.
 _gate_out="$(mktemp)"
+echo "linux-gate: test services at host.docker.internal — Postgres :${GATE_PG_PORT} · MinIO :${GATE_S3_PORT}"
 HOST_NOW="$(date +%s)"
 set +e
 docker run --rm \
@@ -315,8 +356,8 @@ docker run --rm \
   -v signet-gate-target:/gate-target \
   -e CARGO_TARGET_DIR=/gate-target \
   -e CARGO_TERM_COLOR=always \
-  -e DATABASE_URL="postgres://signet:signet_dev_password@host.docker.internal:5432/signet_drive_test" \
-  -e SIGNET_S3_ENDPOINT="http://host.docker.internal:9000" \
+  -e DATABASE_URL="postgres://signet:signet_dev_password@host.docker.internal:${GATE_PG_PORT}/signet_drive_test" \
+  -e SIGNET_S3_ENDPOINT="http://host.docker.internal:${GATE_S3_PORT}" \
   -e SIGNET_S3_BUCKET="signet-test" \
   -e SIGNET_S3_ACCESS_KEY="minioadmin" \
   -e SIGNET_S3_SECRET_KEY="minioadmin" \

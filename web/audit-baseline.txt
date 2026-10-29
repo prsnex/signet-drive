@@ -19,7 +19,15 @@
 #
 # ── Accepted ──────────────────────────────────────────────────────────────────
 #
-# (empty — the set has no current members.)
+# (none at present)
+#
+# HISTORY: GHSA-834v-8h66-3h79 (happy-dom 20.11.2, high; incomplete fix of CVE-2026-33943:
+# host code execution through an unsanitized import alias when happy-dom evaluates page
+# script) was waived here at S215 as dev/test-only (vitest's DOM environment, never in the
+# bundle, our own components only), its only fix then a six-day-old major. RESOLVED at
+# v1.0.12 by a clean fix, not a waiver: happy-dom 21.0.4, exact, with Chris waiving the
+# remaining days of the age rule (2026-10-26). One package moved and no others; full
+# web-ci green on it (check · lint · format:check · test · build).
 #
 # HISTORY: GHSA-mh99-v99m-4gvg (brace-expansion DoS, high) was waived here S137 as
 # dev-only-and-unprunable, then RESOLVED S158/v0.5.27 by a clean fix, not a waiver:

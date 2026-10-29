@@ -9,7 +9,7 @@
 
 import type { SignetApi } from './api';
 import { b64uDecode, b64uEncode, hexEncode, type Bytes } from './crypto/bytes';
-import { IntegrityError, InvalidInputError } from './crypto/errors';
+import { IntegrityError, InvalidInputError, PrfNotSupportedError } from './crypto/errors';
 import {
   deriveWrapKey,
   prfSalt,
@@ -109,7 +109,7 @@ export async function registerSignupCredential(
   const created = await gateway.create(registrationOptionsFromServer(reg.options));
   if (!created) throw new InvalidInputError('passkey registration was cancelled');
   if (!registrationReportsPrfEnabled(created)) {
-    throw new InvalidInputError('this authenticator does not support the required PRF extension');
+    throw new PrfNotSupportedError();
   }
   await api.completeRegistration(accountId, {
     ceremony_id: reg.ceremony_id,

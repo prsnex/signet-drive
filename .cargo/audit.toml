@@ -18,4 +18,20 @@ ignore = [
     # pruned without dropping sqlx, and there is no fixed version to bump to; ignored
     # with no real exposure. Revisit if a fix ships or sqlx restructures its backends.
     "RUSTSEC-2023-0071",
+
+    # crypto-bigint 0.5.5 — timing variability in operations meant to be constant-time
+    # (published 2026-10-23; patched only in 0.7.6+). ⚠ UNLIKE `rsa` ABOVE, THIS ONE IS IN
+    # OUR BUILD GRAPH: elliptic-curve 0.13 → p256 0.13 / ecdsa 0.16, our ES256 signing and
+    # P-256 ECDH in the server (attestation key, Garnet K1/K2) and the CLI. Not in the web
+    # client (signet-crypto-wasm carries ml-kem only) and not the Secure Enclave keys.
+    # There is NO 0.5.x fix: the remedy is the RustCrypto 0.14 generation (API-breaking),
+    # and its fix line had not settled when this was written — crypto-bigint 0.7.6, 0.7.7
+    # and 0.7.8 were all yanked within three days, elliptic-curve 0.14.3 shipped 10-25.
+    # Read of the 0.5.5 source (S215): the ops p256 0.13 calls on secret scalars
+    # (add_mod, sub_mod, sbb, mul_wide) are branch-free masks, so the residual risk is
+    # compiler-introduced branching — not measured in our binaries.
+    # Deferred by ruling (Chris, 2026-10-26): its own release once the fix line has been
+    # stable for a few weeks, after Gus's review. EXIT: that migration release deletes
+    # this entry, and its audit passing without it is part of its acceptance.
+    "RUSTSEC-2026-0387",
 ]

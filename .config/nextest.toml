@@ -45,9 +45,9 @@ fail-fast = false
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'binary(lapse) | binary(sweep_pending) | binary(orphan_sweep) | binary(lifecycle) | binary(trial_lifecycle) | binary(admin) | binary(multipart) | binary(fault_injection) | binary(incomplete_prsn) | binary(retention_sweep)'
+filter = 'binary(lapse) | binary(sweep_pending) | binary(orphan_sweep) | binary(lifecycle) | binary(trial_lifecycle) | binary(admin) | binary(multipart) | binary(fault_injection) | binary(incomplete_prsn) | binary(retention_sweep) | binary(deletion_cause)'
 test-group = 'lifecycle-worker'
 
 [[profile.ci.overrides]]
-filter = 'binary(lapse) | binary(sweep_pending) | binary(orphan_sweep) | binary(lifecycle) | binary(trial_lifecycle) | binary(admin) | binary(multipart) | binary(fault_injection) | binary(incomplete_prsn) | binary(retention_sweep)'
+filter = 'binary(lapse) | binary(sweep_pending) | binary(orphan_sweep) | binary(lifecycle) | binary(trial_lifecycle) | binary(admin) | binary(multipart) | binary(fault_injection) | binary(incomplete_prsn) | binary(retention_sweep) | binary(deletion_cause)'
 test-group = 'lifecycle-worker'

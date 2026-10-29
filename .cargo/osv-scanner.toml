@@ -1,0 +1,40 @@
+# osv-scanner configuration — the OSV ignore set for Cargo.lock (v1.0.12).
+#
+# The OSV source (the `osv-scanner` job in .github/workflows/audit.yml) exists because
+# cargo-audit reads only the RustSec DB, so an advisory filed only on GitHub's advisory
+# DB never failed our audit (GHSA-8ffr-xgwf-xj56 on aws-smithy-json sat on main unseen).
+# OSV merges both. Every entry here is printed at runtime: waived, never hidden.
+#
+# One rationale per advisory, one home: the two RUSTSEC entries are argued in
+# .cargo/audit.toml and only pointed to here; the GHSA-only entry is argued here.
+# Each entry expires (ignoreUntil), which fails the job until someone re-reads it.
+# Re-review this list whenever it changes.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2023-0071"
+ignoreUntil = 2026-12-31T00:00:00Z
+reason = "rsa 0.9.10 (Marvin attack), no upstream fix; in no build graph. Rationale and exit: .cargo/audit.toml."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0387"
+ignoreUntil = 2026-12-31T00:00:00Z
+reason = "crypto-bigint 0.5.5 timing; deferred by ruling to the RustCrypto 0.14 migration release with Gus. Rationale and exit: .cargo/audit.toml."
+
+# block-buffer 0.10.4 — "a caught panic may leave the cursor position of EagerBuffer or
+# ReadBuffer in a corrupted state", allowing out-of-bounds reads/writes (published
+# 2026-08-19; fixed only in 0.12.1, a different line). IN OUR BUILD GRAPH: digest 0.10
+# (sha2/hmac 0.10, ecdsa/p256 0.13 in signet-crypto, so the server and the CLI; and
+# crc-fast under aws-sdk-s3). Reaching it needs BOTH a panic inside a digest's compress
+# step AND code that catches that panic and keeps using the same hasher. RustCrypto's
+# compress functions do not panic, and our one catch_unwind (cli/src/commands.rs, the
+# parallel download worker) keeps every hasher and cipher inside the caught closure, where
+# it is dropped; nothing hashes across chunks. Nor is any hasher shared across a task
+# boundary or a lock: no Mutex/RwLock around a digest or HMAC type, no hasher held as a
+# struct field in server/, cli/ or crypto/, no catch-panic layer, and profile.release sets
+# no `panic` (Bob, by pattern grep, not proof). Recheck if any of those appears.
+# Read 2026-10-28 (Hlin, from Bob's OSV run).
+# EXIT: digest 0.11, which arrives with the RustCrypto 0.14 migration (A1).
+[[IgnoredVulns]]
+id = "GHSA-qwgh-2vcv-g2f7"
+ignoreUntil = 2026-12-31T00:00:00Z
+reason = "block-buffer 0.10.4 panic-cursor corruption; needs a caught panic inside a digest compress step with the hasher reused, which our code never does. Exit: digest 0.11 with the RustCrypto 0.14 migration."

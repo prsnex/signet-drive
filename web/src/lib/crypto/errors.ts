@@ -23,3 +23,15 @@ export class InvalidInputError extends Error {
     this.name = 'InvalidInputError';
   }
 }
+
+/** The passkey just created does not report the WebAuthn PRF extension, which key
+ *  derivation requires. A designed refusal (the 1-Pager: "reject non-PRF authenticators
+ *  at registration with a clear error"), not a defect. It has its own type so the UI
+ *  can show calm copy instead of this message: before bug252 it was a plain
+ *  InvalidInputError, and its developer string reached the sign-up page. */
+export class PrfNotSupportedError extends InvalidInputError {
+  constructor() {
+    super('this authenticator does not support the required PRF extension');
+    this.name = 'PrfNotSupportedError';
+  }
+}
