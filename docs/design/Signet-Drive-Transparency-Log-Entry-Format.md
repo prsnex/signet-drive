@@ -44,7 +44,14 @@ Each row carries a denormalized `entry_version`, also surfaced in receipts and i
 
 ## 2b. The v3 entry (the second epoch)
 
-From epoch 2 every entry is v3. It is the v2 layout with the 16-byte `account_id` replaced by the 64-byte **VRF account index**, the output of ECVRF-RISTRETTO255-SHA512 over the account identifier under the epoch's VRF key. A deletion then leaves nothing in the log that names the account. Only a holder of a proof from the server can link an index to an account. `entry_id` is 1-based within its epoch, and each epoch is its own chain and its own Merkle tree.
+From epoch 2 every entry is v3. It is the v2 layout with the 16-byte `account_id` replaced by the 64-byte **VRF account index**. The suite is ECVRF-RISTRETTO255-SHA512, specified at c2sp.org/vrf-r255, which is RFC 9381's ECVRF construction over the RFC 9496 ristretto255 group. The VRF input is a fixed framing of the account identifier, not the bare identifier.
+
+```
+alpha = "signet-pubkey-log-v3-account-index" || 0x00 || account_id (16 raw bytes)
+index = VRF_hash(epoch secret key, alpha)      // the output beta, 64 bytes, whole, never truncated
+```
+
+The epoch's VRF public key is 32 bytes, a proof is 80 bytes, and the index is the full 64-byte output. A deletion then leaves nothing in the log that names the account. Only a holder of a proof from the server can link an index to an account. `entry_id` is 1-based within its epoch, and each epoch is its own chain and its own Merkle tree.
 
 **Canonical bytes of a v3 entry, version-marked as v2 is.**
 
@@ -77,7 +84,7 @@ A client accepts an epoch only when the public roots file carries that end line 
 
 **The receipt** of a v3 entry has the v2 receipt shape, with `"v": 2`, with `epoch` and `account_index` present, and with no `account_id`. It is built and dual-signed once at insert and stored whole. It is served as stored and never rebuilt from mutable columns. The signing input is unchanged. `"v"` names the receipt's object shape and `entry_version` the entry's canonical-bytes rule, two numbers for two things.
 
-**Binding.** A client that binds a key to an account computes `index = VRF-verify(epoch key, account_id, proof)` from the account's proof, which is served beside every account identifier a client binds, and requires every receipt it binds to carry that `account_index` and that `epoch`. In epoch 1 it binds by `account_id`, as before.
+**Binding.** A client that binds a key to an account computes `index = VRF-verify(epoch public key, alpha(account_id), proof)` from the account's proof, with `alpha` as above, which is served beside every account identifier a client binds, and requires every receipt it binds to carry that `account_index` and that `epoch`. In epoch 1 it binds by `account_id`, as before.
 
 ## 3. The pair commitment
 

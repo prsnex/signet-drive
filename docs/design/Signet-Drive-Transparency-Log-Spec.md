@@ -37,7 +37,7 @@ The mechanism does not cryptographically prevent the attack. It makes the attack
 
 ## 2. Non-goals (v1)
 
-- **Browser-side automatic enforcement.** Certificate Transparency in TLS uses browser-side enforcement, where browsers refuse certificates not present in CT logs. Signet Drive v1 does not do client-side automatic enforcement in the browser. The verifier is the watcher, community or self-run, and the command-line client, which does enforce the anchors described in section 7. A later release may add browser enforcement.
+- **Browser-side automatic enforcement.** Certificate Transparency in TLS uses browser-side enforcement, where browsers refuse certificates not present in CT logs. Signet Drive v1 does not do client-side automatic enforcement in the browser. The verifier is the watcher, community or self-run, and the command-line client, which does enforce the anchors described in section 5.2. A later release may add browser enforcement.
 - **Federation and multi-operator logs.** v1 has one log, run by Signet Drive. Multi-operator federation is out of scope.
 - **Sigstore-style signed entries.** Each log entry is hashed but not signed individually. The audit guarantee comes from the Merkle structure plus public root commits, not from per-entry signatures.
 
@@ -59,7 +59,7 @@ From the second epoch the entries table lives in its own schema, owned by an adm
 | `epoch` | integer | The epoch the entry belongs to (section 3.8). Entries before the first cut are epoch 1. |
 | `entry_id` | integer | 1-based position within its epoch. |
 | `entry_version` | integer | The canonical-bytes rule for this entry. 1, 2 or 3. |
-| `account_id` | UUID | Whose key. Present for epoch 1 entries. Null from epoch 2. |
+| `account_id` | UUID | Whose key. Present for epoch 1 entries other than the hybrid checkpoint. Null from epoch 2. |
 | `account_index` | 64 bytes | The account's VRF index (section 3.8). Present from epoch 2. Null for a genesis entry. |
 | `key_purpose` | string | `signing`, `kem`, `signing_pq`, `kem_pq`, or `epoch`. |
 | `algorithm` | string | `ES256`, `ECDH-ES+A256KW`, `ML-DSA-87`, `ML-KEM-1024`, and similar identifiers. |
@@ -165,7 +165,14 @@ Deltas from v1, each load-bearing.
 
 The log is a sequence of **epochs**. Each epoch is its own chain and its own Merkle tree, with entries `1..=size` within the epoch, its own roots, and its own proofs. Epoch 1 is the log as it stood before the first cut. From epoch 2 every entry is **v3**.
 
-**Why epochs exist.** In epoch 1 an entry names its account by the account identifier. When an account is deleted, an entry that names it cannot be deleted without breaking the hash chain, and cannot be kept without keeping the identifier. The second epoch resolves this. From epoch 2 an entry names its account by a **VRF account index**, the 64-byte output of ECVRF-RISTRETTO255-SHA512 over the account identifier under the epoch's VRF key. A deletion then leaves nothing in the log that names the account. Only a holder of a proof from the server can link an index to an account.
+**Why epochs exist.** In epoch 1 an entry names its account by the account identifier. When an account is deleted, an entry that names it cannot be deleted without breaking the hash chain, and cannot be kept without keeping the identifier. The second epoch resolves this. From epoch 2 an entry names its account by a **VRF account index**. The index is the output of a verifiable random function over a fixed framing of the account identifier under the epoch's VRF key. The suite is ECVRF-RISTRETTO255-SHA512, specified at c2sp.org/vrf-r255, which is RFC 9381's ECVRF construction over the RFC 9496 ristretto255 group. The VRF input is not the bare identifier. It is the domain string, a zero byte, and the 16 raw bytes of the account identifier, so that a proof made for the log's index can never be presented as a VRF value for any other use of the key.
+
+```
+alpha = "signet-pubkey-log-v3-account-index" || 0x00 || account_id (16 raw bytes)
+index = VRF_hash(epoch secret key, alpha)      // the output beta, 64 bytes, whole, never truncated
+```
+
+The epoch's VRF public key is 32 bytes, a compressed ristretto255 point. A proof is 80 bytes. The index is the full 64-byte output. A deletion then leaves nothing in the log that names the account. Only a holder of a proof from the server can link an index to an account.
 
 **The v3 rule.** v2's layout with the 16-byte `account_id` replaced by the 64-byte `account_index`.
 
@@ -202,7 +209,7 @@ So the boundary lives in the chain. A client accepts an epoch only when the publ
 
 **Receipts for v3 entries.** The receipt of a v3 entry has the v2 receipt shape, with `epoch` and `account_index` present and no `account_id`. It is built and signed once at insert and stored whole, and it is served as stored. `"v"` names the receipt's object shape and `entry_version` the entry's canonical-bytes rule.
 
-**Binding a key to an account from epoch 2.** A client that binds a key to an account computes the index from the account's proof, `index = VRF-verify(epoch key, account_id, proof)`, and requires every receipt it binds to carry that `account_index` and that `epoch`. The proof is served beside every account identifier a client binds. In epoch 1 a client binds by `account_id`, as before.
+**Binding a key to an account from epoch 2.** A client that binds a key to an account computes the index from the account's proof, `index = VRF-verify(epoch public key, alpha(account_id), proof)` with `alpha` as above, and requires every receipt it binds to carry that `account_index` and that `epoch`. The proof is served beside every account identifier a client binds. In epoch 1 a client binds by `account_id`, as before.
 
 ## 4. What gets logged
 
@@ -522,7 +529,7 @@ A watcher is any party that periodically fetches the log and the public roots an
 
 ### 7.1 Initial state
 
-The watcher remembers the most recent `(epoch, log_size, merkle_root)` triple it has verified. On first run, this is epoch 1 at size 0 with the empty-tree hash.
+The watcher remembers the most recent `(epoch, log_size, merkle_root)` triple it has verified. On first run it has none. It does not start from epoch 1 at size 0, because after a cut the server answers 410 for epoch 1 and a boundary check against an empty root would be a false alarm. Instead a first run verifies the served epoch from its genesis against the anchor files, exactly as the published `verify/verify-translog.sh` does. It downloads the whole served epoch, recomputes every entry hash and the root, checks that the roots file carries exactly one end line for the previous epoch equal to what the genesis binds and that the VRF key file carries exactly one line for the served epoch whose key hashes to the genesis payload's value, and checks that the last committed root is present in the public history. Then it records the triple.
 
 ### 7.2 Periodic check
 
@@ -534,7 +541,7 @@ On each run, hourly for example, the watcher does the following.
    b. Verify the proof against `(known root, new_merkle_root)` per RFC 6962. Fail loudly if inconsistent.
    c. Optionally, fetch all log entries in the new range via the range endpoint and verify each entry's hash against canonical bytes, verify the chain of `prev_entry_hash` values, and verify that the Merkle root over all entries matches `new_merkle_root`.
    d. Update the watcher state to `(epoch, new_log_size, new_merkle_root)`.
-3. If the epoch is newer than the watcher's known epoch, verify the boundary before anything else. The roots file must carry exactly one end line for the known epoch, its root equal to the watcher's last verified root, and the VRF key file exactly one line for the new epoch. The new epoch's genesis entry, read from the range endpoint, must bind both, per section 3.8. Then download the new epoch in full and verify it as in step 2c, from entry 1.
+3. If the epoch is newer than the watcher's known epoch, verify the boundary before anything else, as a first run does. The roots file must carry exactly one end line for the known epoch, its root equal to the watcher's last verified root, and the VRF key file exactly one line for the new epoch. The new epoch's genesis entry, read from the range endpoint, must bind both, per section 3.8. Then download the new epoch in full and verify it as in step 2c, from entry 1.
 4. Sleep, and repeat.
 
 The published `verify/verify-translog.sh` performs steps 2c and 3 for the served epoch in one run. It recomputes every entry hash and the root locally, checks the end line and the VRF key line against the genesis, and checks that the last committed root is present in the public history.

@@ -23,7 +23,7 @@ This document covers the interface contract of the client.
 - Exit codes.
 - The configuration file's location and schema.
 - The key identification model.
-- The self-update mechanism.
+- The update check, which reports a newer version and never installs.
 - Apple Silicon Secure Enclave behavior, the only supported key storage in v1.
 - Cross-cutting concerns, such as verbosity, error JSON and idempotency.
 
@@ -57,9 +57,9 @@ Out of scope are the exact wording of help text and error messages, where the ca
 | 18 | `insufficient_storage`. The upload cannot fit, because it exceeds the server's single-file ceiling or the Guardian group's pooled quota has less room than it needs. Raised client-side before any byte is sent. The same command succeeds unchanged once space exists. |
 | 20 to 29 | Input and output errors. 21 filesystem error. 22 input read error. 23 output write error. 24 invalid input format. 25 name too long. 26 `not_found` (HTTP 404, distinct from a client-side resolver miss, which is exit 2). 27 `conflict` (HTTP 409). |
 | 30 to 39 | Network errors. 31 `network_error`, not resumable. 32 `transfer_stalled`, a direct-to-storage part transfer that exhausted its attempt budget, resumable by re-running the same upload command. |
-| 40 to 49 | Cryptographic errors. 40 encryption failure. 41 unsupported algorithm. 42 decryption failure, typically a tag mismatch. 43 a rewrap target rejected. |
-| 50 to 59 | Configuration errors. 51 is the platform check, an Apple Silicon Mac is required. |
-| 60 to 69 | Transparency and verification errors. 60 a TRANSPARENCY VIOLATION. 62 `unanchored` or `epoch_changed`, described below. |
+| 40 to 49 | Cryptographic errors. 40 encryption failure. 41 unsupported algorithm. 42 decryption failure, typically a tag mismatch. |
+| 50 to 59 | Configuration errors. 51 is the platform check, an Apple Silicon Mac is required. 52 `se_locked`, the Mac is locked and the Secure Enclave keys are unavailable until a human unlocks the session. It is temporary and clears from outside, so a harness can wait for the unlock and retry. |
+| 60 to 69 | Transparency and verification errors. 60 a TRANSPARENCY VIOLATION. 61 `identity_mismatch`, a local fail-closed refusal when the PRSN handle pinned by the host signer disagrees with the harness-asserted `SIGNET_HANDLE`, so the client will not act as the wrong identity. 62 `unanchored` or `epoch_changed`, described below. |
 | 70 to 79 | Device-access errors. 70 an internal fault on that surface. 77 the authorization-refusal family (`access_paused`, `token_denied`, `token_request_failed`). |
 
 Exit 62 `unanchored` means that what was checked holds as far as it goes, but there is no public anchor to hold it to, because the anchor files are unreachable, do not yet carry the server's epoch, or carry no published root for it. It is informational and not a pass. A script must not read it as verified, and `valid` is false beside it. A write path that cannot anchor an epoch of 2 or later refuses with 62 rather than bind keys it cannot check, and succeeds once the files update. Exit 62 `epoch_changed` means the server changed its served epoch during the command's attempts, and the command is to be run again.
@@ -127,7 +127,7 @@ The client's enforcement is structural against accidents and not against malice.
 
 ## Subcommand surface
 
-The client has three groups plus one onboarding command. The crypto and key tooling (twenty commands), the drive-management surface (twenty-two commands), and the PRSN device-access surface (seven commands), plus `signet enroll`.
+The client has three groups plus one onboarding command. The crypto and key tooling (twenty commands), the drive-management surface (twenty-four commands), and the PRSN device-access surface (seven commands), plus `signet enroll`.
 
 ### Crypto and key tooling
 
@@ -330,21 +330,23 @@ signet encrypt \
   --out <FILE> \
   --aad-file-id <UUID> \
   --to-pubkey <PUBKEY_VALUE> [--to-pubkey <PUBKEY_VALUE> ...] \
+  --to-pq-pubkey <PQ_PUBKEY_VALUE> [--to-pq-pubkey <PQ_PUBKEY_VALUE> ...] \
   --wraps-out <FILE>
 ```
 
-Required. `--in`, the plaintext path. `--out`, the ciphertext path. `--aad-file-id <UUID>`, the file identifier used as additional authenticated data. One or more `--to-pubkey <PUBKEY_VALUE>`, each recipient's KEM public key, whose format is auto-detected among base64url X9.63 bytes, JWK JSON, PEM, and `@/path/to/file` for a file's contents. `--wraps-out <FILE>`, the JSON file receiving one wrap envelope per recipient, in command-line order.
+Required. `--in`, the plaintext path. `--out`, the ciphertext path. `--aad-file-id <UUID>`, the file identifier used as additional authenticated data. One or more `--to-pubkey <PUBKEY_VALUE>`, each recipient's classical KEM public key, whose format is auto-detected among base64url X9.63 bytes, JWK JSON, PEM, and `@/path/to/file` for a file's contents. The same number of `--to-pq-pubkey <PQ_PUBKEY_VALUE>`, each recipient's ML-KEM-1024 encapsulation key, paired with the classical key by position. Every wrap is hybrid, and a release build refuses a classical-only write. `--wraps-out <FILE>`, the JSON file receiving one wrap envelope per recipient, in command-line order.
 
-Output. The ciphertext on disk, the wraps file, and a JSON manifest on standard output with `file_id`, `size_bytes`, `ciphertext_size_bytes`, `etag`, `recipients_wrapped` and `wraps_file`. Each wrap envelope follows the Envelope Format section 5.
+Output. The ciphertext on disk, the wraps file, and a JSON manifest on standard output with `file_id`, `size_bytes`, `ciphertext_size_bytes`, `etag`, `recipients_wrapped` and `wraps_file`. Each wrap envelope is the hybrid recipient block of the Envelope Format, section 5a.
 
 ```json
 [
   {
     "v": 1,
-    "alg": "ECDH-ES+A256KW",
+    "alg": "ECDH-ES+ML-KEM-1024+A256KW",
     "epk": { "kty": "EC", "crv": "P-256", "x": "...", "y": "..." },
-    "ct": "<base64url of 40-byte wrapped DEK>",
-    "rfp": "<recipient KEM pubkey fingerprint, lowercase hex>"
+    "ek": "<base64url of the 1568-byte ML-KEM-1024 ciphertext>",
+    "wk": "<base64url of the wrapped DEK>",
+    "rfp": "<recipient pair fingerprint, lowercase hex>"
   }
 ]
 ```
@@ -380,11 +382,14 @@ Re-wrap a DEK from the caller to a new recipient, used when adding a recipient t
 signet rewrap \
   --wrap-envelope-in <FILE> \
   --to-pubkey <PUBKEY_VALUE> \
+  --to-pq-pubkey <PQ_PUBKEY_VALUE> \
   --wrap-out <FILE> \
   [--key <LABEL>]
 ```
 
-Exit codes. 0. 12 key not found. 22 input read error. 23 output write error. 24 invalid envelope JSON. 41 unsupported algorithm. 42 unwrap failure, the wrong key for the input envelope. 43 the target key rejected.
+The new recipient's classical and ML-KEM-1024 keys are both given, and the new wrap is hybrid. A release build refuses a classical-only write.
+
+Exit codes. 0. 12 key not found. 22 input read error. 23 output write error. 24 invalid envelope JSON. 41 unsupported algorithm. 42 unwrap failure, the wrong key for the input envelope.
 
 ### `signet encrypt-name`
 
@@ -517,7 +522,7 @@ Output. One JSON event per line.
 {"event_id": "<UUID>", "event_type": "share_recipient_added_to_my_folder", "event_time": "<RFC3339>", "target_resource_id": "<UUID>", "target_resource_type": "folder", "event_data": {...}}
 ```
 
-Exit codes. 0. 13, 14 or 15 authentication errors. 31 network error.
+Exit codes. 0. 10 authentication failed. 17 authorization denied. 31 network error.
 
 ### `signet rand`
 
@@ -547,7 +552,7 @@ Exit codes. 0. 22 input error. 24 invalid input on decode.
 Check for a newer version and report it. The client never rewrites or installs itself. Updating is a human action.
 
 ```
-signet update [--check-only] [--server-url <URL>] [--json]
+signet update [--server-url <URL>] [--json]
 ```
 
 Behavior. Fetch `<server_base_url>/cli/latest-version`, compare to the running version, and when newer, report it and direct the human to re-run the installer.
@@ -672,7 +677,7 @@ Local operations are inherently idempotent, with the exception that `signet sign
 
 ### Network error handling
 
-Server-bound commands retry transient errors, timeouts, 5xx responses and refused connections, with exponential backoff of 1, 2, 4 and 8 seconds and at most 3 retries, configurable with `--max-retries <N>`, before exiting 31. A `429 rate_limited` response's `Retry-After` is honored, and the sleep counts against the retries.
+Server-bound commands retry transient errors, timeouts, 5xx responses and refused connections, with exponential backoff of 1, 2, 4 and 8 seconds and at most 3 retries, which is fixed, before exiting 31. A `429 rate_limited` response's `Retry-After` is honored, and the sleep counts against the retries.
 
 ### Version drift
 
