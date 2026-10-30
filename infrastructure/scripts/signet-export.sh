@@ -300,6 +300,16 @@ run_self_test() {
       echo "SELF-TEST FAIL  waived hit was silently dropped (pass without disclosure)" >&2
       st_fail=$((st_fail+1)); st_pass=$((st_pass-1))
     fi
+    # The published baseline must be the one the gate USED (the gating file beside
+    # the allowlist), not the archive's copy: a main-only waiver that passes the
+    # gate but is absent from verify/leak-waivers.txt is "green modulo undisclosed
+    # ignores" (measured 2026-10-30: the first post-tag waiver).
+    if [ -f "$ST_OUT/verify/leak-waivers.txt" ] && grep -q "conf/h.txt | rfc1918" "$ST_OUT/verify/leak-waivers.txt"; then
+      echo "  ok    the waiver the gate used is published in verify/leak-waivers.txt" >&2
+    else
+      echo "SELF-TEST FAIL  the gate passed on a waiver the public tree does not carry (verify/leak-waivers.txt stale or absent)" >&2
+      st_fail=$((st_fail+1)); st_pass=$((st_pass-1))
+    fi
     rm -rf "$ST_DIR"
   fi
   echo "-- an UNMATCHED optional is reported loudly, tallied, and does NOT gate --" >&2
@@ -429,6 +439,14 @@ while IFS= read -r p; do
   fi
   copy_path "$p" "$p" || echo "$p" >> "$MISSING_REQ"
 done < "$REINCLUDES"
+# The DISCLOSED waiver baseline is the one the gate uses: the file beside the
+# allowlist in the checkout this tool runs from (the runbook runs it from main, so
+# post-tag entries govern). Publish THAT copy, over the archive's mapped one, so
+# "pass" means "pass against the baseline the public tree carries" (2026-10-30).
+if [ -f "$(cd "$(dirname "$ALLOWLIST")" && pwd)/leak-waivers.txt" ]; then
+  mkdir -p "$OUT/verify"
+  cp "$(cd "$(dirname "$ALLOWLIST")" && pwd)/leak-waivers.txt" "$OUT/verify/leak-waivers.txt"
+fi
 find "$OUT" -name ".DS_Store" -delete 2>/dev/null
 find "$OUT" -type d -empty -delete 2>/dev/null
 

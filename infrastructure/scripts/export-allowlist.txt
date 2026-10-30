@@ -78,6 +78,8 @@ infrastructure/scripts/npm-audit-gate.sh
 ? docs/design/Signet-Drive-PQR-Crypto-Spec-public.md => docs/design/Signet-Drive-PQR-Crypto-Spec.md
 ? docs/design/Signet-Drive-Envelope-Format-public.md => docs/design/Signet-Drive-Envelope-Format.md
 ? docs/design/Signet-Drive-Transparency-Log-Spec-public.md => docs/design/Signet-Drive-Transparency-Log-Spec.md
+? docs/design/Signet-Drive-PQR-Transparency-Log-Entry-public.md => docs/design/Signet-Drive-Transparency-Log-Entry-Format.md
+? docs/design/Signet-Drive-CLI-Spec-public.md => docs/design/Signet-Drive-CLI-Spec.md
 # Harness Contract for PRSNs: HELD OUT of the public export until PRSN integration is a public offering (Chris + Gus, 2026-09-06); the -public.md source stays in the tree.
 # docs/api/ CUT (Chris, 2026-08-10, S008 scope ruling): the live /api-docs page is
 # the one canonical API surface; the repo README points to it. No second copy, no
