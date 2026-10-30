@@ -233,21 +233,46 @@ fn attestation_verify_rejects_a_tampered_receipt_with_exit_60() {
 
 // ── transparency-verify ───────────────────────────────────────────────────────
 
-/// Build an inclusion-proof document (the server's §6.2 shape) for the entry at
-/// `index` in a synthetic log of `n` leaves; return (proof JSON, root hex).
+/// Build an inclusion-proof document (the design v05 §10.4 shape: the stored
+/// entry whole, bug256) for the entry at `index` in a log of `n` real v3
+/// entries; return (proof JSON, root hex). Each leaf is the entry's own
+/// `entry_hash_v3`, so the CLI's recomputation binds it.
 fn inclusion_proof_doc(n: usize, index: usize) -> (Value, String) {
-    let leaves: Vec<[u8; 32]> = (0..n).map(|i| [(i as u8).wrapping_add(1); 32]).collect();
+    use base64::Engine;
+    let b64u = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let mut prev = [0u8; 32];
+    let mut leaves = Vec::with_capacity(n);
+    let mut entries = Vec::with_capacity(n);
+    for i in 0..n {
+        let id = (i + 1) as u64;
+        let pk = vec![(i as u8).wrapping_add(1); 1568];
+        let idx = [(i as u8).wrapping_add(0x40); 64];
+        let h = signet_crypto::translog::entry_hash_v3(
+            id,
+            Some(&idx),
+            signet_crypto::translog::KeyPurpose::KemPq,
+            "ML-KEM-1024",
+            &pk,
+            1_793_000_000,
+            &prev,
+        );
+        entries.push(json!({
+            "epoch": 2, "entry_id": id, "entry_version": 3,
+            "account_index": hex::encode(idx), "key_purpose": "kem_pq",
+            "algorithm": "ML-KEM-1024", "public_key": b64u.encode(&pk),
+            "public_key_fingerprint": signet_crypto::pubkey::fingerprint_raw(&pk),
+            "created_at": 1_793_000_000u64, "prev_entry_hash": hex::encode(prev),
+            "entry_hash": hex::encode(h),
+        }));
+        leaves.push(h);
+        prev = h;
+    }
     let proof = signet_crypto::merkle::inclusion_proof(&leaves, index);
     let root = signet_crypto::merkle::merkle_root(&leaves);
-    let doc = json!({
-        "entry_id": (index + 1) as u64,
-        "public_key_fingerprint": "abcd",
-        "key_purpose": "kem",
-        "entry_hash": hex::encode(leaves[index]),
-        "log_size_at_proof": n as u64,
-        "merkle_root_at_proof": hex::encode(root),
-        "inclusion_proof": proof.iter().map(hex::encode).collect::<Vec<_>>(),
-    });
+    let mut doc = entries[index].clone();
+    doc["log_size_at_proof"] = json!(n as u64);
+    doc["merkle_root_at_proof"] = json!(hex::encode(root));
+    doc["inclusion_proof"] = json!(proof.iter().map(hex::encode).collect::<Vec<_>>());
     (doc, hex::encode(root))
 }
 
@@ -306,7 +331,9 @@ fn transparency_verify_flags_a_root_mismatch_with_exit_60() {
     );
     assert_eq!(out.status.code(), Some(60));
     let parsed: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(parsed["valid"], true);
+    // The inclusion holds, but the root is not the published one: not valid.
+    assert_eq!(parsed["valid"], false);
+    assert_eq!(parsed["inclusion_holds"], true);
     assert_eq!(parsed["match"], false);
 }
 
@@ -342,8 +369,10 @@ fn transparency_verify_refuses_published_root_without_its_size() {
 fn transparency_verify_rejects_a_tampered_proof_with_exit_13() {
     let dir = TempDir::new().unwrap();
     let (mut doc, root_hex) = inclusion_proof_doc(7, 3);
-    // Corrupt the leaf so it no longer reconstructs to the root.
-    doc["entry_hash"] = json!(hex::encode([0x99u8; 32]));
+    // Corrupt a sibling in the proof path so the (correctly bound) leaf no
+    // longer reconstructs to the root. (Corrupting `entry_hash` itself is now
+    // caught one step earlier, by the bug256 leaf binding, as a violation.)
+    doc["inclusion_proof"][0] = json!(hex::encode([0x99u8; 32]));
     let path = dir.path().join("proof.json");
     std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
 
@@ -362,4 +391,146 @@ fn transparency_verify_rejects_a_tampered_proof_with_exit_13() {
     assert_eq!(out.status.code(), Some(13));
     let parsed: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(parsed["valid"], false);
+}
+
+#[test]
+fn transparency_verify_refuses_a_proof_whose_entry_does_not_hash_to_its_leaf() {
+    // bug256: a self-consistent tree over a leaf that is not this entry.
+    let dir = TempDir::new().unwrap();
+    let (mut doc, root_hex) = inclusion_proof_doc(7, 3);
+    doc["algorithm"] = json!("ML-KEM-768");
+    let path = dir.path().join("proof.json");
+    std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+    let out = signet(
+        dir.path(),
+        &[
+            "transparency-verify",
+            "--inclusion-proof",
+            path.to_str().unwrap(),
+            "--published-root",
+            &root_hex,
+            "--published-size",
+            "7",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(60),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A loopback server answering every request with `body` (here: a
+/// `/v1/server-info` with no `translog`, so the server is in epoch 1).
+fn spawn_server(body: &'static str) -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut sock) = conn else { break };
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            let _ = sock.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    port
+}
+
+#[test]
+fn an_unanchored_result_is_never_valid_and_exits_62() {
+    // Bob, #650: inclusion without a public anchor must not read as a pass in
+    // the field or the exit code. A loopback server is one this CLI knows no
+    // anchor repository for, and no --published-root is given.
+    let dir = TempDir::new().unwrap();
+    let (doc, _root_hex) = inclusion_proof_doc(7, 3);
+    let path = dir.path().join("proof.json");
+    std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+    let port = spawn_server(r#"{"current_signing_keys":[]}"#);
+    let out = Command::new(env!("CARGO_BIN_EXE_signet"))
+        .env("SIGNET_CONFIG", dir.path().join("absent.toml"))
+        .env("SIGNET_SERVER_URL", format!("http://127.0.0.1:{port}"))
+        .env("XDG_CONFIG_HOME", dir.path())
+        .env_remove("SIGNET_ANCHOR_REPO")
+        .args([
+            "transparency-verify",
+            "--inclusion-proof",
+            path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn signet");
+    assert_eq!(
+        out.status.code(),
+        Some(62),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(parsed["valid"], false);
+    assert_eq!(parsed["inclusion_holds"], true);
+    assert_eq!(parsed["published_root_status"], "unanchored");
+}
+
+/// `attestation-verify` online against a loopback server whose server-info
+/// carries the response's signing key and, optionally, an epoch.
+fn attestation_verify_online(translog: Option<Value>) -> Output {
+    let dir = TempDir::new().unwrap();
+    let (response, server_pub) = signed_response(&attestation("active"));
+    let path = dir.path().join("resp.json");
+    std::fs::write(&path, serde_json::to_vec(&response).unwrap()).unwrap();
+    let mut info = json!({ "current_signing_keys": [{
+        "key_id": TEST_SERVER_KEY_ID, "public_key": server_pub,
+        "purpose": "attestation_verification",
+    }]});
+    if let Some(t) = translog {
+        info["translog"] = t;
+    }
+    let port = spawn_server(Box::leak(info.to_string().into_boxed_str()));
+    Command::new(env!("CARGO_BIN_EXE_signet"))
+        .env("SIGNET_CONFIG", dir.path().join("absent.toml"))
+        .env("SIGNET_SERVER_URL", format!("http://127.0.0.1:{port}"))
+        .env("XDG_CONFIG_HOME", dir.path())
+        .env_remove("SIGNET_ANCHOR_REPO")
+        .args(["attestation-verify", "--in", path.to_str().unwrap()])
+        .output()
+        .expect("spawn signet")
+}
+
+#[test]
+fn attestation_verify_online_in_an_unanchorable_epoch_2_exits_62() {
+    // Gus, #651 ruling 1: online, the receipts are bound by index in an
+    // anchored epoch ≥ 2. A loopback server has no anchor repository, so its
+    // epoch 2 cannot be anchored and nothing is bound: 62, never a pass.
+    let out = attestation_verify_online(Some(json!({
+        "epoch": 2, "vrf_suite": signet_crypto::vrf::VRF_SUITE,
+        "vrf_public_key": "07".repeat(32),
+    })));
+    assert_eq!(
+        out.status.code(),
+        Some(62),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn attestation_verify_online_in_epoch_1_keeps_the_attestations_binding() {
+    let out = attestation_verify_online(None);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(parsed["valid"], true);
+    assert_eq!(parsed["receipt_binding"], "attestation");
 }

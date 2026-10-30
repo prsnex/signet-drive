@@ -9,6 +9,8 @@ export function mlkem1024_encapsulate(recipient_ek: Uint8Array): Uint8Array;
 
 export function mlkem1024_keygen(): Uint8Array;
 
+export function vrf_r255_verify(public_key: Uint8Array, account_id: Uint8Array, proof: Uint8Array): Uint8Array;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
@@ -17,6 +19,7 @@ export interface InitOutput {
     readonly mlkem1024_ek_from_seed: (a: number, b: number) => [number, number, number, number];
     readonly mlkem1024_encapsulate: (a: number, b: number) => [number, number, number, number];
     readonly mlkem1024_keygen: () => [number, number, number, number];
+    readonly vrf_r255_verify: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly __wbindgen_exn_store: (a: number) => void;
     readonly __externref_table_alloc: () => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;

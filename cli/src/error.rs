@@ -21,6 +21,12 @@ pub struct CliError {
     pub exit_code: i32,
     pub code: &'static str,
     pub message: String,
+    /// The server's epoch moved under this command: a read refused the
+    /// anchored epoch, or a part named another one. The command's one retry
+    /// from a fresh anchor keys off this
+    /// ([`crate::anchors::once_more_on_epoch_change`]); anywhere else the error
+    /// is what its code says.
+    pub epoch_moved: bool,
 }
 
 impl CliError {
@@ -29,6 +35,7 @@ impl CliError {
             exit_code,
             code,
             message: message.into(),
+            epoch_moved: false,
         }
     }
 
@@ -195,6 +202,34 @@ impl CliError {
     /// 60 — transparency/verification mismatch (proof valid but ≠ public root, etc.).
     pub fn transparency_violation(message: impl Into<String>) -> Self {
         Self::new(60, "transparency_violation", message)
+    }
+
+    /// 62 — the inclusion holds but there is no public anchor to hold the root
+    /// to (the anchor files unreachable or not yet carrying the epoch, or no
+    /// published root for it yet). Informational and NOT a pass: a script must
+    /// not read it as verified (design v05 §5, §10.8; Bob's #650 review).
+    pub fn unanchored(message: impl Into<String>) -> Self {
+        Self::new(62, "unanchored", message)
+    }
+
+    /// 62 — a read refused the epoch this command anchored on (`epoch_retired`
+    /// 410, `epoch_unknown` 404): the server's epoch changed during the
+    /// command, and changed again on its one retry. Nothing was bound; run it
+    /// again. Like `unanchored`, never a pass (design §10.4; Bob and Gus on the
+    /// client PR).
+    pub fn epoch_changed(message: impl Into<String>) -> Self {
+        Self {
+            epoch_moved: true,
+            ..Self::new(62, "epoch_changed", message)
+        }
+    }
+
+    /// Mark this error as the server's epoch having moved under the command (a
+    /// part naming an epoch other than the anchored one), so the command's one
+    /// retry re-anchors. It keeps its own code if the retry meets it again.
+    pub fn as_epoch_move(mut self) -> Self {
+        self.epoch_moved = true;
+        self
     }
 
     /// 61 — launch-binding verification failed: the container's host-signer-pinned

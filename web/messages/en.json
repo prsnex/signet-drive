@@ -648,6 +648,7 @@
   "err_drive_transfer_exhausted_upload": "Upload stopped after several attempts. Your progress is saved, so start it again and it will continue from where it stopped.",
   "err_drive_transfer_exhausted_download": "Download stopped after several attempts. Your file is safe in Signet Drive. You can start the download again.",
   "err_drive_stalled": "The connection to storage stopped responding. Nothing was lost. Please try again.",
+  "err_drive_service_updating": "The service was updating. Please try again.",
   "guardianprsns_show_in_dashboard": "Show PRSN Accounts in the Signet Drive dashboard",
   "guardianprsns_requirement": "A PRSN lives on a Mac with Apple Silicon (M1 or newer). That Mac is the PRSN's home; you can manage it from any device."
 }

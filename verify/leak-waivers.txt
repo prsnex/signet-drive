@@ -24,3 +24,6 @@ cli/src/bucket_transport.rs | rfc1918 | is_local_host() boundary-classification 
 infrastructure/scripts/signet-export.sh | staging-host | self-test negative-control fixture (st_host_infra): the string must match the class pattern or the arm proves nothing; it names no real host. Gus + Chris, 2026-08-29.
 infrastructure/scripts/signet-export.sh | local-port | self-test negative-control fixture: same reasoning; the port literal exists to trip the check under test. Gus + Chris, 2026-08-29.
 infrastructure/scripts/signet-export.sh | rfc1918 | self-test negative-control fixture: a reserved-range literal planted to prove the scanner fires; TEST-NET substitutes would not match the class under test. Gus + Chris, 2026-08-29.
+
+cli/src/anchors.rs | staging-host | KNOWN_ANCHORS: the CLI ships knowing the staging server's origin and its public anchor repository by design (epoch-2 design §2a); the string is in every published 1.0.13 binary (F-REPRO; Bob's strings read, 2026-10-30), the host is public through certificate transparency and the repository is public by Chris's ruling. Gus + Chris, 2026-10-30.
+cli/src/anchors/tests.rs | staging-host | the unit test for KNOWN_ANCHORS resolves the staging origin to its repository; same reasoning as anchors.rs. Gus + Chris, 2026-10-30.

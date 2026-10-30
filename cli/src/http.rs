@@ -87,6 +87,9 @@ fn network(message: impl Into<String>) -> CliError {
 /// then died. Kept corrected rather than deleted — prose that asserted a policy
 /// nothing should have implemented.)
 fn api_status_error(code: u16, body: String) -> CliError {
+    if let Some(refusal) = epoch_refusal(code, &body) {
+        return refusal;
+    }
     match code {
         401 => CliError::authentication_failed(format!(
             "the server did not accept the request's authentication (HTTP 401): {body}"
@@ -102,6 +105,67 @@ fn api_status_error(code: u16, body: String) -> CliError {
         )),
         _ => network(format!("server returned HTTP {code}: {body}")),
     }
+}
+
+/// A 410 `epoch_retired` or 404 `epoch_unknown` in the server's error envelope
+/// (Transparency-Log Spec §6.3): the epoch this command anchored on is not the
+/// served one any more. `epoch_changed`, which the command's one retry keys off.
+fn epoch_refusal(code: u16, body: &str) -> Option<CliError> {
+    let doc: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = doc.get("error")?;
+    let name = error.get("code")?.as_str()?;
+    if !matches!(
+        (code, name),
+        (410, "epoch_retired") | (404, "epoch_unknown")
+    ) {
+        return None;
+    }
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(name);
+    Some(CliError::epoch_changed(format!(
+        "the server's epoch changed during this command ({name}: {message}); \
+         nothing was bound, run it again"
+    )))
+}
+
+thread_local! {
+    /// Set while a command's epoch-bound attempt runs. That attempt may run
+    /// twice ([`crate::anchors::once_more_on_epoch_change`]), so it must not
+    /// write: every write path checks this (Bob and Gus, on the client PR).
+    static READ_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with every write refused.
+pub(crate) fn read_only<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            READ_ONLY.with(|r| r.set(self.0));
+        }
+    }
+    let _restore = Restore(READ_ONLY.with(|r| r.replace(true)));
+    f()
+}
+
+/// Whether writes are refused right now, i.e. an epoch-bound attempt is
+/// running (the flip tests assert every attempt runs under the arm).
+#[cfg(test)]
+pub(crate) fn writes_refused() -> bool {
+    READ_ONLY.with(std::cell::Cell::get)
+}
+
+/// Refuse a write inside an epoch-bound attempt. The URL is not printed: an
+/// enrollment code or a presigned signature can ride in it.
+fn refuse_write_if_read_only(method: &str) -> Result<()> {
+    if READ_ONLY.with(std::cell::Cell::get) {
+        return Err(CliError::generic(format!(
+            "internal: a {method} inside an epoch-bound attempt, which may run twice; \
+             refusing the write"
+        )));
+    }
+    Ok(())
 }
 
 fn backoff(attempt: u32) -> std::time::Duration {
@@ -219,6 +283,7 @@ pub fn get_text_once(url: &str, timeout: std::time::Duration) -> Result<String> 
 /// Mirrors `get_text`'s transient retry + `cli_outdated` handling; a 2xx with an
 /// empty body (a 204) returns `""`.
 pub fn post_text(url: &str, body: Option<&[u8]>) -> Result<String> {
+    refuse_write_if_read_only("POST")?;
     let mut attempt = 0;
     loop {
         let req = agent().post(url).set("Signet-Cli-Version", CLI_VERSION);
@@ -376,6 +441,9 @@ fn signed_call(
     path: &str,
     body: Option<&[u8]>,
 ) -> Result<String> {
+    if method != "GET" {
+        refuse_write_if_read_only(method)?;
+    }
     let url = format!("{base_url}{path}");
     let mut attempt = 0;
     loop {
@@ -685,6 +753,7 @@ pub fn put_presigned(
     knobs: &TransferKnobs,
     ceiling: Option<std::time::Duration>,
 ) -> Result<String> {
+    refuse_write_if_read_only("PUT")?;
     let bounds = knobs.transport_bounds();
     let mut last_error = String::new();
     // The per-attempt ceiling RELAXES as attempts are spent (Gus, S127 G1).
@@ -1363,5 +1432,55 @@ mod tests {
             std::time::Duration::from_secs(300),
             "stall clamps to <=300s"
         );
+    }
+
+    // ---- the epoch refusals and the read-only arm (design §10.4) ----
+
+    #[test]
+    fn an_epoch_refusal_is_epoch_changed_and_other_refusals_keep_their_kind() {
+        let envelope = |code: &str| {
+            format!(r#"{{"error":{{"code":"{code}","message":"m","details":{{"epoch":1}}}}}}"#)
+        };
+        for (status, code) in [(410, "epoch_retired"), (404, "epoch_unknown")] {
+            let err = api_status_error(status, envelope(code));
+            assert_eq!((err.exit_code, err.code), (62, "epoch_changed"));
+            assert!(err.epoch_moved);
+        }
+        // The pairing is exact: another code, or the right code on the other
+        // status, keeps the kind its status always had.
+        let missing = api_status_error(404, envelope("recipient_not_found"));
+        assert_eq!((missing.exit_code, missing.epoch_moved), (26, false));
+        let crossed = api_status_error(404, envelope("epoch_retired"));
+        assert_eq!((crossed.exit_code, crossed.epoch_moved), (26, false));
+        let gone = api_status_error(410, "not json".into());
+        assert_eq!((gone.exit_code, gone.epoch_moved), (31, false));
+    }
+
+    #[test]
+    fn a_write_inside_an_epoch_bound_attempt_is_refused_before_the_network() {
+        // Port 1 is never answered: a write that reached the network would
+        // fail as a network error after its retries, not as this refusal.
+        let err = read_only(|| post_text("http://127.0.0.1:1/v1/x?code=secret", None)).unwrap_err();
+        assert_eq!(err.exit_code, 1);
+        assert!(
+            err.message.contains("epoch-bound attempt"),
+            "{}",
+            err.message
+        );
+        assert!(!err.message.contains("secret"), "the URL is never printed");
+        let err = read_only(|| {
+            put_presigned(
+                "http://127.0.0.1:1/b",
+                b"x",
+                &TransferKnobs::default(),
+                None,
+            )
+        })
+        .unwrap_err();
+        assert!(err.message.contains("a PUT inside"), "{}", err.message);
+        // The arm is down again once the attempt returns, and after a panic.
+        assert!(!READ_ONLY.with(std::cell::Cell::get));
+        let _ = std::panic::catch_unwind(|| read_only::<()>(|| panic!("inside")));
+        assert!(!READ_ONLY.with(std::cell::Cell::get));
     }
 }

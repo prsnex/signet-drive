@@ -1008,17 +1008,82 @@ pub fn attestation_verify(
     server_pq_pubkey: Option<&str>,
     out: &OutputMode,
 ) -> Result<()> {
+    if attestation_id.is_some() == in_path.is_some() {
+        return Err(CliError::invalid_args(
+            "specify exactly one of --attestation-id or --in",
+        ));
+    }
+    attestation_verify_with(
+        &mut |attempt| crate::anchors::anchor_log(attempt, server_url, None),
+        attestation_id,
+        in_path,
+        server_url,
+        server_pubkey,
+        server_pq_pubkey,
+        out,
+    )
+}
+
+/// [`attestation_verify`] with the anchoring passed in (the seam test pins the
+/// anchor before the response read), its arguments checked.
+fn attestation_verify_with(
+    anchor: &mut dyn for<'a> FnMut(
+        &'a crate::anchors::EpochAttempt,
+    ) -> Result<crate::anchors::Anchoring<'a>>,
+    attestation_id: Option<&str>,
+    in_path: Option<&str>,
+    server_url: &str,
+    server_pubkey: Option<&str>,
+    server_pq_pubkey: Option<&str>,
+    out: &OutputMode,
+) -> Result<()> {
+    crate::anchors::once_more_on_epoch_change(|attempt| {
+        attestation_verify_once(
+            attempt,
+            &mut *anchor,
+            attestation_id,
+            in_path,
+            server_url,
+            server_pubkey,
+            server_pq_pubkey,
+            out,
+        )
+    })
+}
+
+/// One attempt of [`attestation_verify`]: the epoch anchored, then the
+/// response fetched, then the receipts bound under the epoch.
+#[allow(clippy::too_many_arguments)]
+fn attestation_verify_once(
+    attempt: &crate::anchors::EpochAttempt,
+    anchor: &mut dyn for<'a> FnMut(
+        &'a crate::anchors::EpochAttempt,
+    ) -> Result<crate::anchors::Anchoring<'a>>,
+    attestation_id: Option<&str>,
+    in_path: Option<&str>,
+    server_url: &str,
+    server_pubkey: Option<&str>,
+    server_pq_pubkey: Option<&str>,
+    out: &OutputMode,
+) -> Result<()> {
+    // The epoch FIRST, online (no operator key pin): a response fetched after
+    // it answers for the anchored epoch or a later one, and a later one names
+    // its epoch in its receipts, which the command re-anchors on (design
+    // §10.4). Fetched before the anchor, an epoch-1 response under an epoch-2
+    // anchor failed at the index (no VRF proof, 60) before the receipt check
+    // could see the move (Hlin, at unit 3).
+    let anchoring = if server_pubkey.is_none() {
+        Some(anchor(attempt)?)
+    } else {
+        None
+    };
     let response: Value = match (attestation_id, in_path) {
         (Some(id), None) => http::get_json(
             &format!("{server_url}/v1/attestations/{id}/verification"),
             &[],
         )?,
         (None, Some(path)) => read_json_arg(path, "verification response")?,
-        _ => {
-            return Err(CliError::invalid_args(
-                "specify exactly one of --attestation-id or --in",
-            ));
-        }
+        _ => unreachable!("attestation_verify checked the arguments"),
     };
 
     let server_key_id = response
@@ -1092,8 +1157,50 @@ pub fn attestation_verify(
     // own server signature + its public_key_fingerprint matching the attested key +
     // the key_purpose. The MMD→inclusion-proof→published-root escalation is D1-gated
     // (transparency-verify covers log inclusion against a published root).
-    let transparency =
-        verify_inline_receipts(&response, attestation, &server_pub, server_pq_vk.as_deref())?;
+    // Online, in an anchored epoch ≥ 2, the receipts must sit under the
+    // subject's index, as on the write path: a server could otherwise attest
+    // keys logged under a foreign index that the owner's watch never sees
+    // (Gus, #651 ruling 1). Epoch 1, and an offline check against an
+    // operator's key pin, keep the attestation's own binding. The proof is
+    // read from inside the signed object.
+    // A response fetched now answers for the anchored epoch (design §10.4); a
+    // saved one (`--in`) answers for whenever it was saved.
+    let mut anchored_epoch = None;
+    let index = if let Some(anchoring) = anchoring {
+        if attestation_id.is_some() {
+            anchored_epoch = Some(anchoring.served.epoch);
+        }
+        let mode = crate::anchors::receipt_rule(anchoring.verdict)?;
+        let subject = attestation
+            .get("subject_account_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| CliError::invalid_data("attestation missing subject_account_id"))?;
+        crate::anchors::index_under(
+            &mode,
+            subject,
+            attestation
+                .get("subject_account_vrf_proof")
+                .and_then(|v| v.as_str()),
+            "attestation",
+        )?
+    } else {
+        None
+    };
+    let binding = match &index {
+        None => AccountBinding::Attested,
+        Some((epoch, index)) => AccountBinding::Index {
+            epoch: *epoch,
+            index,
+        },
+    };
+    let transparency = verify_inline_receipts(
+        &response,
+        attestation,
+        &server_pub,
+        server_pq_vk.as_deref(),
+        binding,
+        anchored_epoch,
+    )?;
 
     let status = attestation
         .get("status")
@@ -1109,6 +1216,9 @@ pub fn attestation_verify(
         "status": status,
         "prsn_sharing_capability": attestation.get("prsn_sharing_capability"),
         "transparency": transparency,
+        // Which binding the receipts were held to: the account's VRF index
+        // (online, epoch ≥ 2) or the attestation's own subject.
+        "receipt_binding": if index.is_some() { "index" } else { "attestation" },
     }))?;
 
     // Signature + inline receipts verified; the status drives the exit code (CLI Spec v08).
@@ -1169,11 +1279,31 @@ pub(crate) fn enforce_response_dual_signature(
     Ok(())
 }
 
+/// What a receipt must name as its account (design v05 §10.6, §10.9). The rule
+/// is chosen by the server's epoch as anchored against the public files, never
+/// by the receipt's own shape.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AccountBinding<'a> {
+    /// No account check: a server-signed attestation already binds the keys to
+    /// its subject (the §9 path in epoch 1, and `attestation verify`).
+    Attested,
+    /// Epoch 1: the v1-shape receipt's `account_id` must name this account.
+    AccountId(&'a str),
+    /// Epoch ≥ 2: the v2-shape receipt must carry this epoch and this account's
+    /// VRF index, computed from the pinned key and the response's proof.
+    Index {
+        epoch: u16,
+        index: &'a [u8; signet_crypto::vrf::INDEX_LEN],
+    },
+}
+
 pub(crate) fn verify_inline_receipts(
     response: &Value,
     attestation: &Value,
     server_pub: &[u8],
     server_pq_vk: Option<&[u8]>,
+    binding: AccountBinding<'_>,
+    anchored_epoch: Option<u16>,
 ) -> Result<&'static str> {
     let receipts = [
         (
@@ -1213,16 +1343,22 @@ pub(crate) fn verify_inline_receipts(
             continue;
         };
         present += 1;
+        // Online, every receipt answers for the anchored epoch, or the epoch
+        // moved under the command (design §10.4).
+        if let Some(epoch) = anchored_epoch {
+            crate::anchors::check_receipt_epoch(receipt, epoch, "attestation")?;
+        }
         let asserted_fp = attestation
             .get(fp_field)
             .and_then(|v| v.as_str())
             .ok_or_else(|| CliError::invalid_data(format!("attestation missing {fp_field}")))?;
-        // No account binding here: the attestation itself (server-signed)
-        // binds these keys to `subject_account_id`.
+        // In epoch 1 the attestation itself (server-signed) binds these keys
+        // to `subject_account_id`; in epoch ≥ 2 each receipt must also sit
+        // under the subject's index, or the owner's watch cannot see it.
         verify_one_receipt(
             receipt,
             asserted_fp,
-            None,
+            binding,
             purpose,
             server_pub,
             server_pq_vk,
@@ -1244,15 +1380,16 @@ pub(crate) fn verify_inline_receipts(
 /// receipt's `server_key_id` is assumed equal to the §9 response's; a mid-rotation
 /// receipt signed by a different key fails the signature check here.)
 ///
-/// `expected_account_id`: when the receipt is the SOLE record binding the key to
-/// an identity (the F-DOWNGRADE(b) human-recipient path — no attestation), the
-/// receipt's `account_id` MUST name that identity; a verifying receipt for a key
-/// logged under a different account is a substitution, not this recipient's key.
-/// `None` when an attestation already carries the account binding.
+/// `binding`: when the receipt is the SOLE record binding the key to an
+/// identity (the F-DOWNGRADE(b) human-recipient path — no attestation), the
+/// receipt MUST name that identity, by `account_id` in epoch 1 and by the VRF
+/// index in epoch ≥ 2; a verifying receipt for a key logged under a different
+/// account is a substitution, not this recipient's key. `Attested` when an
+/// attestation already carries the account binding in epoch 1.
 pub(crate) fn verify_one_receipt(
     receipt: &Value,
     asserted_fp: &str,
-    expected_account_id: Option<&str>,
+    binding: AccountBinding<'_>,
     expected_purpose: &str,
     server_pub: &[u8],
     server_pq_vk: Option<&[u8]>,
@@ -1268,15 +1405,21 @@ pub(crate) fn verify_one_receipt(
             "{expected_purpose} receipt fingerprint does not match the asserted public key"
         )));
     }
-    if let Some(expected_account) = expected_account_id {
-        let receipt_account = receipt
-            .get("account_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| CliError::transparency_violation("receipt missing account_id"))?;
-        if !receipt_account.eq_ignore_ascii_case(expected_account) {
-            return Err(CliError::transparency_violation(format!(
-                "{expected_purpose} receipt binds the key to a DIFFERENT account. A logged key that is not this recipient's is a substitution"
-            )));
+    match binding {
+        AccountBinding::Attested => {}
+        AccountBinding::AccountId(expected_account) => {
+            let receipt_account = receipt
+                .get("account_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| CliError::transparency_violation("receipt missing account_id"))?;
+            if !receipt_account.eq_ignore_ascii_case(expected_account) {
+                return Err(CliError::transparency_violation(format!(
+                    "{expected_purpose} receipt binds the key to a DIFFERENT account. A logged key that is not this recipient's is a substitution"
+                )));
+            }
+        }
+        AccountBinding::Index { epoch, index } => {
+            check_receipt_index(receipt, epoch, index, expected_purpose)?;
         }
     }
     if receipt.get("key_purpose").and_then(|v| v.as_str()) != Some(expected_purpose) {
@@ -1350,12 +1493,234 @@ pub(crate) fn verify_one_receipt(
     Ok(())
 }
 
+/// The epoch-≥-2 receipt binding (§10.5, §10.6): the receipt must be the v2
+/// shape (`v` 2, `entry_version` 3, no `account_id`), name the anchored epoch,
+/// and carry the account's index. The index is compared as bytes.
+fn check_receipt_index(
+    receipt: &Value,
+    epoch: u16,
+    index: &[u8; signet_crypto::vrf::INDEX_LEN],
+    purpose: &str,
+) -> Result<()> {
+    let refuse = |why: String| CliError::transparency_violation(format!("{purpose} receipt {why}"));
+    if receipt.get("v").and_then(Value::as_u64) != Some(2)
+        || receipt.get("entry_version").and_then(Value::as_u64) != Some(3)
+        || receipt.get("account_id").is_some()
+    {
+        return Err(refuse(format!(
+            "is not the epoch-{epoch} receipt shape (v 2, entry_version 3, no account_id)"
+        )));
+    }
+    if receipt.get("epoch").and_then(Value::as_u64) != Some(u64::from(epoch)) {
+        return Err(refuse(format!(
+            "does not name epoch {epoch}, the anchored one"
+        )));
+    }
+    let served = receipt
+        .get("account_index")
+        .and_then(Value::as_str)
+        .and_then(|s| hex::decode(s).ok())
+        .ok_or_else(|| refuse("carries no account_index".into()))?;
+    if served.as_slice() != index.as_slice() {
+        return Err(refuse(
+            "binds the key to a DIFFERENT account index. A logged key that is not this \
+             account's is a substitution"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// `signet transparency verify --self`: the owner's watch (design v05 §2b).
+///
+/// Scans the anchored epoch's published prefix, recomputes every leaf, and
+/// requires the Merkle root over them to equal the published root, so no entry
+/// can be left out of what was scanned (the check a certificate-transparency
+/// monitor makes). It then reports every key logged under this account's
+/// index, each marked by whether this CLI holds it:
+/// - every logged key held, every held key logged → `clean`, exit 0;
+/// - a key under the index this CLI does not hold → TRANSPARENCY VIOLATION,
+///   exit 60 (a key logged in this account's name, or one from an earlier
+///   provisioning of it: either way the owner must look);
+/// - a held key not yet in the published prefix → `unanchored`, exit 62,
+///   until the next published root.
+///
+/// Epoch 1 carries no index (its entries name the account in clear, and
+/// bug254 rewrote some of them), so the watch begins at the epoch-2 cut.
+pub fn transparency_verify_self(
+    keystore: &dyn Keystore,
+    key: Option<&str>,
+    anchor_repo: Option<&str>,
+    server_url: &str,
+    config: &Config,
+    out: &OutputMode,
+) -> Result<()> {
+    crate::anchors::once_more_on_epoch_change(|attempt| {
+        transparency_verify_self_once(attempt, keystore, key, anchor_repo, server_url, config, out)
+    })
+}
+
+/// One attempt of [`transparency_verify_self`].
+fn transparency_verify_self_once(
+    attempt: &crate::anchors::EpochAttempt,
+    keystore: &dyn Keystore,
+    key: Option<&str>,
+    anchor_repo: Option<&str>,
+    server_url: &str,
+    config: &Config,
+    out: &OutputMode,
+) -> Result<()> {
+    use crate::anchors::{EpochVerdict, LogMode};
+
+    let label = resolve_label(key, Purpose::Signing, config)?;
+    let me = http::get_json_signed(keystore, &label, server_url, "/v1/me")?;
+    let account_id = me
+        .get("account_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::invalid_data("/v1/me carries no account_id"))?;
+
+    let anchoring = crate::anchors::anchor_log(attempt, server_url, anchor_repo)?;
+    let mode = match anchoring.verdict {
+        EpochVerdict::Anchored(mode) => mode,
+        EpochVerdict::Unanchored(why) => return Err(CliError::unanchored(why)),
+        EpochVerdict::Violation(why) => return Err(CliError::transparency_violation(why)),
+    };
+    let LogMode::V3 {
+        epoch,
+        vrf_public_key,
+        ..
+    } = mode
+    else {
+        return Err(CliError::unanchored(
+            "epoch 1 carries no account index, so the owner's watch begins at the epoch-2 cut",
+        ));
+    };
+    // `/v1/me` was read before the anchor: it answers for the anchored epoch,
+    // or the epoch moved under the command (design §10.4). Absent is epoch 1,
+    // as the server omits it there (Bob, at unit 3).
+    if me.get("epoch").map_or(Some(1), Value::as_u64) != Some(u64::from(epoch)) {
+        let named = me
+            .get("epoch")
+            .map_or_else(|| "1 (absent)".to_string(), Value::to_string);
+        return Err(CliError::transparency_violation(format!(
+            "/v1/me names epoch {named}, but the anchored epoch is {epoch}"
+        ))
+        .as_epoch_move());
+    }
+    let index = crate::anchors::account_index(
+        &vrf_public_key,
+        account_id,
+        me.get("account_vrf_proof").and_then(Value::as_str),
+        "your account",
+    )?;
+    // A V3 verdict is only reached with the files read.
+    let anchors = anchoring
+        .anchors
+        .as_ref()
+        .ok_or_else(|| CliError::unanchored("the anchor files could not be read"))?;
+    let published = anchors.latest_root(epoch).ok_or_else(|| {
+        CliError::unanchored(format!(
+            "epoch {epoch} has no published root yet, so there is no prefix to scan"
+        ))
+    })?;
+    let size = published.log_size;
+
+    // The scan: entries 1..=size of this epoch, page by page (the server caps
+    // a page); owner_watch judges what came back.
+    let mut scanned: Vec<Value> = Vec::new();
+    while (scanned.len() as u64) < size {
+        let next = scanned.len() as u64 + 1;
+        let page = http::get_json(
+            &format!(
+                "{server_url}/v1/transparency/log/range?epoch={epoch}&start={next}&end={size}"
+            ),
+            &[],
+        )?;
+        let entries = page
+            .get("entries")
+            .and_then(Value::as_array)
+            .filter(|e| !e.is_empty())
+            .ok_or_else(|| {
+                CliError::transparency_violation(format!(
+                    "the server served no entries from {next}, inside epoch {epoch}'s \
+                     published size {size}"
+                ))
+            })?;
+        let room = (size - next + 1) as usize;
+        scanned.extend(entries.iter().take(room).cloned());
+    }
+
+    // The keys this CLI holds, by the log's purpose names and fingerprint rule.
+    let mut held: Vec<(&str, String)> = Vec::new();
+    for (purpose, wire) in [
+        (Purpose::Signing, "signing"),
+        (Purpose::Kem, "kem"),
+        (Purpose::SigningPq, "signing_pq"),
+        (Purpose::KemPq, "kem_pq"),
+    ] {
+        let key_label = KeyLabel::from_handle(label.handle(), purpose)?;
+        if keystore.exists(&key_label)? {
+            let meta = keystore.meta(&key_label)?;
+            held.push((
+                wire,
+                crate::anchors::fingerprint_for(wire, &meta.public_key)?,
+            ));
+        }
+    }
+
+    let watch = crate::anchors::owner_watch(&scanned, epoch, published, &index, &held)?;
+    out.print_json(&serde_json::json!({
+        "verdict": watch.verdict,
+        "epoch": epoch,
+        "scanned": size,
+        "published_root": hex::encode(published.merkle_root),
+        "account_index": hex::encode(index),
+        "entries": watch.entries,
+        "held_not_in_published_log": watch.unlogged,
+    }))?;
+    match watch.verdict {
+        "clean" => Ok(()),
+        // No path logs a second key set under an existing account (each
+        // enrolment mints a new account; a human's keys/initialize is
+        // set-once), so an unheld key here was logged in this account's name.
+        // When a rotation command exists, it records the fingerprint it
+        // retires and this watch reads held plus retired as its own (Gus,
+        // #651 ruling 2); the must-fail arm counting `pubkey_log::append`
+        // call sites announces that day.
+        "foreign_key" => Err(CliError::transparency_violation(format!(
+            "the log holds {} key(s) under your account that this CLI does not hold: {}. \
+             Unless this CLI's keystore lost one of its own keys, a key was logged in your \
+             name",
+            watch.foreign.len(),
+            watch.foreign.join(", ")
+        ))),
+        _ => Err(CliError::unanchored(format!(
+            "{} of your keys are not in epoch {epoch}'s published prefix yet (size {size}); \
+             run again after the next published root",
+            watch.unlogged.len()
+        ))),
+    }
+}
+
+/// `signet transparency verify`: prove that a key is in the log, bound to that
+/// key (bug256), against the log's PUBLIC anchor (design v05 §5, §10.4, §10.8).
+///
+/// Three things are checked, in order: (1) the epoch the server serves, judged
+/// against the public anchor files ([`crate::anchors::anchor_log`]); (2) the
+/// leaf, recomputed from the served entry and bound to the asked fingerprint
+/// and purpose, never taken on the server's word; (3) the inclusion proof over
+/// that recomputed leaf, and the proof's root against the latest published
+/// root of the epoch (RFC 6962 consistency between them, bug149). The anchor is
+/// `--published-root/--published-size` when given, else the public file; the
+/// server's own `last_publicly_committed` is never the anchor.
+#[allow(clippy::too_many_arguments)]
 pub fn transparency_verify(
     inclusion_proof_file: Option<&str>,
     fingerprint: Option<&str>,
     purpose: Option<&str>,
     published_root: Option<&str>,
     published_size: Option<u64>,
+    anchor_repo: Option<&str>,
     server_url: &str,
     out: &OutputMode,
 ) -> Result<()> {
@@ -1365,27 +1730,155 @@ pub fn transparency_verify(
             "--published-root and --published-size must be given together: the roots.jsonl line carries both",
         ));
     }
-    let proof_doc: Value = match (inclusion_proof_file, fingerprint) {
-        (Some(file), None) => read_json_arg(file, "inclusion proof")?,
-        (None, Some(fp)) => {
-            let purpose = purpose.ok_or_else(|| {
-                CliError::invalid_args("--purpose is required with --fingerprint")
-            })?;
-            http::get_json(
-                &format!(
-                    "{server_url}/v1/transparency/log/inclusion-proof?fingerprint={fp}&purpose={purpose}"
-                ),
-                &[],
-            )?
+    match (inclusion_proof_file, fingerprint, purpose) {
+        (Some(_), None, _) | (None, Some(_), Some(_)) => {}
+        (None, Some(_), None) => {
+            return Err(CliError::invalid_args(
+                "--purpose is required with --fingerprint",
+            ));
         }
         _ => {
             return Err(CliError::invalid_args(
                 "specify --inclusion-proof <file> or --fingerprint --purpose",
             ));
         }
-    };
+    }
+    transparency_verify_with(
+        &mut |attempt| crate::anchors::anchor_log(attempt, server_url, anchor_repo),
+        inclusion_proof_file,
+        fingerprint,
+        purpose,
+        published_root,
+        published_size,
+        server_url,
+        out,
+    )
+}
 
-    let entry_hash = hex32(&proof_doc["entry_hash"], "entry_hash")?;
+/// [`transparency_verify`] with the anchoring passed in (Gus's seam: the flip
+/// test pins the proof read to the anchored epoch), its arguments checked.
+#[allow(clippy::too_many_arguments)]
+fn transparency_verify_with(
+    anchor: &mut dyn for<'a> FnMut(
+        &'a crate::anchors::EpochAttempt,
+    ) -> Result<crate::anchors::Anchoring<'a>>,
+    inclusion_proof_file: Option<&str>,
+    fingerprint: Option<&str>,
+    purpose: Option<&str>,
+    published_root: Option<&str>,
+    published_size: Option<u64>,
+    server_url: &str,
+    out: &OutputMode,
+) -> Result<()> {
+    crate::anchors::once_more_on_epoch_change(|attempt| {
+        transparency_verify_once(
+            attempt,
+            &mut *anchor,
+            inclusion_proof_file,
+            fingerprint,
+            purpose,
+            published_root,
+            published_size,
+            server_url,
+            out,
+        )
+    })
+}
+
+/// One attempt of [`transparency_verify`].
+#[allow(clippy::too_many_arguments)]
+fn transparency_verify_once(
+    attempt: &crate::anchors::EpochAttempt,
+    anchor: &mut dyn for<'a> FnMut(
+        &'a crate::anchors::EpochAttempt,
+    ) -> Result<crate::anchors::Anchoring<'a>>,
+    inclusion_proof_file: Option<&str>,
+    fingerprint: Option<&str>,
+    purpose: Option<&str>,
+    published_root: Option<&str>,
+    published_size: Option<u64>,
+    server_url: &str,
+    out: &OutputMode,
+) -> Result<()> {
+    // (1) The epoch, against the public anchors, BEFORE any epoch-bound read:
+    // the proof is then fetched at the anchored epoch, so a serve between the
+    // two is a refusal and a re-anchor, never a proof from the other epoch
+    // (design §10.4). OFFLINE when a saved proof is checked against an
+    // explicit roots.jsonl line: that pair is the whole claim, and no server
+    // is asked anything.
+    let offline = inclusion_proof_file.is_some() && published_root.is_some();
+    let anchoring = if offline {
+        None
+    } else {
+        Some(anchor(attempt)?)
+    };
+    if let Some(crate::anchors::EpochVerdict::Violation(why)) =
+        anchoring.as_ref().map(|a| &a.verdict)
+    {
+        return Err(CliError::transparency_violation(format!(
+            "{why}: TRANSPARENCY VIOLATION"
+        )));
+    }
+    let proof_doc: Value = match (inclusion_proof_file, fingerprint, purpose) {
+        (Some(file), _, _) => read_json_arg(file, "inclusion proof")?,
+        (None, Some(fp), Some(purpose)) => {
+            // `--fingerprint` is never offline, so the anchoring exists.
+            let epoch = anchoring.as_ref().map_or(1, |a| a.served.epoch);
+            http::get_json(
+                &format!(
+                    "{server_url}/v1/transparency/log/inclusion-proof?fingerprint={fp}&purpose={purpose}&epoch={epoch}"
+                ),
+                &[],
+            )?
+        }
+        _ => unreachable!("transparency_verify checked the arguments"),
+    };
+    let proof_epoch = proof_doc
+        .get("epoch")
+        .and_then(Value::as_u64)
+        .and_then(|e| u16::try_from(e).ok())
+        .unwrap_or(1);
+
+    // A proof from an epoch the public file has ended is RETIRED: stated, not
+    // an alarm (§5, §10.8). Its root can still be compared with the end line
+    // when the proof was taken at the epoch's final size.
+    if let Some(end) = anchoring
+        .as_ref()
+        .and_then(|a| a.anchors.as_ref())
+        .and_then(|a| a.epoch_end(proof_epoch))
+    {
+        let proof_size = proof_doc.get("log_size_at_proof").and_then(Value::as_u64);
+        let proof_root = proof_doc
+            .get("merkle_root_at_proof")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase);
+        let at_end = proof_size == Some(end.log_size);
+        let root_matches =
+            at_end && proof_root.as_deref() == Some(hex::encode(end.merkle_root).as_str());
+        if at_end && !root_matches {
+            return Err(CliError::transparency_violation(format!(
+                "this epoch-{proof_epoch} proof's root at size {} is not the epoch's published end root: \
+                 TRANSPARENCY VIOLATION",
+                end.log_size
+            )));
+        }
+        out.print_json(&serde_json::json!({
+            "valid": serde_json::Value::Null,
+            "published_root_status": "epoch_retired",
+            "epoch": proof_epoch,
+            "epoch_final_log_size": end.log_size,
+            "epoch_final_merkle_root": hex::encode(end.merkle_root),
+            "matches_epoch_end": root_matches,
+            "note": format!(
+                "epoch {proof_epoch} was retired at size {} (published end line); its entries are no longer served",
+                end.log_size
+            ),
+        }))?;
+        return Ok(());
+    }
+
+    // (2) The leaf, recomputed and bound to the key asked about (bug256).
+    let entry_hash = crate::anchors::bind_leaf(&proof_doc, fingerprint, purpose)?;
     let entry_id = proof_doc["entry_id"]
         .as_u64()
         .ok_or_else(|| CliError::invalid_data("proof missing entry_id"))?;
@@ -1400,49 +1893,85 @@ pub fn transparency_verify(
         .map(|v| hex32(v, "inclusion_proof element"))
         .collect::<Result<_>>()?;
 
-    let consistent = signet_crypto::merkle::verify_inclusion(
-        &entry_hash,
-        (entry_id - 1) as usize,
-        tree_size as usize,
-        &path,
-        &proof_root,
-    );
+    // (3) The tree, over the RECOMPUTED leaf.
+    let consistent = entry_id >= 1
+        && signet_crypto::merkle::verify_inclusion(
+            &entry_hash,
+            (entry_id - 1) as usize,
+            tree_size as usize,
+            &path,
+            &proof_root,
+        );
 
-    // The published anchor to check against: --published-root/--published-size
-    // (a roots.jsonl line), else the server's last publicly-committed root+size
-    // (null until D1's GitHub commit).
+    // The anchor: the explicit roots.jsonl line, else the public file's latest
+    // root for the served epoch. Never the server's own claim.
+    let unanchored_why: Option<String>;
     let committed: Option<([u8; 32], u64)> = match (published_root, published_size) {
-        (Some(hex), Some(size)) => Some((
-            hex::decode(hex.trim())
-                .ok()
-                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
-                .ok_or_else(|| CliError::invalid_args("--published-root must be 32-byte hex"))?,
-            size,
-        )),
-        _ => fetch_committed_root(server_url)?,
+        (Some(hex), Some(size)) => {
+            unanchored_why = None;
+            Some((
+                hex::decode(hex.trim())
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                    .ok_or_else(|| {
+                        CliError::invalid_args("--published-root must be 32-byte hex")
+                    })?,
+                size,
+            ))
+        }
+        _ => match anchoring.as_ref().map(|a| (&a.verdict, a.anchors.as_ref())) {
+            Some((crate::anchors::EpochVerdict::Anchored(_), Some(a))) => {
+                unanchored_why = None;
+                let epoch = anchoring.as_ref().map_or(1, |x| x.served.epoch);
+                a.latest_root(epoch).map(|r| (r.merkle_root, r.log_size))
+            }
+            Some((crate::anchors::EpochVerdict::Unanchored(why), _)) => {
+                unanchored_why = Some(why.clone());
+                None
+            }
+            _ => {
+                unanchored_why = Some(if anchoring.as_ref().is_some_and(|a| a.repo_known) {
+                    "the public anchor files could not be read".to_string()
+                } else {
+                    "no public anchor repository is known for this server (pass --anchor-repo)"
+                        .to_string()
+                });
+                None
+            }
+        },
     };
 
-    // bug149: the published root is a SNAPSHOT at its own log size. Raw equality
-    // against the proof's (current-size) root is only meaningful at the same size;
-    // between publishes the correct question is whether the current log EXTENDS the
-    // published one (RFC 6962 consistency). Judged only if the inclusion proof
-    // itself verified — a broken proof short-circuits below.
-    let verdict = if consistent {
+    // bug149: the published root is a SNAPSHOT at its own log size; between
+    // publishes the question is whether the current log EXTENDS it.
+    let verdict = if consistent && unanchored_why.is_none() {
         Some(judge_published_root(
             &proof_root,
             tree_size,
             committed,
-            |from, to| fetch_consistency_nodes(server_url, from, to),
+            |from, to| fetch_consistency_nodes(server_url, proof_epoch, from, to),
         )?)
     } else {
         None
     };
 
+    // `valid` means VERIFIED: the inclusion holds AND the root is held to a
+    // public anchor. Inclusion alone is reported as `inclusion_holds`, so an
+    // unanchored result can never read as a pass (Bob, #650).
+    let anchored_pass = matches!(
+        verdict,
+        Some(
+            PublishedRootVerdict::MatchAtSameSize | PublishedRootVerdict::ConsistentAdvance { .. }
+        )
+    );
     out.print_json(&serde_json::json!({
-        "valid": consistent,
+        "valid": consistent && anchored_pass,
+        "inclusion_holds": consistent,
         "fingerprint": proof_doc.get("public_key_fingerprint"),
         "purpose": proof_doc.get("key_purpose"),
+        "epoch": anchoring.as_ref().map_or(proof_epoch, |a| a.served.epoch),
+        "anchor": if offline { "explicit" } else { "public_file" },
         "entry_id": entry_id,
+        "leaf_bound": true,
         "log_size_at_proof": tree_size,
         "merkle_root_at_proof": hex::encode(proof_root),
         "merkle_root_publicly_committed": committed.map(|(root, _)| hex::encode(root)),
@@ -1454,7 +1983,12 @@ pub fn transparency_verify(
             Some(PublishedRootVerdict::RootMismatchAtSameSize) => Some(false),
             _ => None,
         },
-        "published_root_status": verdict.as_ref().map(PublishedRootVerdict::as_str),
+        "published_root_status": match (&unanchored_why, &verdict) {
+            (Some(_), _) => Some("unanchored"),
+            (None, Some(v)) => Some(v.as_str()),
+            (None, None) => None,
+        },
+        "unanchored_reason": unanchored_why,
     }))?;
 
     if !consistent {
@@ -1462,9 +1996,20 @@ pub fn transparency_verify(
             "inclusion proof does not verify against its root",
         ));
     }
-    match verdict.expect("verdict is Some when consistent") {
-        // No public root to compare (D1 not live): informational, exit 0.
-        PublishedRootVerdict::NoPublishedRoot => Ok(()),
+    let Some(verdict) = verdict else {
+        // UNANCHORED: the inclusion holds, but there is no public anchor to
+        // hold the root to. Stated, with its own exit (62), never a pass.
+        return Err(CliError::unanchored(format!(
+            "the inclusion holds but the root is not anchored: {}",
+            unanchored_why.as_deref().unwrap_or("no public anchor")
+        )));
+    };
+    match verdict {
+        // No public root for this epoch yet (the genesis window): inclusion
+        // without an anchor, so the same informational exit as unanchored.
+        PublishedRootVerdict::NoPublishedRoot => Err(CliError::unanchored(
+            "the inclusion holds but no root is published for this epoch yet",
+        )),
         PublishedRootVerdict::MatchAtSameSize => Ok(()),
         // The log grew since the last publish and provably extends it — the
         // ordinary between-publishes state, not an alarm (bug149).
@@ -1564,13 +2109,23 @@ fn judge_published_root(
     }
 }
 
-/// Fetch the server's RFC 6962 consistency-proof nodes for `from → to`.
+/// Fetch the server's RFC 6962 consistency-proof nodes for `from → to` in
+/// `epoch`, the proof's own: a server serving another epoch refuses it, and
+/// the command re-anchors (design §10.4), rather than proving epoch-1 sizes
+/// over epoch 2's tree.
 /// ⚠ Query params are `from`/`to` (`ConsistencyQuery`, server transparency.rs) —
 /// wrong names 400. Only the nodes are used; the response's echoed roots are not
 /// trusted (see `judge_published_root`).
-fn fetch_consistency_nodes(server_url: &str, from: u64, to: u64) -> Result<Vec<[u8; 32]>> {
+fn fetch_consistency_nodes(
+    server_url: &str,
+    epoch: u16,
+    from: u64,
+    to: u64,
+) -> Result<Vec<[u8; 32]>> {
     let doc = http::get_json(
-        &format!("{server_url}/v1/transparency/log/consistency-proof?from={from}&to={to}"),
+        &format!(
+            "{server_url}/v1/transparency/log/consistency-proof?from={from}&to={to}&epoch={epoch}"
+        ),
         &[],
     )?;
     doc["consistency_proof"]
@@ -1579,25 +2134,6 @@ fn fetch_consistency_nodes(server_url: &str, from: u64, to: u64) -> Result<Vec<[
         .iter()
         .map(|v| hex32(v, "consistency_proof element"))
         .collect()
-}
-
-/// The server's most-recent publicly-committed Merkle root AND its log size
-/// (null until D1). The size is load-bearing (bug149): without it the root is a
-/// snapshot with no way to ask the extension question.
-fn fetch_committed_root(server_url: &str) -> Result<Option<([u8; 32], u64)>> {
-    let root = http::get_json(&format!("{server_url}/v1/transparency/log/root"), &[])?;
-    match root.get("last_publicly_committed") {
-        None | Some(Value::Null) => Ok(None),
-        Some(committed) => {
-            let size = committed["log_size"]
-                .as_u64()
-                .ok_or_else(|| CliError::invalid_data("committed root missing log_size"))?;
-            Ok(Some((
-                hex32(&committed["merkle_root"], "committed merkle_root")?,
-                size,
-            )))
-        }
-    }
 }
 
 pub fn audit(
@@ -2160,35 +2696,37 @@ pub fn share_create(
     // Hybrid when my attested bundle is hybrid (§9.2 via self_wrap_keys).
     let mut metadata_key = Zeroizing::new([0u8; 32]);
     OsRng.fill_bytes(&mut *metadata_key);
-    let me = http::get_json_signed(keystore, &signing_label, server_url, "/v1/me")?;
-    let self_keys = self_wrap_keys(keystore, &me, &kem_label)?;
-    let owner_wrap = wrap_metadata_key_for(&self_keys, &metadata_key, &root_bytes)?;
-
     // A PRSN must also wrap the key to its Guardian (the mandatory recipient).
     // Mandatory hybrid + verified-source (F-DOWNGRADE a+b): the Guardian's keys
     // verify against their §10a log receipts (guardians are humans) before
     // anything is wrapped to them — never the bare `/v1/me` bundle alone.
-    let is_prsn = me.get("account_type").and_then(Value::as_str) == Some("prsn");
-    let guardian_wrap = if is_prsn {
-        let guardian = me.get("guardian").ok_or_else(|| {
-            CliError::invalid_data("a PRSN must have a Guardian to create a share folder")
-        })?;
-        let trust = crate::recipient_verify::ServerTrust::fetch(server_url)?;
-        let guardian_keys = crate::recipient_verify::verified_wrap_keys(
-            &trust,
-            server_url,
-            guardian,
-            crate::recipient_verify::HandleExpectation::ServerListed,
-            "Guardian",
-        )?;
-        Some(wrap_metadata_key_for(
-            &guardian_keys,
-            &metadata_key,
-            &root_bytes,
-        )?)
-    } else {
-        None
-    };
+    // `/v1/me` and the Guardian's verification answer for one epoch, or are
+    // read again from a fresh anchor (design §10.4).
+    let (me, guardian_keys) = crate::anchors::once_more_on_epoch_change(|attempt| {
+        let me = http::get_json_signed(keystore, &signing_label, server_url, "/v1/me")?;
+        let is_prsn = me.get("account_type").and_then(Value::as_str) == Some("prsn");
+        let guardian_keys = if is_prsn {
+            let guardian = me.get("guardian").ok_or_else(|| {
+                CliError::invalid_data("a PRSN must have a Guardian to create a share folder")
+            })?;
+            let trust = crate::recipient_verify::ServerTrust::fetch(attempt, server_url)?;
+            Some(crate::recipient_verify::verified_wrap_keys(
+                &trust,
+                server_url,
+                guardian,
+                crate::recipient_verify::HandleExpectation::ServerListed,
+                "Guardian",
+            )?)
+        } else {
+            None
+        };
+        Ok((me, guardian_keys))
+    })?;
+    let self_keys = self_wrap_keys(keystore, &me, &kem_label)?;
+    let owner_wrap = wrap_metadata_key_for(&self_keys, &metadata_key, &root_bytes)?;
+    let guardian_wrap = guardian_keys
+        .map(|keys| wrap_metadata_key_for(&keys, &metadata_key, &root_bytes))
+        .transpose()?;
 
     // Encrypt the name (§7.3; a top-level folder's name binds to root‖itself).
     let encrypted_name =
@@ -2960,53 +3498,62 @@ pub fn upload(
         recipient_account_id: account_id.clone(),
         wrapped_dek,
     }];
-    let recipients = http::get_json_signed(
-        keystore,
-        &signing_label,
-        server_url,
-        &format!("/v1/share-folders/{root_uuid}/recipients"),
-    )?;
-    // Verified-source recipient keys (F-DOWNGRADE a+b): one server-trust fetch
-    // for the whole recipient set (lazily, on the first non-self recipient),
-    // then each recipient's keys verify against their identity record
-    // (attestation / §10a receipts) before any wrap. The OWNER (Bug038) is
-    // wrapped too, so a read_write recipient uploading to a folder it does not
-    // own still covers the owner; when we ARE the owner it is skipped as self.
-    let mut trust: Option<crate::recipient_verify::ServerTrust> = None;
-    let mut seen: std::collections::HashSet<String> =
-        std::collections::HashSet::from([account_id.clone()]);
-    let owner = recipients.get("owner");
-    let wrap_targets = owner.into_iter().chain(
-        recipients
-            .get("recipients")
-            .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or_default(),
-    );
-    for r in wrap_targets {
-        let rid = r
-            .get("recipient_account_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| CliError::invalid_data("recipient missing account_id"))?;
-        if !seen.insert(rid.to_string()) {
-            continue; // self, or already wrapped (owner also listed as a recipient)
-        }
-        if trust.is_none() {
-            trust = Some(crate::recipient_verify::ServerTrust::fetch(server_url)?);
-        }
-        let trust = trust.as_ref().expect("just initialized");
-        let recipient_keys = crate::recipient_verify::verified_wrap_keys(
-            trust,
+    // The recipient set and every recipient's verification answer for one
+    // epoch, or are read again from a fresh anchor (design §10.4).
+    let recipient_wraps = crate::anchors::once_more_on_epoch_change(|attempt| {
+        let recipients = http::get_json_signed(
+            keystore,
+            &signing_label,
             server_url,
-            r,
-            crate::recipient_verify::HandleExpectation::ServerListed,
-            "recipient",
+            &format!("/v1/share-folders/{root_uuid}/recipients"),
         )?;
-        wrapped_deks.push(WrappedDekInput {
-            recipient_account_id: rid.to_string(),
-            wrapped_dek: wrap_dek_for(&recipient_keys, &dek)?,
-        });
-    }
+        let mut wraps = Vec::new();
+        // Verified-source recipient keys (F-DOWNGRADE a+b): one server-trust fetch
+        // for the whole recipient set (lazily, on the first non-self recipient),
+        // then each recipient's keys verify against their identity record
+        // (attestation / §10a receipts) before any wrap. The OWNER (Bug038) is
+        // wrapped too, so a read_write recipient uploading to a folder it does not
+        // own still covers the owner; when we ARE the owner it is skipped as self.
+        let mut trust: Option<crate::recipient_verify::ServerTrust> = None;
+        let mut seen: std::collections::HashSet<String> =
+            std::collections::HashSet::from([account_id.clone()]);
+        let owner = recipients.get("owner");
+        let wrap_targets = owner.into_iter().chain(
+            recipients
+                .get("recipients")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        );
+        for r in wrap_targets {
+            let rid = r
+                .get("recipient_account_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| CliError::invalid_data("recipient missing account_id"))?;
+            if !seen.insert(rid.to_string()) {
+                continue; // self, or already wrapped (owner also listed as a recipient)
+            }
+            if trust.is_none() {
+                trust = Some(crate::recipient_verify::ServerTrust::fetch(
+                    attempt, server_url,
+                )?);
+            }
+            let trust = trust.as_ref().expect("just initialized");
+            let recipient_keys = crate::recipient_verify::verified_wrap_keys(
+                trust,
+                server_url,
+                r,
+                crate::recipient_verify::HandleExpectation::ServerListed,
+                "recipient",
+            )?;
+            wraps.push(WrappedDekInput {
+                recipient_account_id: rid.to_string(),
+                wrapped_dek: wrap_dek_for(&recipient_keys, &dek)?,
+            });
+        }
+        Ok(wraps)
+    })?;
+    wrapped_deks.extend(recipient_wraps);
 
     // Initiate the multipart upload (reserves quota, returns one part URL per chunk).
     let initiate_body = InitiateBody {
@@ -4517,22 +5064,42 @@ fn resolve_recipient_pubkey(
     server_url: &str,
     handle: &str,
 ) -> Result<(RecipientWrapKeys, Value)> {
-    let resp = http::get_json_signed(
-        keystore,
-        signing,
-        server_url,
-        &format!("/v1/recipients/{handle}"),
-    )?;
-    let trust = crate::recipient_verify::ServerTrust::fetch(server_url)?;
-    // F-PIN1: `handle` is the user-typed name — the bundle's echo must match it.
-    let keys = crate::recipient_verify::verified_wrap_keys(
-        &trust,
-        server_url,
-        &resp,
-        crate::recipient_verify::HandleExpectation::UserNamed(handle),
-        &format!("recipient '{handle}'"),
-    )?;
-    Ok((keys, resp))
+    resolve_recipient_pubkey_with(keystore, signing, server_url, handle, &mut |attempt| {
+        crate::recipient_verify::ServerTrust::fetch(attempt, server_url)
+    })
+}
+
+/// [`resolve_recipient_pubkey`] with the anchoring passed in (the flip tests'
+/// seam). The bundle is read inside the attempt: it names the epoch it was
+/// served under, so a bundle read before a serve is read again after it
+/// (design §10.4).
+pub(crate) fn resolve_recipient_pubkey_with(
+    keystore: &dyn Keystore,
+    signing: &KeyLabel,
+    server_url: &str,
+    handle: &str,
+    anchor: &mut dyn for<'a> FnMut(
+        &'a crate::anchors::EpochAttempt,
+    ) -> Result<crate::recipient_verify::ServerTrust<'a>>,
+) -> Result<(RecipientWrapKeys, Value)> {
+    crate::anchors::once_more_on_epoch_change(|attempt| {
+        let resp = http::get_json_signed(
+            keystore,
+            signing,
+            server_url,
+            &format!("/v1/recipients/{handle}"),
+        )?;
+        let trust = anchor(attempt)?;
+        // F-PIN1: `handle` is the user-typed name — the bundle's echo must match it.
+        let keys = crate::recipient_verify::verified_wrap_keys(
+            &trust,
+            server_url,
+            &resp,
+            crate::recipient_verify::HandleExpectation::UserNamed(handle),
+            &format!("recipient '{handle}'"),
+        )?;
+        Ok((keys, resp))
+    })
 }
 
 /// `signet recipient <handle>` — resolve + verify a recipient's KEM public key
@@ -6346,7 +6913,7 @@ mod dual_sign_receipt_tests {
         verify_one_receipt(
             &receipt,
             "fp-signing",
-            None,
+            AccountBinding::Attested,
             "signing",
             &es_pub,
             Some(&pq_vk),
@@ -6364,7 +6931,7 @@ mod dual_sign_receipt_tests {
             verify_one_receipt(
                 &stripped_sig,
                 "fp-signing",
-                None,
+                AccountBinding::Attested,
                 "signing",
                 &es_pub,
                 Some(&pq_vk),
@@ -6383,7 +6950,7 @@ mod dual_sign_receipt_tests {
             verify_one_receipt(
                 &stripped_kid,
                 "fp-signing",
-                None,
+                AccountBinding::Attested,
                 "signing",
                 &es_pub,
                 Some(&pq_vk),
@@ -6395,7 +6962,15 @@ mod dual_sign_receipt_tests {
         // N9's receipt-layer cousin: a dual-signed receipt with NO pq vk in
         // hand fails closed (never silently skips the PQ half).
         assert!(
-            verify_one_receipt(&receipt, "fp-signing", None, "signing", &es_pub, None,).is_err(),
+            verify_one_receipt(
+                &receipt,
+                "fp-signing",
+                AccountBinding::Attested,
+                "signing",
+                &es_pub,
+                None,
+            )
+            .is_err(),
             "cannot silently skip an unverifiable PQ co-signature"
         );
     }
@@ -6411,7 +6986,7 @@ mod dual_sign_receipt_tests {
         verify_one_receipt(
             &receipt,
             "fp-signing",
-            Some("00000000-0000-4000-8000-00000000cafe"),
+            AccountBinding::AccountId("00000000-0000-4000-8000-00000000cafe"),
             "signing",
             &es_pub,
             Some(&pq_vk),
@@ -6422,7 +6997,7 @@ mod dual_sign_receipt_tests {
             verify_one_receipt(
                 &receipt,
                 "fp-signing",
-                Some("11111111-1111-4111-8111-111111111111"),
+                AccountBinding::AccountId("11111111-1111-4111-8111-111111111111"),
                 "signing",
                 &es_pub,
                 Some(&pq_vk),
@@ -6888,5 +7463,118 @@ mod bug180_partial_download_tests {
         let missing = std::env::temp_dir().join("bug180-never-existed.part");
         std::fs::remove_file(&missing).ok();
         drop(TempFileGuard(Some(missing)));
+    }
+}
+
+#[cfg(test)]
+mod epoch_seam_tests {
+    use super::*;
+    use crate::anchors::{Anchoring, EpochVerdict, LogMode, ServedEpoch};
+    use serde_json::json;
+
+    #[test]
+    fn transparency_verify_reads_the_proof_at_the_anchored_epoch_and_re_anchors_once() {
+        // Gus's seam (unit 1): the command the run sheet runs during the cut's
+        // wait. The proof is read at the anchored epoch, a refusal there
+        // re-anchors once, both attempts run under the write arm, and the
+        // server sees only GETs. The second attempt ends on the server's own
+        // answer (no entry), which is not an epoch move and is not retried.
+        let (url, log) = crate::test_support::serve_scripted(|_, target| {
+            if target.ends_with("&epoch=1") {
+                crate::test_support::epoch_retired()
+            } else {
+                (
+                    404,
+                    json!({ "error": { "code": "not_found", "message": "no entry" } }).to_string(),
+                )
+            }
+        });
+        let anchors = std::cell::Cell::new(0u16);
+        let err = transparency_verify_with(
+            &mut |_| {
+                assert!(
+                    crate::http::writes_refused(),
+                    "every attempt runs under the arm"
+                );
+                anchors.set(anchors.get() + 1);
+                Ok(Anchoring::for_test(
+                    ServedEpoch {
+                        epoch: anchors.get(),
+                        vrf_public_key: None,
+                    },
+                    None,
+                    EpochVerdict::Anchored(LogMode::Legacy),
+                    false,
+                ))
+            },
+            None,
+            Some("fp"),
+            Some("kem"),
+            None,
+            None,
+            &url,
+            &OutputMode { pretty: false },
+        )
+        .unwrap_err();
+        assert_eq!(anchors.get(), 2, "re-anchored once");
+        assert_eq!(err.exit_code, 26, "{}", err.message);
+        let log = log.lock().unwrap().clone();
+        assert_eq!(log.len(), 2, "{log:?}");
+        assert!(
+            log.iter().all(|l| l.starts_with(
+                "GET /v1/transparency/log/inclusion-proof?fingerprint=fp&purpose=kem"
+            )),
+            "{log:?}"
+        );
+        assert!(
+            log[0].ends_with("&epoch=1") && log[1].ends_with("&epoch=2"),
+            "the proof read names the anchored epoch: {log:?}"
+        );
+    }
+
+    #[test]
+    fn attestation_verify_anchors_before_it_fetches_the_response() {
+        // Unit 1d: the §9 response is fetched AFTER the anchor, so one read
+        // across a serve names the later epoch in its receipts, which the
+        // receipt check treats as an epoch move. Fetched first, an epoch-1
+        // response under an epoch-2 anchor failed at the index (60) before
+        // that check could see it. The injected anchoring writes into the
+        // server's own request log, so the order is the log's.
+        let (url, log) = crate::test_support::serve_scripted(|_, _| {
+            (
+                404,
+                json!({ "error": { "code": "not_found", "message": "no attestation" } })
+                    .to_string(),
+            )
+        });
+        let seen = log.clone();
+        let err = attestation_verify_with(
+            &mut |_| {
+                assert!(
+                    crate::http::writes_refused(),
+                    "every attempt runs under the arm"
+                );
+                seen.lock().unwrap().push("anchor".to_string());
+                Ok(Anchoring::for_test(
+                    ServedEpoch {
+                        epoch: 1,
+                        vrf_public_key: None,
+                    },
+                    None,
+                    EpochVerdict::Anchored(LogMode::Legacy),
+                    false,
+                ))
+            },
+            Some("att-1"),
+            None,
+            &url,
+            None,
+            None,
+            &OutputMode { pretty: false },
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code, 26, "{}", err.message);
+        let log = log.lock().unwrap().clone();
+        assert_eq!(log, ["anchor", "GET /v1/attestations/att-1/verification"]);
     }
 }

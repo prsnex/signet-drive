@@ -124,6 +124,39 @@ pub fn decapsulate(seed: &[u8], ct: &[u8]) -> Result<Vec<u8>, &'static str> {
     Ok(ss.as_slice().to_vec())
 }
 
+/// The VRF input for an account: `signet_crypto::vrf::alpha`, byte for byte
+/// (domain ‖ 0x00 ‖ the UUID's 16 bytes; the native test pins the two).
+const VRF_ALPHA_DOMAIN: &[u8] = b"signet-pubkey-log-v3-account-index";
+
+/// The transparency log's v3 account index that `proof` proves for
+/// `account_id` (a UUID's 16 bytes) under the epoch's VRF `public_key`
+/// (Transparency-Log Epoch-2 design §2, §10.6): ECVRF-RISTRETTO255-SHA512
+/// through the same pinned `vrf-r255` the server and the CLI use. Fails
+/// closed: a malformed key or proof, and a proof that does not verify, return
+/// no index.
+pub fn vrf_verify(
+    public_key: &[u8],
+    account_id: &[u8],
+    proof: &[u8],
+) -> Result<Vec<u8>, &'static str> {
+    let public_key: [u8; 32] = public_key
+        .try_into()
+        .map_err(|_| "vrf public key must be 32 bytes")?;
+    let account_id: &[u8; 16] = account_id
+        .try_into()
+        .map_err(|_| "account id must be 16 bytes")?;
+    let proof: [u8; 80] = proof.try_into().map_err(|_| "vrf proof must be 80 bytes")?;
+    let pk = vrf_r255::PublicKey::from_bytes(public_key).ok_or("malformed vrf public key")?;
+    let pi = vrf_r255::Proof::from_bytes(proof).ok_or("malformed vrf proof")?;
+    let mut alpha = Vec::with_capacity(VRF_ALPHA_DOMAIN.len() + 1 + 16);
+    alpha.extend_from_slice(VRF_ALPHA_DOMAIN);
+    alpha.push(0x00);
+    alpha.extend_from_slice(account_id);
+    Option::<[u8; 64]>::from(pk.verify(&alpha, &pi))
+        .map(|index| index.to_vec())
+        .ok_or("vrf proof does not verify")
+}
+
 /// The wasm32-only JS exports — thin wrappers mapping the core's errors to
 /// `JsError` (which cannot be constructed on non-wasm targets).
 #[cfg(target_arch = "wasm32")]
@@ -152,6 +185,15 @@ mod js {
     #[wasm_bindgen]
     pub fn mlkem1024_decapsulate(seed: &[u8], ct: &[u8]) -> Result<Vec<u8>, JsError> {
         super::decapsulate(seed, ct).map_err(err)
+    }
+
+    #[wasm_bindgen]
+    pub fn vrf_r255_verify(
+        public_key: &[u8],
+        account_id: &[u8],
+        proof: &[u8],
+    ) -> Result<Vec<u8>, JsError> {
+        super::vrf_verify(public_key, account_id, proof).map_err(err)
     }
 }
 
@@ -216,5 +258,63 @@ mod tests {
         assert!(ek_from_seed(&[0u8; 63]).is_err());
         assert!(encapsulate(&[0u8; 1567]).is_err());
         assert!(decapsulate(&[0u8; 64], &[0u8; 1569]).is_err());
+    }
+
+    // ---- the VRF account index (Transparency-Log Epoch-2 design §10.6) ----
+
+    /// A known answer from the server's own implementation (`signet_crypto::vrf`,
+    /// secret key 0x01 × 32): the same bytes on both compile targets.
+    const VRF_PK: &str = "3e440469a098036d89ffb2d77a4542928f2f74c2b5769da7480736ace829dc10";
+    const VRF_ACCOUNT: [u8; 16] = [
+        0xCA, 0xFE, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0xBE, 0xEF,
+    ];
+    const VRF_PROOF: &str = "02ea537b0797536f1c299db70c48b77ac1a2fba463e45602b3216adea310be06\
+                             a207adf81c21914edb94d9c0581f111145df4282e0ab7ef331d9e03d65431897\
+                             ab5becdf48a56bd9b26875661db6ba00";
+    const VRF_INDEX: &str = "69f8f2ca9cc69e6e18aa9bef8dcbb0f6df0ff32e46b9c60f7b6da89850f82f98\
+                             b9a038a32b8c22204821abcfdfd5ae5f2d1bcf55ff3c6d6300accbfa2e1cad55";
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn kat_vrf_index_is_pinned() {
+        let index = vrf_verify(
+            &hex::decode(VRF_PK).unwrap(),
+            &VRF_ACCOUNT,
+            &hex::decode(VRF_PROOF).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(hex::encode(index), VRF_INDEX);
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn vrf_refuses_another_account_an_altered_proof_and_bad_lengths() {
+        let pk = hex::decode(VRF_PK).unwrap();
+        let proof = hex::decode(VRF_PROOF).unwrap();
+        let mut other = VRF_ACCOUNT;
+        other[15] ^= 1;
+        assert!(vrf_verify(&pk, &other, &proof).is_err());
+        let mut altered = proof.clone();
+        altered[40] ^= 1;
+        assert!(vrf_verify(&pk, &VRF_ACCOUNT, &altered).is_err());
+        assert!(vrf_verify(&pk[..31], &VRF_ACCOUNT, &proof).is_err());
+        assert!(vrf_verify(&pk, &VRF_ACCOUNT[..15], &proof).is_err());
+        assert!(vrf_verify(&pk, &VRF_ACCOUNT, &proof[..79]).is_err());
+    }
+
+    /// The native cross-check: what the server proves, this module verifies to
+    /// the same index, so the framing here is `signet_crypto::vrf::alpha`'s.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn vrf_matches_signet_crypto_byte_for_byte() {
+        for seed in 1u8..=8 {
+            let sk = signet_crypto::vrf::VrfSecretKey::from_bytes(&[seed; 32]).unwrap();
+            let account = [seed.wrapping_mul(37); 16];
+            let (index, proof) = sk.prove(&account).unwrap();
+            assert_eq!(
+                vrf_verify(&sk.public_key(), &account, &proof).unwrap(),
+                index.to_vec()
+            );
+        }
     }
 }

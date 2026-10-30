@@ -15,7 +15,7 @@
 // translate.
 
 import { SignetApiError } from './api';
-import { PrfNotSupportedError } from './crypto/errors';
+import { EpochChangedError, PrfNotSupportedError } from './crypto/errors';
 import { StallError, TransferExhaustedError } from './transfer';
 // Relative on purpose: the unit-test runner resolves no $lib aliases (vite.config's
 // stated design), and the compiled catalog is a sibling directory either way.
@@ -101,6 +101,12 @@ export function friendlyCeremonyError(error: unknown): string {
       default:
         return error.message || m.err_common_generic();
     }
+  }
+  // bug253: passkey rotation refuses a new passkey that does not report PRF
+  // (rotate.ts), the same browser-side refusal bug252 mapped at sign-up; without
+  // this arm the fall-through below put its developer string in the dialog.
+  if (error instanceof PrfNotSupportedError) {
+    return m.err_auth_prf_not_supported();
   }
   if (error instanceof Error && error.message) {
     return error.message;
@@ -227,6 +233,12 @@ export function friendlyDriveError(error: unknown): string {
   }
   if (error instanceof StallError) {
     return m.err_drive_stalled();
+  }
+  // Design §10.4 (Gus, on the client PR): the transparency log's epoch moved
+  // during the operation and again on its one re-read. Nothing was wrapped or
+  // sent; a web user has no exit code, so the copy says what to do.
+  if (error instanceof EpochChangedError) {
+    return m.err_drive_service_updating();
   }
   if (error instanceof Error && error.message) {
     return error.message;

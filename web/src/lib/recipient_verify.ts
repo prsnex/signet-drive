@@ -33,17 +33,19 @@
 // append-only, watcher-visible records — the trust model's verifiability
 // layer, with the CLI as the stronger dual-verifying surface by design.
 
-import type {
-  AttestationVerificationResponse,
-  DriveApi,
-  LogReceipt,
-  ServerInfoResponse,
+import {
+  SignetApiError,
+  type AttestationVerificationResponse,
+  type DriveApi,
+  type LogReceipt,
+  type ServerInfoResponse,
 } from './api';
-import { b64uDecode, type Bytes } from './crypto/bytes';
-import { IntegrityError, InvalidInputError } from './crypto/errors';
+import { b64uDecode, hexDecode, hexEncode, type Bytes } from './crypto/bytes';
+import { EpochChangedError, IntegrityError, InvalidInputError } from './crypto/errors';
 import { hybridRfp } from './crypto/hybrid_wrap';
 import { toCanonicalBytes, type JsonObject, type JsonValue } from './crypto/jcs';
 import { fingerprint, fingerprintRaw } from './crypto/pubkey';
+import { vrfVerify } from './crypto/vrf';
 
 /** A verified wrap target: the P-011 classical key + the fingerprint-verified
  *  ML-KEM half (mandatory under F-DOWNGRADE(a) for every third-party
@@ -59,6 +61,11 @@ export interface RecipientKeyBundle {
   account_type?: string | null;
   account_id?: string | null;
   recipient_account_id?: string | null;
+  /** The epoch the server answered under; from epoch 2 the account's VRF proof
+   *  beside its id, named in pairs (design §10.6). */
+  epoch?: number | null;
+  account_vrf_proof?: string | null;
+  recipient_account_vrf_proof?: string | null;
   attestation_id?: string | null;
   kem_pubkey?: string | null;
   kem_pubkey_fingerprint?: string | null;
@@ -114,9 +121,19 @@ type IdentityApi = Pick<DriveApi, 'getServerInfo' | 'getAttestationVerification'
  *  one `/v1/server-info` fetch per operation (shared across an upload's whole
  *  recipient loop). The active ML-DSA-87 key must be PUBLISHED (its absence is
  *  a downgrade signal — this deployment is post-7c by construction), though
- *  the web verifies only the ES256 half (module docs). */
+ *  the web verifies only the ES256 half (module docs).
+ *
+ *  The same read anchors the operation's transparency-log epoch and, from
+ *  epoch 2, the VRF key receipts are bound under (design §10.6). The key comes
+ *  from `/v1/server-info` (Gus's ruling, on Bob's reason): the web's binding
+ *  trusts the server for the VRF key, as it already does for inclusion, an
+ *  accepted limit; sender protection against a split VRF key is the CLI's,
+ *  which pins it from the public file. */
 export class ServerTrust {
   private info: ServerInfoResponse | undefined;
+  /** The FIRST read's epoch and VRF key: one operation binds under one epoch,
+   *  so a key-rotation re-fetch (`keyById`) never moves them. */
+  private anchored: { epoch: number; vrfPublicKey: string | undefined } | undefined;
 
   constructor(private readonly api: IdentityApi) {}
 
@@ -129,8 +146,56 @@ export class ServerTrust {
             'treat its identity records as trustworthy (MF-2 downgrade signal)',
         );
       }
+      this.anchored ??= {
+        epoch: this.info.translog?.epoch ?? 1,
+        vrfPublicKey: this.info.translog?.vrf_public_key ?? undefined,
+      };
     }
     return this.info;
+  }
+
+  /** The served epoch this operation anchored (1 before the first cut). */
+  async epoch(): Promise<number> {
+    await this.fetch();
+    return this.anchored!.epoch;
+  }
+
+  /** What a receipt for `accountId` must name from epoch 2: the epoch, and the
+   *  index the account's VRF proof yields under the anchored VRF key. `null`
+   *  in epoch 1, where the account id (or the attestation) binds. A missing
+   *  key or proof, or a proof that does not verify, binds nothing. */
+  async indexFor(
+    accountId: string,
+    proof: string | null | undefined,
+    who: string,
+  ): Promise<{ epoch: number; index: string } | null> {
+    const epoch = await this.epoch();
+    if (epoch < 2) return null;
+    const key = this.anchored!.vrfPublicKey;
+    if (!key) {
+      throw new IntegrityError(
+        `server-info names epoch ${epoch} but no VRF key: cannot bind ${who}'s keys to the log`,
+      );
+    }
+    if (!proof) {
+      throw new IntegrityError(
+        `${who}: no VRF proof for the account in epoch ${epoch} — cannot bind its keys to the log`,
+      );
+    }
+    let index: Bytes;
+    try {
+      index = await vrfVerify(
+        strictHex(key, 32, 'VRF key'),
+        uuidBytes(accountId, who),
+        strictHex(proof, 80, 'VRF proof'),
+      );
+    } catch (e) {
+      throw new IntegrityError(
+        `${who}: the account's VRF proof does not verify under the epoch's key — ` +
+          `substitution (${e instanceof Error ? e.message : e})`,
+      );
+    }
+    return { epoch, index: hexEncode(index) };
   }
 
   /** An ES256 signing key by id (current or retired — a response or receipt
@@ -143,6 +208,68 @@ export class ServerTrust {
     if (fresh) return b64uDecode(fresh.public_key);
     throw new IntegrityError(`server-info has no signing key with id ${keyId}`);
   }
+}
+
+/** Run an operation's epoch-bound reads, and once more from a fresh
+ *  `/v1/server-info` when the server's epoch moved under the first attempt
+ *  (design §10.4; the CLI's `once_more_on_epoch_change`). Each attempt makes
+ *  its own `ServerTrust` and only reads: the caller wraps and writes after this
+ *  returns. On the retry nothing is caught: a refusal met again stays an
+ *  EpochChangedError ("The service was updating. Please try again."), and a
+ *  part naming another epoch again is an IntegrityError, since it then
+ *  contradicts a fresh read. */
+export async function onceMoreOnEpochChange<T>(attempt: () => Promise<T>): Promise<T> {
+  try {
+    return await attempt();
+  } catch (e) {
+    if (!(e instanceof EpochChangedError)) throw e;
+  }
+  try {
+    return await attempt();
+  } catch (e) {
+    if (e instanceof EpochChangedError && !e.refusal) throw new IntegrityError(e.message);
+    throw e;
+  }
+}
+
+/** A 410 `epoch_retired` or 404 `epoch_unknown` in the server's error envelope:
+ *  the epoch this operation anchored is not the served one any more. */
+function isEpochRefusal(e: unknown): e is SignetApiError {
+  return (
+    e instanceof SignetApiError &&
+    ((e.status === 410 && e.code === 'epoch_retired') ||
+      (e.status === 404 && e.code === 'epoch_unknown'))
+  );
+}
+
+/** A receipt answers for one epoch: its `epoch`, or 1 when it names none (the
+ *  shape before epoch 2). Another means the epoch moved under the operation. */
+function checkReceiptEpoch(receipt: LogReceipt, epoch: number, who: string, purpose: string) {
+  const named = receipt['epoch'] ?? 1;
+  if (named !== epoch) {
+    throw new EpochChangedError(
+      `${who}: the ${purpose} receipt answers for epoch ${String(named)}, but the anchored ` +
+        `epoch is ${epoch}`,
+      false,
+    );
+  }
+}
+
+/** Lowercase hex of exactly `len` bytes, or an IntegrityError. */
+function strictHex(hex: string, len: number, what: string): Bytes {
+  if (!new RegExp(`^[0-9a-fA-F]{${len * 2}}$`).test(hex)) {
+    throw new IntegrityError(`${what} is not ${len} bytes of hex`);
+  }
+  return hexDecode(hex.toLowerCase());
+}
+
+/** A UUID's 16 raw bytes (the VRF input's account id). */
+function uuidBytes(uuid: string, who: string): Bytes {
+  const hex = uuid.replace(/-/g, '');
+  if (!/^[0-9a-fA-F]{32}$/.test(hex)) {
+    throw new IntegrityError(`${who}: the account id is not a UUID`);
+  }
+  return hexDecode(hex.toLowerCase());
 }
 
 function findById(info: ServerInfoResponse, keyId: string) {
@@ -216,11 +343,27 @@ export async function verifiedRecipient(
         `to an identity record`,
     );
   }
+  // The account id and, from epoch 2, its VRF proof, named in pairs (§10.6).
+  const proof = bundle.account_id ? bundle.account_vrf_proof : bundle.recipient_account_vrf_proof;
+
+  // The bundle answers for the anchored epoch, or the epoch moved under the
+  // operation: it is read before the trust (design §10.4). An absent `epoch`
+  // is epoch 1, since the server omits the field while epoch 1 is served
+  // (Bob, at unit 3), so a bundle read before a serve shows as the move it is.
+  const epoch = await trust.epoch();
+  const named = bundle.epoch ?? 1;
+  if (named !== epoch) {
+    throw new EpochChangedError(
+      `${who}: the recipient bundle names epoch ${bundle.epoch ?? '1 (absent)'}, but the ` +
+        `anchored epoch is ${epoch}`,
+      false,
+    );
+  }
 
   if (isPrsn) {
     await verifyAgainstAttestation(trust, api, bundle, recipient, accountId, handle, who);
   } else {
-    await verifyAgainstReceipts(trust, api, bundle, accountId, who);
+    await verifyAgainstReceipts(trust, api, bundle, accountId, proof, who);
   }
   return recipient;
 }
@@ -298,13 +441,17 @@ async function verifyAgainstAttestation(
   }
 
   // The inline §10a receipts: present for all four attested keys, each
-  // ES256-verified + shape-checked (ties the attested keys into the log).
-  await verifyInlineReceipts(trust, response, attestation, who);
+  // ES256-verified + shape-checked (ties the attested keys into the log). From
+  // epoch 2 each must sit under the subject's index; the proof is read from
+  // INSIDE the signed object (§10.6).
+  const index = await trust.indexFor(accountId, str(attestation, 'subject_account_vrf_proof'), who);
+  await verifyInlineReceipts(trust, response, attestation, index, who);
 }
 
 /** Human recipients: no attestation exists — the verified source is the §10a
  *  log receipt for EACH half of the hybrid KEM pair, bound to the recipient's
- *  account (D2 affirmation §1). Key-currency note: a receipt proves the key
+ *  account (D2 affirmation §1): by `account_id` in epoch 1, by the account's
+ *  VRF index from epoch 2 (§10.6). Key-currency note: a receipt proves the key
  *  was LOGGED for the account, not that it is current — moot for humans in v1
  *  (the KEM identity is set-once); PRSN currency is the attestation path's
  *  status check, which is why classification comes from the handle. */
@@ -313,8 +460,11 @@ async function verifyAgainstReceipts(
   api: IdentityApi,
   bundle: RecipientKeyBundle,
   accountId: string,
+  proof: string | null | undefined,
   who: string,
 ): Promise<void> {
+  const epoch = await trust.epoch();
+  const binding: ReceiptBinding = (await trust.indexFor(accountId, proof, who)) ?? { accountId };
   const pairs: [string | null | undefined, string][] = [
     [bundle.kem_pubkey_fingerprint, 'kem'],
     [bundle.kem_pq_pubkey_fingerprint, 'kem_pq'],
@@ -325,16 +475,31 @@ async function verifyAgainstReceipts(
     }
     let receipt: LogReceipt;
     try {
-      receipt = await api.getLogReceipt(fp, purpose);
+      // At the anchored epoch: a server that has since served another refuses
+      // it, and the operation re-reads (design §10.4).
+      receipt = await api.getLogReceipt(fp, purpose, epoch);
     } catch (e) {
+      if (isEpochRefusal(e)) {
+        throw new EpochChangedError(
+          `the server's epoch changed during this operation (${e.code}: ${e.message})`,
+          true,
+        );
+      }
       throw new IntegrityError(
         `${who}: no verifiable ${purpose} log receipt for the offered key — ` +
           `an unlogged key is not a wrap target (${e instanceof Error ? e.message : e})`,
       );
     }
-    await verifyOneReceipt(trust, receipt, fp, accountId, purpose, who);
+    // A receipt naming another epoch than the one asked for is the server
+    // contradicting its own parameter, not a race: the binding refuses it.
+    await verifyOneReceipt(trust, receipt, fp, binding, purpose, who);
   }
 }
+
+/** What a receipt must name to bind a key to its account: the account id in
+ *  epoch 1, the epoch and index from epoch 2; `null` where a server-signed
+ *  attestation already carries the epoch-1 binding. */
+type ReceiptBinding = { accountId: string } | { epoch: number; index: string } | null;
 
 /** Verify a §9 attestation-verification response at the web bound: ES256 over
  *  the canonical bytes + the PQ siblings' structural presence (MF-2 shape —
@@ -373,8 +538,12 @@ async function verifyInlineReceipts(
   trust: ServerTrust,
   response: AttestationVerificationResponse,
   attestation: JsonObject,
+  index: { epoch: number; index: string } | null,
   who: string,
 ): Promise<void> {
+  // The §9 response is read before the trust and takes no epoch, so each
+  // receipt must answer for the anchored one, or the epoch moved (§10.4).
+  const epoch = await trust.epoch();
   const receipts: [string, string, string][] = [
     ['subject_signing_pubkey_receipt', 'subject_signing_pubkey_fingerprint', 'signing'],
     ['subject_kem_pubkey_receipt', 'subject_kem_pubkey_fingerprint', 'kem'],
@@ -390,9 +559,10 @@ async function verifyInlineReceipts(
           `receipt — the write path requires the full receipt set`,
       );
     }
-    // The attestation (server-signed) binds the keys to the subject account;
-    // no separate account binding needed here.
-    await verifyOneReceipt(trust, receipt, assertedFp, null, purpose, who);
+    checkReceiptEpoch(receipt, epoch, who, purpose);
+    // In epoch 1 the attestation (server-signed) binds the keys to the subject
+    // account; from epoch 2 each receipt must also sit under its index.
+    await verifyOneReceipt(trust, receipt, assertedFp, index, purpose, who);
   }
 }
 
@@ -405,7 +575,7 @@ async function verifyOneReceipt(
   trust: ServerTrust,
   receipt: LogReceipt,
   assertedFp: string,
-  expectedAccountId: string | null,
+  binding: ReceiptBinding,
   purpose: string,
   who: string,
 ): Promise<void> {
@@ -417,15 +587,27 @@ async function verifyOneReceipt(
   if (receipt['key_purpose'] !== purpose) {
     throw new IntegrityError(`${who}: ${purpose} receipt has an unexpected key_purpose`);
   }
-  if (expectedAccountId !== null) {
+  if (binding !== null && 'accountId' in binding) {
     const receiptAccount = receipt['account_id'];
     if (
       typeof receiptAccount !== 'string' ||
-      receiptAccount.toLowerCase() !== expectedAccountId.toLowerCase()
+      receiptAccount.toLowerCase() !== binding.accountId.toLowerCase()
     ) {
       throw new IntegrityError(
         `${who}: ${purpose} receipt binds the key to a DIFFERENT account — a ` +
           `logged key that is not this recipient's is a substitution`,
+      );
+    }
+  } else if (binding !== null) {
+    const receiptIndex = receipt['account_index'];
+    if (
+      receipt['epoch'] !== binding.epoch ||
+      typeof receiptIndex !== 'string' ||
+      receiptIndex.toLowerCase() !== binding.index
+    ) {
+      throw new IntegrityError(
+        `${who}: ${purpose} receipt is not under the account's index in epoch ` +
+          `${binding.epoch} — a logged key that is not this recipient's is a substitution`,
       );
     }
   }

@@ -262,6 +262,22 @@ enum Command {
         /// The log_size from the same roots.jsonl line as --published-root.
         #[arg(long = "published-size", requires = "published_root")]
         published_size: Option<u64>,
+        /// The public repository holding this server's anchor files
+        /// (`roots.jsonl`, `vrf-keys.jsonl`). Known servers need none; a
+        /// self-run server names its own. Also `SIGNET_ANCHOR_REPO`.
+        #[arg(long = "anchor-repo")]
+        anchor_repo: Option<String>,
+        /// The owner's watch: scan this epoch's published entries and report
+        /// every key logged under this account's index, held or not.
+        #[arg(
+            long = "self",
+            conflicts_with_all = ["inclusion_proof", "fingerprint", "purpose", "published_root"]
+        )]
+        self_watch: bool,
+        /// The identity `--self` checks (a key label or handle); resolved as
+        /// every signed command resolves it.
+        #[arg(long, requires = "self_watch")]
+        key: Option<String>,
     },
     /// Fetch audit-log entries since a given event_id (signed request).
     Audit {
@@ -1576,15 +1592,33 @@ fn dispatch(cli: &Cli, config: &Config, out: &OutputMode) -> Result<(), CliError
             purpose,
             published_root,
             published_size,
-        } => commands::transparency_verify(
-            inclusion_proof.as_deref(),
-            fingerprint.as_deref(),
-            purpose.as_deref(),
-            published_root.as_deref(),
-            *published_size,
-            &config.server_base_url,
-            out,
-        ),
+            anchor_repo,
+            self_watch,
+            key,
+        } => {
+            if *self_watch {
+                let keystore = keystore::open(config)?;
+                commands::transparency_verify_self(
+                    keystore.as_ref(),
+                    key.as_deref(),
+                    anchor_repo.as_deref(),
+                    &config.server_base_url,
+                    config,
+                    out,
+                )
+            } else {
+                commands::transparency_verify(
+                    inclusion_proof.as_deref(),
+                    fingerprint.as_deref(),
+                    purpose.as_deref(),
+                    published_root.as_deref(),
+                    *published_size,
+                    anchor_repo.as_deref(),
+                    &config.server_base_url,
+                    out,
+                )
+            }
+        }
         Command::Audit { key, since, limit } => {
             let keystore = keystore::open(config)?;
             commands::audit(

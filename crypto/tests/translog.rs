@@ -263,3 +263,170 @@ fn server_dual_sign_ctx_constants_are_the_prefix_labels() {
     let input = signet_crypto::translog::receipt_signing_input(&serde_json::json!({})).unwrap();
     assert!(input.starts_with(&receipt_prefix));
 }
+
+// ---- v3 (epoch 2): the VRF account index in place of the account id ----
+
+#[test]
+fn entry_hash_v3_hashes_the_spec_preimage_byte_for_byte() {
+    let index = [0x5au8; 64];
+    let prev = [0x11u8; 32];
+    let pk = test_pubkey();
+    let alg = "ECDH-ES+A256KW";
+    let mut pre = vec![0x03u8];
+    pre.extend_from_slice(&7u64.to_be_bytes());
+    pre.extend_from_slice(&index);
+    pre.push(0x02);
+    pre.extend_from_slice(&(alg.len() as u32).to_be_bytes());
+    pre.extend_from_slice(alg.as_bytes());
+    pre.extend_from_slice(&(pk.len() as u32).to_be_bytes());
+    pre.extend_from_slice(&pk);
+    pre.extend_from_slice(&1_793_000_000u64.to_be_bytes());
+    pre.extend_from_slice(&prev);
+    assert_eq!(
+        translog::entry_hash_v3(
+            7,
+            Some(&index),
+            KeyPurpose::Kem,
+            alg,
+            &pk,
+            1_793_000_000,
+            &prev
+        ),
+        hash::sha256(&pre)
+    );
+    assert_eq!(translog::ENTRY_VERSION_V3, 0x03);
+}
+
+#[test]
+fn entry_hash_v3_hashes_a_missing_index_as_64_zero_bytes() {
+    let prev = [0u8; 32];
+    let payload = b"payload";
+    assert_eq!(
+        translog::entry_hash_v3(1, None, KeyPurpose::Epoch, "a", payload, 9, &prev),
+        translog::entry_hash_v3(
+            1,
+            Some(&[0u8; 64]),
+            KeyPurpose::Epoch,
+            "a",
+            payload,
+            9,
+            &prev
+        )
+    );
+}
+
+#[test]
+fn v3_and_v2_never_collide_on_the_same_fields() {
+    // Same entry, same key, an index whose first 16 bytes are the v2 account id:
+    // the version byte and the field width keep the two rules apart.
+    let prev = [0x11u8; 32];
+    let pk = test_pubkey();
+    let mut index = [0u8; 64];
+    index[..16].copy_from_slice(&HUMAN_1);
+    assert_ne!(
+        translog::entry_hash_v3(7, Some(&index), KeyPurpose::Kem, "x", &pk, 5, &prev),
+        translog::entry_hash_v2(7, Some(&HUMAN_1), KeyPurpose::Kem, "x", &pk, 5, &prev)
+    );
+}
+
+#[test]
+fn epoch_payload_v3_binds_the_previous_epoch_and_the_vrf_key() {
+    let root = [0xa4u8; 32];
+    let vrf_pk = [0x54u8; 32];
+    let mut expected = b"signet-pubkey-log-v3-epoch".to_vec();
+    expected.push(0x00);
+    expected.extend_from_slice(&2u16.to_be_bytes());
+    expected.extend_from_slice(&11u64.to_be_bytes());
+    expected.extend_from_slice(&root);
+    expected.extend_from_slice(&hash::sha256(&vrf_pk));
+    assert_eq!(translog::epoch_payload_v3(2, 11, &root, &vrf_pk), expected);
+    assert_eq!(translog::EPOCH_ALGORITHM_V3, "signet-translog-v3");
+    // A different previous root, size or key is a different payload.
+    assert_ne!(translog::epoch_payload_v3(2, 12, &root, &vrf_pk), expected);
+    assert_ne!(
+        translog::epoch_payload_v3(2, 11, &[0u8; 32], &vrf_pk),
+        expected
+    );
+    assert_ne!(
+        translog::epoch_payload_v3(2, 11, &root, &[0u8; 32]),
+        expected
+    );
+}
+
+/// The published verifier's v3 known answers, computed here by the crate's own
+/// `entry_hash_v3`, `epoch_payload_v3` and `merkle_root` and asserted to the
+/// same hex `infrastructure/scripts/verify-translog.sh --self-test` pins (Bob,
+/// at unit 4 of the epoch-2 client PR: two copies of one rule, so either side
+/// moving fails a test). Epoch 2 opened on (11, 0x11 × 32) under crypto-wasm's
+/// known-answer VRF key, then a hybrid KEM pair under that key's index.
+#[test]
+fn v3_known_answers_match_the_published_verifier() {
+    let vrf: [u8; 32] =
+        hex::decode("3e440469a098036d89ffb2d77a4542928f2f74c2b5769da7480736ace829dc10")
+            .unwrap()
+            .try_into()
+            .unwrap();
+    let index: [u8; 64] = hex::decode(
+        "69f8f2ca9cc69e6e18aa9bef8dcbb0f6df0ff32e46b9c60f7b6da89850f82f98\
+         b9a038a32b8c22204821abcfdfd5ae5f2d1bcf55ff3c6d6300accbfa2e1cad55",
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
+    let payload = translog::epoch_payload_v3(2, 11, &[0x11; 32], &vrf);
+    assert_eq!(
+        hex::encode(&payload),
+        "7369676e65742d7075626b65792d6c6f672d76332d65706f6368000002000000000000000b\
+         1111111111111111111111111111111111111111111111111111111111111111\
+         1579d610eebcc433138125b6a37e308966d84919d8eaffd68cf02caf988805fb"
+    );
+    let genesis = translog::entry_hash_v3(
+        1,
+        None,
+        KeyPurpose::Epoch,
+        translog::EPOCH_ALGORITHM_V3,
+        &payload,
+        1_793_000_000,
+        &[0; 32],
+    );
+    let mut kem = vec![0x04u8];
+    kem.extend_from_slice(&[0x22; 64]);
+    let kem_entry = translog::entry_hash_v3(
+        2,
+        Some(&index),
+        KeyPurpose::Kem,
+        "ECDH-ES+A256KW",
+        &kem,
+        1_793_000_001,
+        &genesis,
+    );
+    let kem_pq_entry = translog::entry_hash_v3(
+        3,
+        Some(&index),
+        KeyPurpose::KemPq,
+        "ML-KEM-1024",
+        &[0x33; 1568],
+        1_793_000_002,
+        &kem_entry,
+    );
+    assert_eq!(
+        hex::encode(genesis),
+        "ec6f991305b821c0c6ee4ed046f3ef2f877ded00f2f59da54d2f6fdf5aee078b"
+    );
+    assert_eq!(
+        hex::encode(kem_entry),
+        "ac5c499905f9b01570cb5877e9724f81ba0085782a7d54026069cb2b73d525e4"
+    );
+    assert_eq!(
+        hex::encode(kem_pq_entry),
+        "4163b3e6c1ec706a948792352fed1054b22afefe0ff961705485b0794b61930c"
+    );
+    assert_eq!(
+        hex::encode(signet_crypto::merkle::merkle_root(&[
+            genesis,
+            kem_entry,
+            kem_pq_entry
+        ])),
+        "63d052f5a2750939d2ddf02c93992b7bd0d821c33ef42d359f15c0370213a06a"
+    );
+}

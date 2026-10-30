@@ -14,6 +14,9 @@ import {
   wrapKemPrivkey,
   type KemPrivkeyWrap,
 } from './crypto/kem_wrap';
+import { PrfNotSupportedError } from './crypto/errors';
+import { friendlyCeremonyError } from './errors';
+import { m } from './paraglide/messages.js';
 import { rotatePasskey } from './rotate';
 import type {
   AssertionCredentialLike,
@@ -171,5 +174,39 @@ describe('rotatePasskey — the browser-side KEM re-wrap', () => {
       clientExtensionResults?: Record<string, unknown>;
     };
     expect(oldAssertion.clientExtensionResults?.prf).toBeUndefined();
+  });
+
+  it('bug253: a new passkey without PRF is refused with calm catalog copy, never the raw string', async () => {
+    const pair = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, [
+      'deriveBits',
+    ]);
+    const pkcs8 = new Uint8Array(await crypto.subtle.exportKey('pkcs8', pair.privateKey)) as Bytes;
+    const currentBlob = await wrapKemPrivkey(
+      await deriveWrapKey(OLD_PRF),
+      pkcs8,
+      crypto.getRandomValues(new Uint8Array(12)),
+    );
+    const counts: Counts = { creates: 0, gets: 0 };
+    const prfCapable = rotatingGateway(counts);
+    // Gesture 2 registers in a passkey manager that does not report PRF.
+    const noPrf: WebAuthnGateway = {
+      ...prfCapable,
+      create: async (options) => {
+        const credential = await prfCapable.create(options);
+        return credential && { ...credential, getClientExtensionResults: () => ({}) };
+      },
+    };
+
+    const err = await rotatePasskey(
+      { api: fakeRotateApi(counts), gateway: noPrf },
+      currentBlob,
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PrfNotSupportedError);
+    expect(counts.complete).toBeUndefined();
+
+    // The rotate dialog renders through friendlyCeremonyError (AccountStore.rotatePasskey).
+    const shown = friendlyCeremonyError(err);
+    expect(shown).toBe(m.err_auth_prf_not_supported());
+    expect(shown).not.toContain('PRF extension');
   });
 });

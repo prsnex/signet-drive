@@ -53,7 +53,12 @@ import {
   type NameEnvelope,
 } from './crypto';
 import { formatBytes } from './format';
-import { ServerTrust, verifiedRecipient, type VerifiedRecipient } from './recipient_verify';
+import {
+  onceMoreOnEpochChange,
+  ServerTrust,
+  verifiedRecipient,
+  type VerifiedRecipient,
+} from './recipient_verify';
 import { trace, errorIdentity } from './trace';
 import {
   TransferExhaustedError,
@@ -783,31 +788,38 @@ export class Drive {
       },
     ];
     if (target.shareFolder) {
-      const { recipients, owner } = await this.api.listRecipients(target.rootFolderId);
       // Verified-source recipient keys (F-DOWNGRADE a+b): one server-trust
       // fetch for the whole recipient set; each recipient's keys verify
       // against their identity record (attestation / §10a receipts) before
       // any wrap. The OWNER is wrapped too (Bug038) so a read_write recipient
       // (a Guardian) uploading to a folder it does not own still covers the
-      // owner; when we ARE the owner it is skipped (self-wrap covers it).
-      const trust = new ServerTrust(this.api);
-      const wrapTargets = [owner, ...recipients];
-      const seen = new Set<string>([this.session.accountId]);
-      for (const r of wrapTargets) {
-        if (seen.has(r.recipient_account_id)) continue;
-        seen.add(r.recipient_account_id);
-        const recipient = await verifiedRecipient(
-          trust,
-          this.api,
-          r,
-          'server-listed',
-          r.permission === 'owner' ? 'the folder owner' : 'a share recipient',
-        );
-        wrappedDeks.push({
-          recipient_account_id: r.recipient_account_id,
-          wrapped_dek: await this.wrapDekTo(recipient, dek),
-        });
-      }
+      // owner; when we ARE the owner it is skipped (self-wrap covers it). The
+      // set and every verification answer for one epoch, or are read again
+      // from a fresh server-info (design §10.4); nothing here writes.
+      const wraps = await onceMoreOnEpochChange(async () => {
+        const { recipients, owner } = await this.api.listRecipients(target.rootFolderId);
+        const trust = new ServerTrust(this.api);
+        const wrapTargets = [owner, ...recipients];
+        const seen = new Set<string>([this.session.accountId]);
+        const out: typeof wrappedDeks = [];
+        for (const r of wrapTargets) {
+          if (seen.has(r.recipient_account_id)) continue;
+          seen.add(r.recipient_account_id);
+          const recipient = await verifiedRecipient(
+            trust,
+            this.api,
+            r,
+            'server-listed',
+            r.permission === 'owner' ? 'the folder owner' : 'a share recipient',
+          );
+          out.push({
+            recipient_account_id: r.recipient_account_id,
+            wrapped_dek: await this.wrapDekTo(recipient, dek),
+          });
+        }
+        return out;
+      });
+      wrappedDeks.push(...wraps);
     }
 
     const metadataKey = await this.metadataKey(target.rootFolderId);
@@ -1910,17 +1922,21 @@ export class Drive {
   async recipientKey(
     handle: string,
   ): Promise<{ recipient: VerifiedRecipient; view: RecipientKey }> {
-    const view = await this.api.getRecipientKey(handle);
-    const trust = new ServerTrust(this.api);
-    // F-PIN1: `handle` is the user-typed name — the bundle's echo must match it.
-    const recipient = await verifiedRecipient(
-      trust,
-      this.api,
-      view,
-      { userNamed: handle },
-      `recipient '${handle}'`,
-    );
-    return { recipient, view };
+    // The bundle and its verification answer for one epoch, or are read again
+    // from a fresh server-info (design §10.4).
+    return onceMoreOnEpochChange(async () => {
+      const view = await this.api.getRecipientKey(handle);
+      const trust = new ServerTrust(this.api);
+      // F-PIN1: `handle` is the user-typed name — the bundle's echo must match it.
+      const recipient = await verifiedRecipient(
+        trust,
+        this.api,
+        view,
+        { userNamed: handle },
+        `recipient '${handle}'`,
+      );
+      return { recipient, view };
+    });
   }
 
   /** Create a top-level share folder: a fresh metadata key wrapped to the owner

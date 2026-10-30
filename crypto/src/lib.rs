@@ -84,6 +84,7 @@ pub mod merkle;
 pub mod pubkey;
 pub mod signing;
 pub mod translog;
+pub mod vrf;
 pub mod wrap;
 pub mod x509;
 

@@ -35,3 +35,19 @@ export class PrfNotSupportedError extends InvalidInputError {
     this.name = 'PrfNotSupportedError';
   }
 }
+
+/** The server's transparency-log epoch moved under an operation (design §10.4):
+ *  a read refused the epoch the operation anchored (`refusal`), or a part it
+ *  read names another one. `onceMoreOnEpochChange` re-reads once from a fresh
+ *  `/v1/server-info`. A refusal met again reaches the user as "The service was
+ *  updating. Please try again."; a part naming another epoch again becomes an
+ *  IntegrityError, since it then contradicts a fresh read. */
+export class EpochChangedError extends Error {
+  constructor(
+    message: string,
+    readonly refusal: boolean,
+  ) {
+    super(message);
+    this.name = 'EpochChangedError';
+  }
+}

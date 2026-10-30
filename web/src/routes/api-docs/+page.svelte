@@ -400,8 +400,12 @@ signet transparency-verify --fingerprint "$KEM_FINGERPRINT" --purpose kem</code
           ></tr
         >
         <tr
-          ><td><code>transparency-verify --fingerprint --purpose [--published-root]</code></td><td
-            >Verify a transparency-log inclusion proof.</td
+          ><td
+            ><code>transparency-verify --fingerprint --purpose | --inclusion-proof | --self</code
+            ></td
+          ><td
+            >Verify a transparency-log inclusion proof, or watch your own keys (<code>--self</code
+            >).</td
           ></tr
         >
         <tr
@@ -577,6 +581,36 @@ signet transparency-verify --fingerprint "$FINGERPRINT" --purpose kem
 #   GET /v1/transparency/log/root
 #   GET /v1/transparency/log/inclusion-proof?fingerprint=...&amp;purpose=...
 #   GET /v1/transparency/log/consistency-proof?...</code
+      ></pre>
+    <h3>Epochs</h3>
+    <p>
+      The log runs in epochs. A new epoch starts from a genesis entry that binds the previous
+      epoch's final size and root, and from epoch 2 every entry names its account by a VRF index
+      (ECVRF-RISTRETTO255-SHA512) instead of the account id: only the server can compute an index,
+      anyone given the account's proof can check it, and deleting an account changes nothing in the
+      log. The public anchor repository publishes each epoch's end line and VRF key.
+    </p>
+    <pre><code
+        ># What the server reports:
+#   GET /v1/server-info            -> translog: {'{'} epoch, vrf_suite, vrf_public_key {'}'}
+#   GET /v1/transparency/log/root  -> epoch, previous_epoch: {'{'} epoch, log_size, merkle_root {'}'}
+#
+# Every epoch-bound read takes the epoch you anchored (entries are served whole, as stored):
+#   GET /v1/transparency/log/range?epoch=N&amp;start=...&amp;end=...
+#   GET /v1/transparency/log/receipt?fingerprint=...&amp;purpose=...&amp;epoch=N
+#   GET /v1/transparency/log/inclusion-proof?fingerprint=...&amp;purpose=...&amp;epoch=N
+#   GET /v1/transparency/log/consistency-proof?from=...&amp;to=...&amp;epoch=N
+# Another epoch is refused: 410 epoch_retired (with that epoch's final size and root)
+# or 404 epoch_unknown. Read /root again and retry.
+#
+# From epoch 2, a response that names an account beside keys carries the account's proof:
+#   /v1/recipients/{'{'}handle{'}'}        -> epoch, account_vrf_proof
+#   share recipients rows          -> epoch, recipient_account_vrf_proof
+#   /v1/me and its guardian block  -> epoch, account_vrf_proof
+#   attestation verification       -> subject_account_vrf_proof, inside the signed object
+#
+# Check every key logged under your own account's index:
+signet transparency-verify --self</code
       ></pre>
   </section>
 

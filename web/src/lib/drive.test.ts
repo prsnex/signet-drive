@@ -54,7 +54,9 @@ import {
   utf8Encode,
   type NameEnvelope,
 } from './crypto';
+import { IntegrityError } from './crypto/errors';
 import type { JsonObject } from './crypto/jcs';
+import { friendlyDriveError } from './errors';
 import { formatBytes } from './format';
 import { receiptSigningInput, verificationSigningInput } from './recipient_verify';
 import { generateKemKeypair, importKemPrivateNonExtractable } from './kem';
@@ -2740,5 +2742,326 @@ describe('upload seal-ahead (bug178 phase 2, S174)', () => {
   it('floors fractional values rather than preparing a fraction of a part', () => {
     expect(uploadPrepareAhead(1.9)).toBe(1);
     expect(uploadPrepareAhead(0.9)).toBe(0);
+  });
+});
+
+// ---- the epoch-2 binding and one epoch per operation (design §10.4, §10.6) ----
+
+// crypto-wasm's known answer (signet_crypto::vrf, secret key 0x01 × 32): an
+// epoch-2 VRF public key, an account, its proof, and the index it proves.
+const KAT_VRF_PK = '3e440469a098036d89ffb2d77a4542928f2f74c2b5769da7480736ace829dc10';
+const KAT_ACCOUNT = 'cafe0000-0000-4000-8000-00000000beef';
+const KAT_PROOF =
+  '02ea537b0797536f1c299db70c48b77ac1a2fba463e45602b3216adea310be06' +
+  'a207adf81c21914edb94d9c0581f111145df4282e0ab7ef331d9e03d65431897' +
+  'ab5becdf48a56bd9b26875661db6ba00';
+const KAT_INDEX =
+  '69f8f2ca9cc69e6e18aa9bef8dcbb0f6df0ff32e46b9c60f7b6da89850f82f98' +
+  'b9a038a32b8c22204821abcfdfd5ae5f2d1bcf55ff3c6d6300accbfa2e1cad55';
+
+/** A FakeDrive whose log is in epochs. server-info names the served epoch
+ *  and, from 2, the VRF key; bundles and recipient rows name it from 2, with
+ *  the account's proof, and OMIT it in epoch 1, as the server does; receipts
+ *  are read at an asked epoch and refused otherwise (3b's envelope); a §9
+ *  response from 2 carries the subject's proof inside the signed object and
+ *  receipts under its index. `flipBefore` serves epoch 2 just before the
+ *  named read. Every call is logged by name, so a test can show that the
+ *  attempt that ran twice wrote nothing. */
+class EpochDrive extends FakeDrive {
+  served = 1;
+  flipBefore: string | null = null;
+  readonly calls: string[] = [];
+  /** A bundle in epoch 1's shape (no `epoch`, no proof), whatever is served. */
+  staleBundle = false;
+  /** Every epoch-bound receipt read refused. */
+  refuseAlways = false;
+  /** The index epoch-2 receipts sit under. */
+  receiptIndex = KAT_INDEX;
+  /** A human recipient `listRecipients` lists beside the owner. */
+  shareRecipient: RecipientKey | null = null;
+
+  private see(name: string): void {
+    if (this.flipBefore === name) {
+      this.served = 2;
+      this.flipBefore = null;
+    }
+    this.calls.push(name);
+  }
+
+  private epochFields(proofName: 'account_vrf_proof' | 'recipient_account_vrf_proof') {
+    // The server's shape: no `epoch` (and no proof) while epoch 1 is served.
+    if (this.staleBundle || this.served < 2) return {};
+    return { epoch: this.served, [proofName]: KAT_PROOF };
+  }
+
+  async getServerInfo(): Promise<ServerInfoResponse> {
+    this.see('server-info');
+    const info = await super.getServerInfo();
+    return {
+      ...info,
+      translog:
+        this.served >= 2
+          ? {
+              epoch: this.served,
+              vrf_suite: 'ECVRF-RISTRETTO255-SHA512',
+              vrf_public_key: KAT_VRF_PK,
+            }
+          : { epoch: 1 },
+    };
+  }
+
+  async getRecipientKey(handle: string): Promise<RecipientKey> {
+    this.see('recipient');
+    return { ...(await super.getRecipientKey(handle)), ...this.epochFields('account_vrf_proof') };
+  }
+
+  async listRecipients(): Promise<RecipientsResponse> {
+    this.see('recipients');
+    const listed = await super.listRecipients();
+    const r = this.shareRecipient;
+    if (!r) return listed;
+    return {
+      ...listed,
+      recipients: [
+        {
+          recipient_account_id: r.account_id,
+          handle: r.handle,
+          account_type: r.account_type,
+          kem_pubkey: r.kem_pubkey,
+          kem_pubkey_fingerprint: r.kem_pubkey_fingerprint,
+          kem_pq_pubkey: r.kem_pq_pubkey,
+          kem_pq_pubkey_fingerprint: r.kem_pq_pubkey_fingerprint,
+          permission: 'read_write',
+          is_mandatory_guardian: false,
+          ...this.epochFields('recipient_account_vrf_proof'),
+        },
+      ],
+    };
+  }
+
+  async getLogReceipt(fp: string, purpose: string, epoch?: number): Promise<LogReceipt> {
+    this.see(`receipt:${purpose}:${epoch}`);
+    if (this.refuseAlways || (epoch !== undefined && epoch !== this.served)) {
+      throw epoch !== undefined && epoch > this.served
+        ? new SignetApiError(404, 'epoch_unknown', `epoch ${epoch} is not served`)
+        : new SignetApiError(410, 'epoch_retired', `epoch ${epoch} is retired`);
+    }
+    if (this.served < 2) return super.getLogReceipt(fp, purpose);
+    return this.v2Receipt(fp, purpose);
+  }
+
+  /** A §10.5 receipt in epoch 2, under `receiptIndex`, really signed. */
+  async v2Receipt(fp: string, purpose: string): Promise<LogReceipt> {
+    const unsigned: JsonObject = {
+      v: 2,
+      type: 'signet-pubkey-log-receipt',
+      epoch: 2,
+      entry_id: 7,
+      entry_version: 3,
+      account_index: this.receiptIndex,
+      key_purpose: purpose,
+      algorithm: purpose === 'kem_pq' ? 'ML-KEM-1024' : 'ECDH-ES+A256KW',
+      public_key_fingerprint: fp,
+      entry_hash: 'aa',
+      log_size_at_insertion: 7,
+      issued_at: 1_700_000_000,
+      max_merge_delay_seconds: 86_400,
+      server_key_id: 'srv-es',
+      server_pq_key_id: 'srv-pq',
+    };
+    return {
+      ...unsigned,
+      server_signature: await this.serverSign(receiptSigningInput(unsigned)),
+      server_signature_mldsa87: 'cGxhY2Vob2xkZXI',
+    };
+  }
+
+  async getAttestationVerification(id: string): Promise<AttestationVerificationResponse> {
+    this.see('verification');
+    const v1 = await super.getAttestationVerification(id);
+    if (this.served < 2) return v1;
+    // Epoch 2: the subject's proof inside the signed object (§10.6), re-signed,
+    // and the four receipts under its index.
+    const attestation: JsonObject = {
+      ...(v1.attestation as JsonObject),
+      subject_account_vrf_proof: KAT_PROOF,
+    };
+    const fp = (field: string) => attestation[field] as string;
+    return {
+      ...v1,
+      attestation,
+      server_signature: await this.serverSign(
+        verificationSigningInput(attestation, v1.server_key_id, v1.signed_at),
+      ),
+      subject_signing_pubkey_receipt: await this.v2Receipt(
+        fp('subject_signing_pubkey_fingerprint'),
+        'signing',
+      ),
+      subject_kem_pubkey_receipt: await this.v2Receipt(fp('subject_kem_pubkey_fingerprint'), 'kem'),
+      subject_signing_pq_pubkey_receipt: await this.v2Receipt(
+        fp('subject_signing_pq_pubkey_fingerprint'),
+        'signing_pq',
+      ),
+      subject_kem_pq_pubkey_receipt: await this.v2Receipt(
+        fp('subject_kem_pq_pubkey_fingerprint'),
+        'kem_pq',
+      ),
+    };
+  }
+
+  async initiateMultipart(
+    fileId: string,
+    body: InitiateMultipartBody,
+  ): Promise<InitiateMultipartResponse> {
+    this.calls.push('write:initiate');
+    return super.initiateMultipart(fileId, body);
+  }
+}
+
+/** A hybrid PRSN recipient at the known-answer account, attested in epoch 1. */
+async function registerPat(api: EpochDrive): Promise<void> {
+  const kem = await generateKemKeypair();
+  const mlkem = await mlkemKeygen();
+  await api.registerPrsn({
+    handle: 'pat-ai',
+    account_type: 'prsn',
+    account_id: KAT_ACCOUNT,
+    kem_pubkey: b64uEncode(kem.publicX963),
+    kem_pubkey_fingerprint: await fingerprint(kem.publicX963),
+    kem_pq_pubkey: b64uEncode(mlkem.ek),
+    kem_pq_pubkey_fingerprint: await fingerprintRaw(mlkem.ek),
+  });
+}
+
+/** A hybrid human recipient at the known-answer account, logged in epoch 1. */
+async function registerAlice(api: EpochDrive): Promise<RecipientKey> {
+  const kem = await generateKemKeypair();
+  const mlkem = await mlkemKeygen();
+  const bundle: RecipientKey = {
+    handle: 'alice',
+    account_type: 'human',
+    account_id: KAT_ACCOUNT,
+    kem_pubkey: b64uEncode(kem.publicX963),
+    kem_pubkey_fingerprint: await fingerprint(kem.publicX963),
+    kem_pq_pubkey: b64uEncode(mlkem.ek),
+    kem_pq_pubkey_fingerprint: await fingerprintRaw(mlkem.ek),
+  };
+  await api.registerHuman(bundle);
+  return bundle;
+}
+
+describe('the epoch-2 binding and one epoch per operation (design §10.4, §10.6)', () => {
+  let session: Session;
+  let api: EpochDrive;
+  let drive: Drive;
+
+  beforeEach(async () => {
+    session = await newSession();
+    api = new EpochDrive();
+    api.ownerAccountId = session.accountId;
+    drive = new Drive(api, session);
+  });
+
+  const reads = (name: string) => api.calls.filter((c) => c === name).length;
+
+  it('epoch 2 binds a human recipient by the index its VRF proof yields', async () => {
+    const bundle = await registerAlice(api);
+    api.served = 2;
+    const { recipient } = await drive.recipientKey('alice');
+    expect(recipient.pqPubkey).toEqual(b64uDecode(bundle.kem_pq_pubkey!));
+  });
+
+  it("epoch 2 refuses a receipt under another account's index", async () => {
+    await registerAlice(api);
+    api.served = 2;
+    api.receiptIndex = 'ab'.repeat(64);
+    await expect(drive.recipientKey('alice')).rejects.toThrow(/not under the account's index/);
+  });
+
+  it("a serve between the trust and the receipt read is one clean re-read (Bob's flip)", async () => {
+    await registerAlice(api);
+    api.flipBefore = 'receipt:kem:1';
+    await drive.recipientKey('alice');
+    expect(api.calls).toEqual([
+      'recipient',
+      'server-info',
+      'receipt:kem:1',
+      'recipient',
+      'server-info',
+      'receipt:kem:2',
+      'receipt:kem_pq:2',
+    ]);
+  });
+
+  it('a bundle read before the serve is read again after it', async () => {
+    await registerAlice(api);
+    api.flipBefore = 'server-info';
+    await drive.recipientKey('alice');
+    expect(api.calls).toEqual([
+      'recipient',
+      'server-info',
+      'recipient',
+      'server-info',
+      'receipt:kem:2',
+      'receipt:kem_pq:2',
+    ]);
+  });
+
+  it('a bundle naming another epoch on both reads is the integrity alarm, not "try again"', async () => {
+    await registerAlice(api);
+    api.served = 2;
+    api.staleBundle = true;
+    const err = await drive.recipientKey('alice').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(IntegrityError);
+    expect(reads('server-info')).toBe(2);
+  });
+
+  it('a refusal on both reads says "try again", never the alarm', async () => {
+    await registerAlice(api);
+    api.refuseAlways = true;
+    const err = await drive.recipientKey('alice').catch((e: unknown) => e);
+    expect(err).not.toBeInstanceOf(IntegrityError);
+    expect(friendlyDriveError(err)).toBe('The service was updating. Please try again.');
+    expect(reads('server-info')).toBe(2);
+  });
+
+  it("epoch 2 binds a PRSN's §9 receipts by the proof inside the signed attestation", async () => {
+    await registerPat(api);
+    api.served = 2;
+    await drive.recipientKey('pat-ai');
+    api.receiptIndex = 'ab'.repeat(64);
+    await expect(drive.recipientKey('pat-ai')).rejects.toThrow(/not under the account's index/);
+  });
+
+  it('a §9 response read across a serve is one clean re-read', async () => {
+    // The §9 endpoint takes no epoch; its receipts name theirs (design §10.4).
+    await registerPat(api);
+    api.flipBefore = 'verification';
+    await drive.recipientKey('pat-ai');
+    expect(api.calls).toEqual([
+      'recipient',
+      'server-info',
+      'verification',
+      'recipient',
+      'server-info',
+      'verification',
+    ]);
+  });
+
+  it('an upload into a share re-reads its recipient set across a serve, and writes only after', async () => {
+    api.shareRecipient = await registerAlice(api);
+    const folder = await drive.createShareFolder('Epochs');
+    api.calls.length = 0;
+    api.flipBefore = 'receipt:kem:1';
+    await drive.uploadFile(
+      { folderId: folder.folder_id, rootFolderId: folder.folder_id, shareFolder: true },
+      'a.txt',
+      new Blob([utf8Encode('alpha')]),
+    );
+    expect(reads('recipients')).toBe(2);
+    expect(api.calls.filter((c) => c.startsWith('write:'))).toEqual(['write:initiate']);
+    expect(api.calls.indexOf('write:initiate')).toBeGreaterThan(
+      api.calls.lastIndexOf('server-info'),
+    );
   });
 });

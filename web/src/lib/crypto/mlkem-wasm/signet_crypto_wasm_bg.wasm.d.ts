@@ -5,6 +5,7 @@ export const mlkem1024_decapsulate: (a: number, b: number, c: number, d: number)
 export const mlkem1024_ek_from_seed: (a: number, b: number) => [number, number, number, number];
 export const mlkem1024_encapsulate: (a: number, b: number) => [number, number, number, number];
 export const mlkem1024_keygen: () => [number, number, number, number];
+export const vrf_r255_verify: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
 export const __wbindgen_exn_store: (a: number) => void;
 export const __externref_table_alloc: () => number;
 export const __wbindgen_externrefs: WebAssembly.Table;

@@ -68,6 +68,7 @@ uuid = { version = "1", features = ["v4"] }
 # zeroized promptly after wrap/unwrap — both the classical Concat-KDF path and the
 # hybrid SP 800-227 KDM. Same major the CLI already uses for its keystore secrets.
 zeroize = "1"
+vrf-r255 = "=0.1.0"
 
 [dev-dependencies]
 # Differential-test oracle: OpenSSL (C; an independent codebase + lineage from

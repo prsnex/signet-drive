@@ -623,6 +623,10 @@ export interface RecipientKey {
    *  check binds the keys to (F-DOWNGRADE(b)): a PRSN's attestation names it
    *  as subject_account_id; a human's §10a log receipts name it. */
   account_id: string;
+  /** The epoch the server answered under, and from epoch 2 the account's VRF
+   *  proof (hex) binding `account_id` to its log index (design §10.6). */
+  epoch?: number | null;
+  account_vrf_proof?: string | null;
   /** The active attestation this bundle was resolved from (PRSN recipients
    *  only) — the writer's verified source (F-DOWNGRADE(b)). */
   attestation_id?: string | null;
@@ -641,6 +645,9 @@ export interface RecipientKey {
 
 export interface RecipientView {
   recipient_account_id: string;
+  /** As RecipientKey's `epoch` and VRF proof (design §10.6). */
+  epoch?: number | null;
+  recipient_account_vrf_proof?: string | null;
   handle: string | null;
   /** `human` | `prsn` — the writer's verified-source dispatch key (see
    *  RecipientKey.account_id / attestation_id). */
@@ -700,6 +707,9 @@ export interface ServerInfoResponse {
   version?: string;
   current_signing_keys?: ServerInfoKey[];
   retired_signing_keys?: ServerInfoKey[];
+  /** The transparency log (design §10.1): the served epoch and, from epoch 2,
+   *  its VRF public key (hex), which the browser binds receipts by. */
+  translog?: { epoch: number; vrf_suite?: string; vrf_public_key?: string } | null;
 }
 
 /** A §9 attestation-verification response (Envelope Format §9). Verified
@@ -827,7 +837,9 @@ export interface DriveApi {
   // against before wrapping (F-DOWNGRADE(b)) — all three are public reads.
   getServerInfo(): Promise<ServerInfoResponse>;
   getAttestationVerification(attestationId: string): Promise<AttestationVerificationResponse>;
-  getLogReceipt(fingerprint: string, purpose: string): Promise<LogReceipt>;
+  /** The key's receipt in `epoch` when given: a server serving another epoch
+   *  refuses it (410 `epoch_retired` / 404 `epoch_unknown`, design §10.4). */
+  getLogReceipt(fingerprint: string, purpose: string, epoch?: number): Promise<LogReceipt>;
   createShareFolder(body: CreateShareFolderBody): Promise<ShareFolderView>;
   listRecipients(folderId: string): Promise<RecipientsResponse>;
   createInvitation(folderId: string, body: CreateInvitationBody): Promise<CreateInvitationResponse>;
@@ -1503,10 +1515,10 @@ export function createApiClient(
         'GET',
         `/v1/attestations/${encodeURIComponent(attestationId)}/verification`,
       ),
-    getLogReceipt: (fingerprint, purpose) =>
+    getLogReceipt: (fingerprint, purpose, epoch) =>
       request<LogReceipt>(
         'GET',
-        `/v1/transparency/log/receipt?fingerprint=${encodeURIComponent(fingerprint)}&purpose=${encodeURIComponent(purpose)}`,
+        `/v1/transparency/log/receipt?fingerprint=${encodeURIComponent(fingerprint)}&purpose=${encodeURIComponent(purpose)}${epoch === undefined ? '' : `&epoch=${epoch}`}`,
       ),
     createShareFolder: (body) => request<ShareFolderView>('POST', '/v1/share-folders', body),
     listRecipients: (folderId) =>

@@ -10,6 +10,7 @@
 //! argument handling, config, I/O, the HTTP verification paths, and the `signet
 //! enroll` onboarding flow.
 
+pub mod anchors;
 pub mod broker;
 pub mod broker_client;
 pub mod broker_credential;

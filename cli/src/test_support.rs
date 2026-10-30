@@ -99,3 +99,65 @@ pub(crate) fn test_keystore() -> (tempfile::TempDir, SoftwareKeystore, KeyLabel,
 pub(crate) fn junk_wrap_body() -> String {
     serde_json::json!({ "wrapped_key": { "alg": "not-a-real-wrap-alg", "v": 1 } }).to_string()
 }
+
+// ---- the epoch-flip tests' loopback server (design §10.4) --------------------
+
+/// One loopback request's method and target, read to the end of its head (a
+/// GET has no body), so closing after the answer never resets a request still
+/// being written.
+fn read_head(sock: &mut std::net::TcpStream) -> Option<(String, String)> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = sock.read(&mut buf).ok()?;
+        if n == 0 {
+            return None;
+        }
+        head.extend_from_slice(&buf[..n]);
+    }
+    let text = String::from_utf8_lossy(&head);
+    let mut line = text.lines().next()?.split_whitespace();
+    Some((line.next()?.to_string(), line.next()?.to_string()))
+}
+
+/// A loopback server answering each request from `route` (method, target →
+/// status, JSON body) and logging every request as "METHOD target".
+pub(crate) fn serve_scripted(
+    route: impl Fn(&str, &str) -> (u16, String) + Send + 'static,
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = log.clone();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut sock) = conn else { break };
+            let Some((method, target)) = read_head(&mut sock) else {
+                continue;
+            };
+            seen.lock().unwrap().push(format!("{method} {target}"));
+            let (status, body) = route(&method, &target);
+            let _ = sock.write_all(
+                format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    (format!("http://127.0.0.1:{port}"), log)
+}
+
+/// The 410 a server serving epoch 2 answers for an epoch-1 read.
+pub(crate) fn epoch_retired() -> (u16, String) {
+    (
+        410,
+        serde_json::json!({ "error": { "code": "epoch_retired", "message": "epoch 1 is retired",
+            "details": { "epoch": 1, "final_log_size": 11, "final_merkle_root": "00" } } })
+        .to_string(),
+    )
+}

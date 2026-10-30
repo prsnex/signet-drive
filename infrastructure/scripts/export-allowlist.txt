@@ -151,3 +151,4 @@ infrastructure/scripts/verify-web-bundle.sh => verify/verify-web-bundle.sh
 ## nextest's no-retry posture and the audit advisory baseline are trust claims)
 + .config/nextest.toml
 + .cargo/audit.toml
++ .cargo/osv-scanner.toml

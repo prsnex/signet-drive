@@ -153,6 +153,90 @@ pub const EPOCH_ALGORITHM: &str = "signet-translog-v2";
 /// The epoch checkpoint's `public_key` payload bytes.
 pub const EPOCH_PAYLOAD: &[u8] = b"signet-pubkey-log-v2-epoch";
 
+/// The 1-byte entry-format version hashed FIRST in a v3 preimage: the epoch-2
+/// format (Transparency-Log Epoch-2 design v03 §2–§3), where an entry names its
+/// account by the VRF index ([`crate::vrf`]) instead of the account id, so a
+/// deletion leaves nothing in the log to forget.
+pub const ENTRY_VERSION_V3: u8 = 0x03;
+
+/// The per-entry `entry_hash` under the **v3** canonical bytes: v2's layout with
+/// the 16-byte account id replaced by the 64-byte VRF account index.
+///
+/// ```text
+/// uint8(entry_version = 0x03)               // 1   (INSIDE the hashed bytes)
+///   || uint64_be(entry_id)                  // 8   (1-based within the epoch)
+///   || account_index (64 bytes)             // 64  (VRF output β; all-zero when None)
+///   || uint8(key_purpose)                   // 1
+///   || uint32_be(algorithm utf8 len)        // 4
+///   || algorithm utf8 bytes                 // L
+///   || uint32_be(public_key len)            // 4
+///   || public_key bytes                     // K
+///   || uint64_be(created_at unix seconds)   // 8
+///   || prev_entry_hash (32 bytes)           // 32  (all-zero for the epoch's genesis)
+/// ```
+///
+/// `account_index = None` is an account-less entry (the epoch's genesis entry)
+/// and hashes as 64 zero bytes, as v2 hashed a NULL account as 16.
+pub fn entry_hash_v3(
+    entry_id: u64,
+    account_index: Option<&[u8; crate::vrf::INDEX_LEN]>,
+    key_purpose: KeyPurpose,
+    algorithm: &str,
+    public_key: &[u8],
+    created_at: u64,
+    prev_entry_hash: &[u8; 32],
+) -> [u8; 32] {
+    let alg = algorithm.as_bytes();
+    let mut buf = Vec::with_capacity(122 + alg.len() + public_key.len());
+    buf.push(ENTRY_VERSION_V3);
+    buf.extend_from_slice(&entry_id.to_be_bytes());
+    buf.extend_from_slice(account_index.unwrap_or(&[0u8; crate::vrf::INDEX_LEN]));
+    buf.push(key_purpose.as_byte());
+    buf.extend_from_slice(&(alg.len() as u32).to_be_bytes());
+    buf.extend_from_slice(alg);
+    buf.extend_from_slice(&(public_key.len() as u32).to_be_bytes());
+    buf.extend_from_slice(public_key);
+    buf.extend_from_slice(&created_at.to_be_bytes());
+    buf.extend_from_slice(prev_entry_hash);
+    hash::sha256(&buf)
+}
+
+/// The algorithm field of an epoch-2-or-later genesis entry.
+pub const EPOCH_ALGORITHM_V3: &str = "signet-translog-v3";
+/// The tag that opens a v3 genesis entry's payload.
+pub const EPOCH_PAYLOAD_V3_TAG: &[u8] = b"signet-pubkey-log-v3-epoch";
+
+/// The `public_key` payload of a v3 genesis entry, which binds the new epoch to
+/// the one it succeeds and to the epoch's VRF key, inside the chain (design v03
+/// §3.2 and §2a):
+///
+/// ```text
+/// EPOCH_PAYLOAD_V3_TAG || 0x00
+///   || uint16_be(epoch)                     // 2
+///   || uint64_be(previous epoch's final log_size)
+///   || previous epoch's final Merkle root   // 32
+///   || SHA-256(this epoch's VRF public key) // 32
+/// ```
+///
+/// A client accepts a new epoch only if the published roots file carries the
+/// previous epoch's end line with this `(size, root)`, and the VRF key file a
+/// line for this epoch whose key hashes to this value.
+pub fn epoch_payload_v3(
+    epoch: u16,
+    prev_epoch_size: u64,
+    prev_epoch_root: &[u8; 32],
+    vrf_public_key: &[u8; crate::vrf::PUBLIC_KEY_LEN],
+) -> Vec<u8> {
+    let mut p = Vec::with_capacity(EPOCH_PAYLOAD_V3_TAG.len() + 1 + 2 + 8 + 32 + 32);
+    p.extend_from_slice(EPOCH_PAYLOAD_V3_TAG);
+    p.push(0x00);
+    p.extend_from_slice(&epoch.to_be_bytes());
+    p.extend_from_slice(&prev_epoch_size.to_be_bytes());
+    p.extend_from_slice(prev_epoch_root);
+    p.extend_from_slice(&hash::sha256(vrf_public_key));
+    p
+}
+
 /// The domain-separation prefix for log-receipt signatures (Envelope §10a).
 const RECEIPT_PREFIX: &[u8] = b"signet-pubkey-log-receipt-v1\n";
 
