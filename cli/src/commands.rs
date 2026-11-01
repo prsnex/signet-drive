@@ -1555,17 +1555,51 @@ pub fn transparency_verify_self(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
+    transparency_verify_self_with(
+        &mut |attempt| crate::anchors::anchor_log(attempt, server_url, anchor_repo),
+        keystore,
+        key,
+        server_url,
+        config,
+        out,
+    )
+}
+
+/// [`transparency_verify_self`] with the anchoring passed in: the seam the
+/// epoch-move tests drive. Without it the anchor host is fixed
+/// (`anchors::fetch_raw`), so nothing could move the epoch under the command,
+/// and #654 declared the retry untested (Bob's B.26 class).
+fn transparency_verify_self_with(
+    anchor: &mut dyn for<'a> FnMut(
+        &'a crate::anchors::EpochAttempt,
+    ) -> Result<crate::anchors::Anchoring<'a>>,
+    keystore: &dyn Keystore,
+    key: Option<&str>,
+    server_url: &str,
+    config: &Config,
+    out: &OutputMode,
+) -> Result<()> {
     crate::anchors::once_more_on_epoch_change(|attempt| {
-        transparency_verify_self_once(attempt, keystore, key, anchor_repo, server_url, config, out)
+        transparency_verify_self_once(
+            attempt,
+            &mut *anchor,
+            keystore,
+            key,
+            server_url,
+            config,
+            out,
+        )
     })
 }
 
 /// One attempt of [`transparency_verify_self`].
 fn transparency_verify_self_once(
     attempt: &crate::anchors::EpochAttempt,
+    anchor: &mut dyn for<'a> FnMut(
+        &'a crate::anchors::EpochAttempt,
+    ) -> Result<crate::anchors::Anchoring<'a>>,
     keystore: &dyn Keystore,
     key: Option<&str>,
-    anchor_repo: Option<&str>,
     server_url: &str,
     config: &Config,
     out: &OutputMode,
@@ -1579,7 +1613,7 @@ fn transparency_verify_self_once(
         .and_then(Value::as_str)
         .ok_or_else(|| CliError::invalid_data("/v1/me carries no account_id"))?;
 
-    let anchoring = crate::anchors::anchor_log(attempt, server_url, anchor_repo)?;
+    let anchoring = anchor(attempt)?;
     let mode = match anchoring.verdict {
         EpochVerdict::Anchored(mode) => mode,
         EpochVerdict::Unanchored(why) => return Err(CliError::unanchored(why)),
@@ -7576,5 +7610,122 @@ mod epoch_seam_tests {
         assert_eq!(err.exit_code, 26, "{}", err.message);
         let log = log.lock().unwrap().clone();
         assert_eq!(log, ["anchor", "GET /v1/attestations/att-1/verification"]);
+    }
+
+    /// A software keystore holding a signing pair for `/v1/me`'s signed read.
+    fn self_watch_keystore(tag: &str) -> crate::keystore::SoftwareKeystore {
+        let dir =
+            std::env::temp_dir().join(format!("signet-self-watch-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ks = crate::keystore::SoftwareKeystore::open(dir).expect("open keystore");
+        let label = KeyLabel::parse("tester-ai-signing", Some(Purpose::Signing)).expect("label");
+        ks.generate(&label, "ES256").expect("signing key");
+        let pq = KeyLabel::parse("tester-ai-signing-pq", Some(Purpose::SigningPq)).expect("label");
+        ks.generate(&pq, "ML-DSA-87").expect("signing-pq key");
+        ks
+    }
+
+    /// An anchoring at `epoch` (V3), or with `verdict` in its place.
+    fn self_watch_anchoring<'a>(verdict: EpochVerdict) -> Anchoring<'a> {
+        Anchoring::for_test(
+            ServedEpoch {
+                epoch: 3,
+                vrf_public_key: Some([0; 32]),
+            },
+            None,
+            verdict,
+            true,
+        )
+    }
+
+    fn v3_at(epoch: u16) -> EpochVerdict {
+        EpochVerdict::Anchored(LogMode::V3 {
+            epoch,
+            vrf_public_key: [0; 32],
+            genesis_entry_hash: [0; 32],
+        })
+    }
+
+    #[test]
+    fn transparency_verify_self_reanchors_once_when_v1_me_names_another_epoch() {
+        // `/v1/me` is read first and names epoch 2; the first anchor says 3:
+        // the epoch moved under the command, so it reads `/v1/me` again and
+        // anchors once more, and the second anchor's verdict is the answer.
+        let ks = self_watch_keystore("once");
+        let (url, log) = crate::test_support::serve_scripted(|_, _| {
+            (
+                200,
+                json!({ "account_id": "00000000-0000-4000-8000-000000000001", "epoch": 2 })
+                    .to_string(),
+            )
+        });
+        let seen = log.clone();
+        let mut calls = 0;
+        let err = transparency_verify_self_with(
+            &mut |_| {
+                calls += 1;
+                seen.lock().unwrap().push(format!("anchor {calls}"));
+                Ok(self_watch_anchoring(if calls == 1 {
+                    v3_at(3)
+                } else {
+                    EpochVerdict::Unanchored("the second anchor's verdict".to_string())
+                }))
+            },
+            &ks,
+            Some("tester-ai-signing"),
+            &url,
+            &Config::default(),
+            &OutputMode { pretty: false },
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.exit_code,
+            CliError::unanchored("x").exit_code,
+            "{}",
+            err.message
+        );
+        assert!(
+            err.message.contains("the second anchor's verdict"),
+            "{}",
+            err.message
+        );
+        let log = log.lock().unwrap().clone();
+        assert_eq!(log, ["GET /v1/me", "anchor 1", "GET /v1/me", "anchor 2"]);
+    }
+
+    #[test]
+    fn transparency_verify_self_retries_only_once_and_a_second_move_is_a_violation() {
+        // The epoch named by `/v1/me` never matches the anchor: the retry is not
+        // retried. The second mismatch contradicts a fresh anchor, exit 60.
+        let ks = self_watch_keystore("twice");
+        let (url, log) = crate::test_support::serve_scripted(|_, _| {
+            (
+                200,
+                json!({ "account_id": "00000000-0000-4000-8000-000000000001", "epoch": 2 })
+                    .to_string(),
+            )
+        });
+        let seen = log.clone();
+        let err = transparency_verify_self_with(
+            &mut |_| {
+                seen.lock().unwrap().push("anchor".to_string());
+                Ok(self_watch_anchoring(v3_at(3)))
+            },
+            &ks,
+            Some("tester-ai-signing"),
+            &url,
+            &Config::default(),
+            &OutputMode { pretty: false },
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.exit_code,
+            CliError::transparency_violation("x").exit_code,
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("names epoch 2"), "{}", err.message);
+        let log = log.lock().unwrap().clone();
+        assert_eq!(log, ["GET /v1/me", "anchor", "GET /v1/me", "anchor"]);
     }
 }

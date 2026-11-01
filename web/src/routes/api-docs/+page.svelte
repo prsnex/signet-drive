@@ -290,7 +290,7 @@ signet transparency-verify --fingerprint "$KEM_FINGERPRINT" --purpose kem</code
       <code>SIGNET_BROKER_ADDR</code> set, operations go to the local Secure-Enclave broker over mutual-TLS
       (native and Docker); the keystore otherwise auto-detects (the device Secure Enclave natively).
     </p>
-    <table>
+    <table class="commands">
       <thead><tr><th>Command</th><th>Purpose</th></tr></thead>
       <tbody>
         <tr
@@ -306,18 +306,23 @@ signet transparency-verify --fingerprint "$KEM_FINGERPRINT" --purpose kem</code
           ></tr
         >
         <tr
-          ><td><code>folder list|create [PATH]</code></td><td
+          ><td><code>folder list|<wbr />create [PATH]</code></td><td
             >List or create folders by path (ids as the precision fallback).</td
           ></tr
         >
         <tr
-          ><td><code>file list|upload|download</code></td><td
+          ><td><code>file list|<wbr />upload|<wbr />download</code></td><td
             >The data plane: chunked client-side encryption, direct to object storage (up to 100
             GB).</td
           ></tr
         >
         <tr
-          ><td><code>share create|list|recipients|invite|preview|accept|remove|leave</code></td><td
+          ><td
+            ><code
+              >share create|<wbr />list|<wbr />recipients|<wbr />invite|<wbr />preview|<wbr
+              />accept|<wbr />remove|<wbr />leave</code
+            ></td
+          ><td
             >Share-folder management; <code>invite</code> re-wraps file keys to the recipient (capability-gated).</td
           ></tr
         >
@@ -335,37 +340,39 @@ signet transparency-verify --fingerprint "$KEM_FINGERPRINT" --purpose kem</code
           ></tr
         >
         <tr
-          ><td><code>device pickup|keygen|sign|renew|renew-cert</code></td><td
+          ><td
+            ><code>device pickup|<wbr />keygen|<wbr />sign|<wbr />renew|<wbr />renew-cert</code></td
+          ><td
             >This device's key operations via the broker, for scripts and explicit provisioning:
             <code>pickup</code> is what <code>connect</code> runs; the rest operate via the broker.</td
           ></tr
         >
         <tr
-          ><td><code>host-channel provision|list|remove</code></td><td
+          ><td><code>host-channel provision|<wbr />list|<wbr />remove</code></td><td
             >Host-side delegation channels: the present-but-inactive fallback path (Apple
             <code>container</code> runtimes); Docker + native use the local broker.</td
           ></tr
         >
         <tr
-          ><td><code>keygen --signing|--kem --label L</code></td><td
+          ><td><code>keygen --signing|<wbr />--kem --label L</code></td><td
             >Generate a keypair in the keystore (low-level; <code>enroll</code> does this for you).</td
           ></tr
         >
         <tr
-          ><td><code>pubkey --signing|--kem --key L [--base64url]</code></td><td
+          ><td><code>pubkey --signing|<wbr />--kem --key L [--base64url]</code></td><td
             >Print the public key (x963/der/pem/jwk).</td
           ></tr
         >
         <tr
-          ><td><code>fingerprint --signing|--kem --key L</code></td><td
+          ><td><code>fingerprint --signing|<wbr />--kem --key L</code></td><td
             >SHA-256 of the DER SPKI (lowercase hex).</td
           ></tr
         >
         <tr
           ><td><code>keys list</code> · <code>keys delete --label HANDLE</code></td><td
             >List or delete keys by handle; <code>--purpose</code> selects one of
-            <code>signing|kem|signing-pq|kem-pq</code>, else every key the handle holds (all four
-            for a hybrid identity).</td
+            <code>signing|<wbr />kem|<wbr />signing-pq|<wbr />kem-pq</code>, else every key the
+            handle holds (all four for a hybrid identity).</td
           ></tr
         >
         <tr
@@ -395,13 +402,14 @@ signet transparency-verify --fingerprint "$KEM_FINGERPRINT" --purpose kem</code
           ></tr
         >
         <tr
-          ><td><code>attestation-verify --attestation-id|--in --server-pubkey</code></td><td
+          ><td><code>attestation-verify --attestation-id|<wbr />--in --server-pubkey</code></td><td
             >Verify a server-signed attestation response.</td
           ></tr
         >
         <tr
           ><td
-            ><code>transparency-verify --fingerprint --purpose | --inclusion-proof | --self</code
+            ><code
+              >transparency-verify --fingerprint --purpose |<wbr /> --inclusion-proof |<wbr /> --self</code
             ></td
           ><td
             >Verify a transparency-log inclusion proof, or watch your own keys (<code>--self</code
@@ -708,6 +716,19 @@ signet transparency-verify --self</code
   th {
     color: var(--muted);
     font-weight: 600;
+  }
+  /* bug257: a command cell such as `share create|list|recipients|…` has no break
+     point, so at phone width it set the table, and the page, wider than the screen.
+     Code in a cell may break anywhere; the table then fits its column. */
+  td code {
+    overflow-wrap: anywhere;
+  }
+  /* At phone width the auto layout squeezed the command column to a few
+     characters and broke names mid-word; at 45% it breaks at the `|` and `-`. */
+  @media (max-width: 600px) {
+    .commands td:first-child {
+      width: 45%;
+    }
   }
   .note {
     background: var(--surface);

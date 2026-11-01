@@ -632,6 +632,8 @@
   "err_ceremony_handle_in_flight": "That name is held by another enrollment you have in progress. Finish or cancel that one, or wait for it to expire, then reuse the name.",
   "err_ceremony_not_under_guardianship": "That PRSN is no longer under your guardianship. Refreshing your list.",
   "err_ceremony_version_conflict": "This account is already being changed elsewhere. Please refresh and try again.",
+  "err_ceremony_passkey_prompt_ended": "The passkey prompt was cancelled or timed out, so nothing changed. Please try again.",
+  "err_ceremony_passkey_already_registered": "That passkey is already on your account. Please try again and choose a different passkey manager or device.",
   "err_admin_item_gone": "That item no longer exists. Refreshing.",
   "err_admin_grant_changed": "That grant was already changed (it may already be revoked). Refreshing.",
   "err_admin_check_value": "Please check the value and try again.",

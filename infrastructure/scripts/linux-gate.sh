@@ -32,6 +32,8 @@
 #     infrastructure/scripts/linux-gate.sh --clippy        # ROOTS §5.1/§5.6: clippy -D warnings,
 #                                                          # BOTH feature configs, in-container
 #     infrastructure/scripts/linux-gate.sh --nextest -E 'binary(lapse)'  # + nextest filters
+#     infrastructure/scripts/linux-gate.sh --nextest --keep-db  # keep the test database (every
+#                                                          # test run otherwise starts fresh)
 #
 # --nextest reproduces CI's exact scheduler (process-per-test, cross-binary
 # parallelism, the ci profile's test-groups) inside the container. This is the
@@ -122,6 +124,13 @@ extract_test_targets() {
   done
 }
 
+# fresh_db_planned <clippy_mode 0|1> <keep_db 0|1> — does this run start from a
+# fresh database? Every test run does (CI starts fresh), unless --keep-db asks to
+# debug a state; a lint run touches no database. Factored out for the self-test.
+fresh_db_planned() {
+  [ "$1" = "0" ] && [ "$2" = "0" ]
+}
+
 self_test() {
   local fails=0 n
   n="$(printf 'running 5 tests\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 147 filtered out\n' | count_executed)"
@@ -152,6 +161,10 @@ RS
   [ "$n" = "folders shares " ] && echo "PASS  extract_test_targets: two --test names, --test-threads ignored" || { echo "FAIL  extract_test_targets='$n' (want 'folders shares ')"; fails=$((fails+1)); }
   n="$(extract_test_targets cargo test --test=quota | tr '\n' ' ')"
   [ "$n" = "quota " ] && echo "PASS  extract_test_targets: --test=NAME form" || { echo "FAIL  --test= form='$n' (want 'quota ')"; fails=$((fails+1)); }
+  # Gus's proposal (2026-10-31): the gate starts each test run from a fresh database.
+  fresh_db_planned 0 0 && echo "PASS  fresh_db_planned: a test run starts fresh" || { echo "FAIL  a test run would keep a stale database"; fails=$((fails+1)); }
+  fresh_db_planned 0 1 && { echo "FAIL  --keep-db would still reset the database"; fails=$((fails+1)); } || echo "PASS  fresh_db_planned: --keep-db keeps it"
+  fresh_db_planned 1 0 && { echo "FAIL  --clippy would touch the database"; fails=$((fails+1)); } || echo "PASS  fresh_db_planned: --clippy touches no database"
   n="$(extract_test_targets cargo test --workspace -p signet-server | tr '\n' ' ')"
   [ "$n" = "" ] && echo "PASS  extract_test_targets: no --test → empty (assertion skipped)" || { echo "FAIL  no-target case='$n' (want empty)"; fails=$((fails+1)); }
 
@@ -250,9 +263,10 @@ GATE_S3_PORT="$(_gate_port SIGNET_GATE_S3_PORT 9000)" || exit 2
 # with no tests) — same design as the CI gate's 6/7-vs-8 override: default-refuse, with
 # an explicit opt-out. --allow-count-mismatch (bug135) is the same design for the
 # targeted-run count assertion. Extracted from anywhere in the args.
-ALLOW_EMPTY=0; ALLOW_COUNT_MISMATCH=0; _kept=()
+ALLOW_EMPTY=0; ALLOW_COUNT_MISMATCH=0; KEEP_DB=0; _kept=()
 for _a in "$@"; do case "$_a" in
   --allow-empty) ALLOW_EMPTY=1 ;;
+  --keep-db) KEEP_DB=1 ;;
   --allow-count-mismatch) ALLOW_COUNT_MISMATCH=1 ;;
   *) _kept+=("$_a") ;;
 esac; done
@@ -346,6 +360,32 @@ fi
 # bug135 PREVENT: the freshness preamble runs IN the container, before cargo,
 # on the artifact clock (see container-freshness.sh). HOST_NOW is captured
 # host-side immediately before the run so the skew measurement is honest.
+# ⭐ A FRESH DATABASE PER TEST RUN (Gus's proposal, 2026-10-31; --keep-db opts out).
+# CI starts from an empty Postgres; a long-lived local one drifts from it. Twice on
+# 10-31 a gate database was stale: one held 2870 epoch-1 rows the v1.1.0 code refuses
+# to boot on, one held a 0004 checksum from a file nine minutes older than the one
+# that shipped (VersionMismatch). And an isolated database leaks whenever a test fails
+# before its drop, so a long-lived gate collects them exactly when something is wrong.
+# So: drop every signet_iso_* database (all are older than this run) and recreate
+# signet_drive_test, with the gate Postgres's own image, before the build. A run
+# therefore also exercises first boot, the path v1.1.0 adds.
+# Pinned by digest, as the gate's own image is: postgres:17 as the gate Postgres runs it.
+GATE_PG_CLIENT_IMAGE="postgres:17@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe"
+if fresh_db_planned "$CLIPPY_MODE" "$KEEP_DB"; then
+  echo "linux-gate: fresh database — dropping signet_iso_* and recreating signet_drive_test (--keep-db to keep it)"
+  docker run --rm -i -e PGPASSWORD=signet_dev_password "$GATE_PG_CLIENT_IMAGE" \
+    psql -h host.docker.internal -p "$GATE_PG_PORT" -U signet -d template1 -v ON_ERROR_STOP=1 -q -tA <<'SQL' \
+    || { echo "linux-gate: could not reset the test database — refusing to run on a stale one (--keep-db to override)" >&2; exit 2; }
+SELECT format('DROP DATABASE IF EXISTS %I WITH (FORCE)', datname)
+  FROM pg_database WHERE datname LIKE 'signet\_iso\_%' \gexec
+DROP DATABASE IF EXISTS signet_drive_test WITH (FORCE);
+CREATE DATABASE signet_drive_test;
+SELECT 'linux-gate: fresh: signet_drive_test recreated; '
+       || (SELECT count(*) FROM pg_database WHERE datname LIKE 'signet\_iso\_%')
+       || ' isolated databases left';
+SQL
+fi
+
 _gate_out="$(mktemp)"
 echo "linux-gate: test services at host.docker.internal — Postgres :${GATE_PG_PORT} · MinIO :${GATE_S3_PORT}"
 HOST_NOW="$(date +%s)"

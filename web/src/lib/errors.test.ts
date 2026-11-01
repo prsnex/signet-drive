@@ -9,6 +9,7 @@ import {
   friendlyDriveError,
 } from './errors';
 import { StallError, TransferExhaustedError } from './transfer';
+import { m } from './paraglide/messages.js';
 
 describe('friendlyAuthError', () => {
   it('maps known API error codes to friendly copy without leaking detail', () => {
@@ -65,6 +66,31 @@ describe('friendlyCeremonyError', () => {
 
   it('has a safe fallback for non-Error throws', () => {
     expect(friendlyCeremonyError('weird')).toContain('went wrong');
+  });
+
+  // bug258: a WebAuthn ceremony that the browser ends with a DOMException showed the
+  // browser's own string in the rotate dialog. Each maps to calm copy that says to
+  // try again, and none surfaces the exception's message.
+  it.each([
+    [
+      'NotAllowedError',
+      'The operation either timed out or was not allowed. See: https://www.w3.org/TR/webauthn-2/#sctn-privacy-considerations-client.',
+    ],
+    ['AbortError', 'The operation was aborted.'],
+  ])('maps a %s from the passkey prompt to calm try-again copy (bug258)', (name, raw) => {
+    const copy = friendlyCeremonyError(new DOMException(raw, name));
+    expect(copy).not.toBe(raw);
+    expect(copy).toBe(m.err_ceremony_passkey_prompt_ended());
+    expect(copy).toContain('try again');
+  });
+
+  it('maps an InvalidStateError (the passkey is already registered) to its own try-again copy (bug258)', () => {
+    const raw =
+      'The user attempted to register an authenticator that contains one of the credentials already registered with the relying party.';
+    const copy = friendlyCeremonyError(new DOMException(raw, 'InvalidStateError'));
+    expect(copy).not.toBe(raw);
+    expect(copy).toBe(m.err_ceremony_passkey_already_registered());
+    expect(copy).toContain('try again');
   });
 });
 

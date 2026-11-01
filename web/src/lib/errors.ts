@@ -108,6 +108,20 @@ export function friendlyCeremonyError(error: unknown): string {
   if (error instanceof PrfNotSupportedError) {
     return m.err_auth_prf_not_supported();
   }
+  // bug258: the browser ends a WebAuthn ceremony with a DOMException (the prompt
+  // cancelled or timed out, or the passkey manager declined), and the fall-through
+  // below put the browser's own string, W3C link and all, in the rotate dialog.
+  if (error instanceof DOMException) {
+    switch (error.name) {
+      case 'NotAllowedError':
+      case 'AbortError':
+        return m.err_ceremony_passkey_prompt_ended();
+      case 'InvalidStateError':
+        // create() with excludeCredentials: this authenticator already holds one of
+        // the account's passkeys.
+        return m.err_ceremony_passkey_already_registered();
+    }
+  }
   if (error instanceof Error && error.message) {
     return error.message;
   }
