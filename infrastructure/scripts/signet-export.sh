@@ -233,6 +233,10 @@ st_host_waived() { # a waived hit must still be REPORTED and TALLIED, never drop
 st_docsallow() { printf 'Re-included fixture doc.\n' > "$1/docs/design/Extraneous.md"; echo '+ docs/design/Extraneous.md' >> "$2"; }
 st_lockfile()  { sed -i.bak '/^Cargo\.lock$/d' "$2"; rm -f "$2.bak"; }
 st_spdx()      { printf 'pub fn g() {}\n' > "$1/src/bad.rs"; echo 'src/bad.rs' >> "$2"; }
+# The generated wasm-pack pkgs carry headerless .d.ts files; license.spdx skips the two
+# pkg directories by name (§1-67, Gus) and nothing else, which the second case controls.
+st_spdx_pkg()  { mkdir -p "$1/web/src/lib/crypto/vrf-wasm"; printf 'export function f(): void;\n' > "$1/web/src/lib/crypto/vrf-wasm/x.d.ts"; echo 'web' >> "$2"; }
+st_spdx_other(){ mkdir -p "$1/web/src/lib/crypto/other-wasm"; printf 'export function f(): void;\n' > "$1/web/src/lib/crypto/other-wasm/x.d.ts"; echo 'web' >> "$2"; }
 st_vendored()  { mkdir -p "$1/web/node_modules/p"; printf 'x\n' > "$1/web/node_modules/p/i.js"; echo 'web' >> "$2"; }
 st_style()     { printf '# Bad\n\nThis line has an em dash \xe2\x80\x94 which the register bans.\n' \
                    > "$1/docs/design/Bad - v01 - 260101.md"
@@ -272,6 +276,16 @@ run_self_test() {
   # arrived from the tag) AND frozen (nothing pins resolution) — both honest.
   st_case "lockfile.identity"     GATE-FAIL "lockfile.identity lockfile.frozen" st_lockfile
   st_case "license.spdx"          GATE-FAIL "license.spdx"      st_spdx
+  st_case "license.spdx/pkg-exempt" GATE-PASS ""                st_spdx_pkg
+  if st_case "license.spdx/scoped" GATE-FAIL "license.spdx"     st_spdx_other; then
+    if grep -q "license.spdx: web/src/lib/crypto/other-wasm/x.d.ts" "$ST_LOG"; then
+      echo "  ok    the exemption is the two pkg directories by name: other-wasm/ is named" >&2
+    else
+      echo "SELF-TEST FAIL  license.spdx failed without naming web/src/lib/crypto/other-wasm/x.d.ts" >&2
+      st_fail=$((st_fail+1)); st_pass=$((st_pass-1))
+    fi
+    rm -rf "$ST_DIR"
+  fi
   st_case "bloat.vendored"        GATE-FAIL "bloat.vendored"    st_vendored
   st_case "style.lint"            GATE-FAIL "style.lint"        st_style
   st_case "refs.closure"          GATE-FAIL "refs.closure"      st_refs
@@ -634,7 +648,7 @@ n=0
 while IFS= read -r f; do
   head -5 "$OUT/$f" | grep -q "SPDX-License-Identifier" || { n=$((n+1)); note "license.spdx: $f"; }
 done < <(cd "$OUT" && find . -type f \( -name "*.rs" -o -name "*.ts" -o -name "*.svelte" \) 2>/dev/null \
-         | sed 's|^\./||' | grep -v "test-vectors/" | grep -v "mlkem-wasm/")
+         | sed 's|^\./||' | grep -v "test-vectors/" | grep -v -E "(mlkem|vrf)-wasm/")
 record license.spdx "$([ $n -eq 0 ] && echo pass || echo fail)" $n
 
 # 7. bloat.vendored; vendored dependency trees in the export

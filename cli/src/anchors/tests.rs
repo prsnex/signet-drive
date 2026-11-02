@@ -64,19 +64,76 @@ fn origins_normalize_and_map_to_their_anchor_repositories() {
         normalize_origin("https://drive.mysignet.ca/v1/x"),
         "https://drive.mysignet.ca"
     );
+    let repo = |url: &str, over: Option<&str>| anchor_repo_for(url, over).unwrap();
     assert_eq!(
-        anchor_repo_for("https://drive.mysignet.ca", None).as_deref(),
+        repo("https://drive.mysignet.ca", None).as_deref(),
         Some("prsnex/signet-drive-transparency-log")
     );
     assert_eq!(
-        anchor_repo_for("https://staging.drive.mysignet.ca/", None).as_deref(),
+        repo("https://staging.drive.mysignet.ca/", None).as_deref(),
         Some("prsnex/signet-drive-transparency-log-staging")
     );
-    assert_eq!(anchor_repo_for("http://localhost:8080", None), None);
+    assert_eq!(repo("http://localhost:8080", None), None);
     assert_eq!(
-        anchor_repo_for("http://localhost:8080", Some("me/my-log")).as_deref(),
+        repo("http://localhost:8080", Some("me/my-log")).as_deref(),
         Some("me/my-log")
     );
+}
+
+#[test]
+fn only_an_override_names_a_branch_and_the_derived_repositories_read_main() {
+    // bug266 (Gus's terms): `owner/name@branch` in the override only. A
+    // repository the CLI derives from the server never carries a branch, so a
+    // known server is always read at `main`.
+    for (origin, known) in KNOWN_ANCHORS {
+        assert!(!known.contains('@'), "{known}");
+        let derived = anchor_repo_for(origin, None).unwrap().unwrap();
+        assert_eq!(
+            repo_and_branch(&derived),
+            Some((*known, "main")),
+            "{origin}"
+        );
+    }
+    assert_eq!(
+        anchor_repo_for(
+            "http://localhost:8080",
+            Some(" prsnex/smoke-log@smoke/run-41 ")
+        )
+        .unwrap()
+        .as_deref(),
+        Some("prsnex/smoke-log@smoke/run-41")
+    );
+    assert_eq!(
+        repo_and_branch("prsnex/smoke-log@smoke/run-41"),
+        Some(("prsnex/smoke-log", "smoke/run-41"))
+    );
+    assert_eq!(repo_and_branch("me/my-log"), Some(("me/my-log", "main")));
+    // Anything but a repository and a ref name is refused before it reaches the
+    // fetch URL, with the invalid-arguments error.
+    for bad in [
+        "noslash",
+        "a/b/c",
+        "/name",
+        "owner/",
+        "owner/..",
+        "owner/.hidden",
+        "owner/name@",
+        "owner/name@-x",
+        "owner/name@.x",
+        "owner/name@/x",
+        "owner/name@x/",
+        "owner/name@a..b",
+        "owner/name@a//b",
+        "owner/name@a?b",
+        "owner/name@a#b",
+        "owner/name@a b",
+        "owner/name@a@b",
+        "own_er/name",
+    ] {
+        assert_eq!(repo_and_branch(bad), None, "{bad}");
+        let err = anchor_repo_for("http://localhost:8080", Some(bad)).unwrap_err();
+        assert_eq!(err.code, "invalid_arguments", "{bad}");
+    }
 }
 
 // ---- parsing ----------------------------------------------------------------

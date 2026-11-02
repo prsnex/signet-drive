@@ -38,11 +38,24 @@ export const MLKEM_SEED_LEN = 64;
 
 let ready: Promise<void> | undefined;
 
-/** Initialize the wasm module (idempotent — first caller wins). Browser code
- *  never needs to call this (ops init lazily from the bundled asset URL);
- *  tests call it with the .wasm bytes read from disk before the first op. */
+/** Initialize the wasm module (idempotent once it has loaded). A failed load
+ *  is not kept: the next call fetches again, so one dropped connection does not
+ *  fail every later operation until a reload (the twin of initVrf's rule, §1-67).
+ *  Browser code never needs to call this (ops init lazily from the bundled asset
+ *  URL); tests call it with the .wasm bytes read from disk before the first op. */
 export function initMlkem(wasm?: BufferSource): Promise<void> {
-  ready ??= init(wasm === undefined ? undefined : { module_or_path: wasm }).then(() => undefined);
+  if (!ready) {
+    const loading: Promise<void> = init(
+      wasm === undefined ? undefined : { module_or_path: wasm },
+    ).then(
+      () => undefined,
+      (e: unknown) => {
+        if (ready === loading) ready = undefined;
+        throw e;
+      },
+    );
+    ready = loading;
+  }
   return ready;
 }
 

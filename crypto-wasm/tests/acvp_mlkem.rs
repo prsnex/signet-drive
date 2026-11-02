@@ -20,6 +20,8 @@
 //! (README): if a crate upgrade makes an excluded class expressible, the pin
 //! fails loudly and the ledger must be re-decided rather than silently rot.
 
+#![cfg(feature = "mlkem")]
+
 use kem::Decapsulate;
 use ml_kem::{B32, EncapsulateDeterministic, EncodedSizeUser, KemCore, MlKem1024};
 use serde_json::Value;

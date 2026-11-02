@@ -58,7 +58,8 @@ const config = {
         'default-src': ['self'],
         // 'wasm-unsafe-eval' (PQR item 6): permits WebAssembly COMPILATION
         // only — a named, narrow relaxation for the ML-KEM module
-        // (src/lib/crypto/mlkem-wasm/), far narrower than 'unsafe-eval' (JS
+        // (src/lib/crypto/mlkem-wasm/) and the VRF verifier a share loads
+        // (src/lib/crypto/vrf-wasm/, §1-67), far narrower than 'unsafe-eval' (JS
         // eval stays blocked). The asset itself is same-origin (connect-src
         // 'self' covers its fetch) and its hash is committed into the bundle
         // manifest (§9.3/SRI).

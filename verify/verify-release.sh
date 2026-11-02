@@ -210,12 +210,15 @@ verify_wasm() {
   say "building wasm pkg via the committed container recipe"
   ( cd "$SRC" && ./crypto-wasm/build-web-pkg.sh ) >>"$WORK/build-wasm.log" 2>&1 \
     || tool_err "wasm build failed (log: $WORK/build-wasm.log)"
-  if git -C "$SRC" diff --quiet -- web/src/lib/crypto/mlkem-wasm; then
+  # Both committed pkgs (§1-67: ML-KEM and, from v1.1.1, the VRF verifier); a tag
+  # before the split has no vrf-wasm/, which git diff reads as unchanged.
+  if git -C "$SRC" diff --quiet -- web/src/lib/crypto/mlkem-wasm web/src/lib/crypto/vrf-wasm \
+     && [ -z "$(git -C "$SRC" status --porcelain -- web/src/lib/crypto/vrf-wasm)" ]; then
     say "wasm_pkg: REPRODUCED-FULL (rebuild matches the committed pkg byte-for-byte)"
     return 0
   fi
   FULL=false
-  git -C "$SRC" diff --stat -- web/src/lib/crypto/mlkem-wasm | tail -3 >&2
+  git -C "$SRC" diff --stat -- web/src/lib/crypto/mlkem-wasm web/src/lib/crypto/vrf-wasm | tail -3 >&2
   say "wasm_pkg: NOT-REPRODUCED (rebuild differs from the committed pkg)"
   return 1
 }

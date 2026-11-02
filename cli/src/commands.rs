@@ -4614,9 +4614,7 @@ pub fn download(
     // upload's `plaintext_bytes`. The old output surfaced the transport's
     // ciphertext `size_bytes` under a name a scripting PRSN reads as the file's
     // length — a false mismatch waiting to happen.
-    let plaintext_written: u64;
-
-    match (multipart_chunks, chunk_size) {
+    let plaintext_written: u64 = match (multipart_chunks, chunk_size) {
         // §4.2 multipart: Range-GET each on-disk chunk, open it, stream to disk.
         (Some(chunks), Some(csize)) => {
             let chunk_count = chunks.max(0) as u32;
@@ -4880,7 +4878,7 @@ pub fn download(
                     indexed.len()
                 )));
             }
-            plaintext_written = written.load(Ordering::Acquire);
+            written.load(Ordering::Acquire)
         }
         // No §4.2 chunk metadata: not a multipart file. The legacy single-PUT (§4.1)
         // transport was retired (S042), so this should not occur for a live file.
@@ -4889,7 +4887,7 @@ pub fn download(
                 "download-url returned no multipart chunk metadata (the single-PUT transport is retired)",
             ));
         }
-    }
+    };
     // bug180: close the handle BEFORE the rename (Windows refuses to rename an
     // open file; POSIX allows it, and relying on that would make this correct
     // on one platform by accident). Positioned writes go straight to the file —

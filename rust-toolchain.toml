@@ -8,6 +8,6 @@
 # deliberately (a new committed wasm pkg + release manifests follow the bump);
 # MSRV stays 1.88 (Cargo.toml rust-version).
 [toolchain]
-channel = "1.96.0"
+channel = "1.99.1"
 components = ["clippy", "rustfmt"]
 targets = ["wasm32-unknown-unknown"]

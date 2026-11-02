@@ -15,7 +15,12 @@
 // translate.
 
 import { SignetApiError } from './api';
-import { EpochChangedError, PrfNotSupportedError } from './crypto/errors';
+import {
+  EpochChangedError,
+  ModuleLoadError,
+  PasskeyPromptEndedError,
+  PrfNotSupportedError,
+} from './crypto/errors';
 import { StallError, TransferExhaustedError } from './transfer';
 // Relative on purpose: the unit-test runner resolves no $lib aliases (vite.config's
 // stated design), and the compiled catalog is a sibling directory either way.
@@ -107,6 +112,13 @@ export function friendlyCeremonyError(error: unknown): string {
   // this arm the fall-through below put its developer string in the dialog.
   if (error instanceof PrfNotSupportedError) {
     return m.err_auth_prf_not_supported();
+  }
+  // bug262: a rotation gesture whose prompt returned no credential (the gateway
+  // resolved null rather than rejecting) is the same ended prompt as bug258's
+  // NotAllowedError, so the same calm copy; before it, the plain-Error fall-through
+  // below put "the rotation was cancelled" in the dialog.
+  if (error instanceof PasskeyPromptEndedError) {
+    return m.err_ceremony_passkey_prompt_ended();
   }
   // bug258: the browser ends a WebAuthn ceremony with a DOMException (the prompt
   // cancelled or timed out, or the passkey manager declined), and the fall-through
@@ -252,6 +264,12 @@ export function friendlyDriveError(error: unknown): string {
   // during the operation and again on its one re-read. Nothing was wrapped or
   // sent; a web user has no exit code, so the copy says what to do.
   if (error instanceof EpochChangedError) {
+    return m.err_drive_service_updating();
+  }
+  // §1-67 (Bob): the VRF verifier, loaded at the first share, could not be fetched
+  // (a dropped connection, a deploy since the page loaded). Nothing was wrapped or
+  // sent, and the next attempt fetches it again: the same calm copy, never the alarm.
+  if (error instanceof ModuleLoadError) {
     return m.err_drive_service_updating();
   }
   if (error instanceof Error && error.message) {

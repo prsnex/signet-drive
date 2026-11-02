@@ -69,11 +69,12 @@ LINUX_VOLUME="signet-linux-target"
 LINUX_BIN_NAME="signet-linux-arm64"
 # The Linux-helper builder image, PINNED BY DIGEST (R5 / the Bug026 copy-exact
 # lesson): a floating `rust:alpine` re-resolves per machine/day and silently
-# changes the toolchain under the byte-identical-rebuild claim. This digest is
-# the image that produced the S002 byte-for-byte Linux match (Gus, 260704).
+# changes the toolchain under the byte-identical-rebuild claim. rust:1.99.1-alpine
+# (rustc 1.99.1, Alpine 3.24.3), moved with rust-toolchain.toml at v1.1.1; before it,
+# rust 1.96.0 on Alpine 3.23.4, the S002 byte-for-byte Linux match's lineage (Gus, 260704).
 # Bump deliberately: update the digest + note the rustc/alpine versions in the
 # commit message; the manifest records it per-release either way.
-LINUX_BUILDER_IMAGE="rust@sha256:66f48b19d6e88519e2e58bebe0d945779a6a4ca41c2db17db78c9569655b50ac"
+LINUX_BUILDER_IMAGE="rust@sha256:7e9e2d068a107a2adafd19930011178d14a78326053cd4c3a9f7ad3fd049557d"
 
 log()  { echo "→ $*"; }
 die()  { echo "ERROR: $*" >&2; exit 1; }

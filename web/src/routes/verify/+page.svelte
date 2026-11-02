@@ -20,6 +20,7 @@
   import { persistSession } from '$lib/persist';
   import { sessionStore } from '$lib/session.svelte';
   import { friendlyAuthError } from '$lib/errors';
+  import { PrfNotSupportedError } from '$lib/crypto/errors';
   import { m } from '$lib/paraglide/messages.js';
 
   // bug062: the passkey ceremony no longer fires cold on page load. The emailed
@@ -44,6 +45,7 @@
     | 'registered'
     | 'unlocking'
     | 'cancelled'
+    | 'prf_unsupported'
     | 'unlock_cancelled'
     | 'finish_by_signin'
     | 'signing_in'
@@ -138,6 +140,12 @@
       // single-use verification token.
       if (isCancellation(err)) {
         status = 'cancelled';
+      } else if (err instanceof PrfNotSupportedError) {
+        // bug252 (c), Chris 2026-11-02: a passkey saved where PRF is unavailable
+        // (1Password) is refused before complete-registration, so nothing is stored
+        // and the token is untouched; offer the passkey step again, never "Back to
+        // sign up" and a fresh email.
+        status = 'prf_unsupported';
       } else {
         status = 'error';
         error = friendlyAuthError(err);
@@ -238,6 +246,13 @@
     </div>
     <Button onclick={register}>{m.verify_try_again()}</Button>
     <p class="alt"><a href="/signup">{m.verify_back_to_signup()}</a></p>
+  </AuthCard>
+{:else if status === 'prf_unsupported'}
+  <AuthCard title={m.verify_prf_unsupported_title()} subtitle={m.verify_prf_unsupported_body()}>
+    <div class="prep">
+      <p class="note">{m.verify_prf_unsupported_recovery()}</p>
+    </div>
+    <Button onclick={register}>{m.verify_try_again()}</Button>
   </AuthCard>
 {:else if status === 'unlock_cancelled'}
   <AuthCard title={m.verify_unlock_cancelled_title()} subtitle={m.verify_unlock_cancelled_body()}>

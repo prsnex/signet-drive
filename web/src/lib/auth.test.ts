@@ -13,6 +13,7 @@ import {
   unlockSignupKeys,
 } from './auth';
 import { b64uDecode, b64uEncode, hexDecode, hexEncode } from './crypto/bytes';
+import { PrfNotSupportedError } from './crypto/errors';
 import { friendlyAuthError } from './errors';
 import { m } from './paraglide/messages.js';
 import { deriveZ, generateEphemeralKeypair, importEcdhPublicX963 } from './crypto/ecdh';
@@ -333,5 +334,38 @@ describe('bug252: a passkey without PRF at sign-up', () => {
     const shown = friendlyAuthError(refusal);
     expect(shown).toBe(m.err_auth_prf_not_supported());
     expect(shown).not.toMatch(/PRF extension/);
+  });
+
+  it('leaves the passkey step retryable: a second attempt with a PRF passkey completes, with no new token (bug252 (c))', async () => {
+    const { api } = fakeServer();
+    let begins = 0;
+    let completes = 0;
+    const real = mockGateway();
+    const noPrf: WebAuthnGateway = {
+      ...real,
+      create: async (options) => {
+        const created = await real.create(options);
+        return created && { ...created, getClientExtensionResults: () => ({}) };
+      },
+    };
+    const countingApi = {
+      ...api,
+      beginRegistration: async (accountId: string) => {
+        begins += 1;
+        return api.beginRegistration(accountId);
+      },
+      completeRegistration: async () => {
+        completes += 1;
+      },
+    };
+
+    await expect(
+      registerSignupCredential({ api: countingApi, gateway: noPrf }, 'acct-1'),
+    ).rejects.toBeInstanceOf(PrfNotSupportedError);
+    const retried = await registerSignupCredential({ api: countingApi, gateway: real }, 'acct-1');
+
+    expect(retried.credentialId.length).toBeGreaterThan(0);
+    expect(begins).toBe(2);
+    expect(completes).toBe(1);
   });
 });

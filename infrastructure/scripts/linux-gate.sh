@@ -68,14 +68,14 @@ set -euo pipefail
 # The SAME digest-pinned image as crypto-wasm/build-web-pkg.sh (bump together
 # with rust-toolchain.toml). Multi-arch manifest: on an Apple Silicon host the
 # arm64 variant runs natively.
-RUST_IMAGE="rust@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc"
+RUST_IMAGE="rust@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b"
 
 # A thin derived image adding aws-lc-sys's build deps (cmake; the base image
 # already carries gcc + perl) and cargo-nextest for the --nextest CI-repro
 # mode (prebuilt binary, version-pinned to the host install — bump together).
 # Rebuilt when the base digest or the tag suffix changes.
 NEXTEST_VERSION="0.9.140"
-GATE_IMAGE="signet-linux-gate:5e2214abe154-n1"
+GATE_IMAGE="signet-linux-gate:9181b56c2a21-n1"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 

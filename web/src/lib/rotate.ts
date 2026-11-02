@@ -17,7 +17,7 @@
 
 import type { AccountApi } from './api';
 import { b64uEncode } from './crypto/bytes';
-import { InvalidInputError, PrfNotSupportedError } from './crypto/errors';
+import { PasskeyPromptEndedError, PrfNotSupportedError } from './crypto/errors';
 import {
   deriveWrapKey,
   prfSalt,
@@ -43,8 +43,8 @@ export interface RotateDeps {
 
 /** Run the 3-gesture passkey rotation end-to-end. Returns the new PRF-wrapped KEM
  *  blob, which the caller stores in the session (the KEM keypair + its public key
- *  are unchanged). Throws InvalidInputError if any gesture is dismissed or the new
- *  authenticator lacks PRF. */
+ *  are unchanged). Throws PasskeyPromptEndedError (an InvalidInputError) if any
+ *  gesture is dismissed, or PrfNotSupportedError if the new authenticator lacks PRF. */
 export async function rotatePasskey(
   deps: RotateDeps,
   currentBlob: KemPrivkeyWrap,
@@ -58,7 +58,7 @@ export async function rotatePasskey(
   // locally; sign-in proves a single assertion can be both PRF-bearing and
   // server-verified (the PRF output is stripped before posting, INV-13).
   const oldAssertion = await gateway.get(await assertionOptionsWithLocalPrf(begin.options));
-  if (!oldAssertion) throw new InvalidInputError('the rotation was cancelled');
+  if (!oldAssertion) throw new PasskeyPromptEndedError('rotation');
   const oldPrf = extractPrfFirst(oldAssertion);
 
   // Recover the current PKCS#8 by unwrapping under the old PRF (the session key
@@ -71,7 +71,7 @@ export async function rotatePasskey(
   const newCredential = await gateway.create(
     registrationOptionsFromServer(begin.registration_options),
   );
-  if (!newCredential) throw new InvalidInputError('the rotation was cancelled');
+  if (!newCredential) throw new PasskeyPromptEndedError('rotation');
   if (!registrationReportsPrfEnabled(newCredential)) {
     throw new PrfNotSupportedError();
   }
@@ -85,7 +85,7 @@ export async function rotatePasskey(
       rpId: readRpId(begin.registration_options),
     }),
   );
-  if (!newPrfAssertion) throw new InvalidInputError('the rotation was cancelled');
+  if (!newPrfAssertion) throw new PasskeyPromptEndedError('rotation');
   const newPrf = extractPrfFirst(newPrfAssertion);
 
   // Re-wrap the SAME PKCS#8 under the new PRF (fresh IV per wrap event).

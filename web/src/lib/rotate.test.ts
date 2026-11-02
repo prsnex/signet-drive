@@ -209,4 +209,55 @@ describe('rotatePasskey — the browser-side KEM re-wrap', () => {
     expect(shown).toBe(m.err_auth_prf_not_supported());
     expect(shown).not.toContain('PRF extension');
   });
+
+  // bug262: a gesture whose prompt returns no credential (the gateway resolves null
+  // rather than rejecting) put the developer string "the rotation was cancelled" in
+  // the dialog, through friendlyCeremonyError's plain-Error fall-through.
+  it.each([
+    ['gesture 1, the current passkey', 'get', 1],
+    ['gesture 2, the new passkey', 'create', 1],
+    ['gesture 3, the new passkey assertion', 'get', 2],
+  ] as const)(
+    'bug262: %s returning no credential shows calm try-again copy, never the raw string',
+    async (_label, which, nth) => {
+      const pair = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, [
+        'deriveBits',
+      ]);
+      const pkcs8 = new Uint8Array(
+        await crypto.subtle.exportKey('pkcs8', pair.privateKey),
+      ) as Bytes;
+      const currentBlob = await wrapKemPrivkey(
+        await deriveWrapKey(OLD_PRF),
+        pkcs8,
+        crypto.getRandomValues(new Uint8Array(12)),
+      );
+      const counts: Counts = { creates: 0, gets: 0 };
+      const real = rotatingGateway(counts);
+      let gets = 0;
+      let creates = 0;
+      const dismissing: WebAuthnGateway = {
+        ...real,
+        get: async (options) => {
+          gets += 1;
+          return which === 'get' && gets === nth ? null : real.get(options);
+        },
+        create: async (options) => {
+          creates += 1;
+          return which === 'create' && creates === nth ? null : real.create(options);
+        },
+      };
+
+      const err = await rotatePasskey(
+        { api: fakeRotateApi(counts), gateway: dismissing },
+        currentBlob,
+      ).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect(counts.complete).toBeUndefined();
+
+      // The rotate dialog renders through friendlyCeremonyError (AccountStore.rotatePasskey).
+      const shown = friendlyCeremonyError(err);
+      expect(shown).not.toBe('the rotation was cancelled');
+      expect(shown).toBe(m.err_ceremony_passkey_prompt_ended());
+    },
+  );
 });

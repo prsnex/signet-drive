@@ -264,7 +264,10 @@ enum Command {
         published_size: Option<u64>,
         /// The public repository holding this server's anchor files
         /// (`roots.jsonl`, `vrf-keys.jsonl`). Known servers need none; a
-        /// self-run server names its own. Also `SIGNET_ANCHOR_REPO`.
+        /// self-run server names its own, as `owner/name`, read at `main`, or
+        /// `owner/name@branch`. Only this override takes a branch; a known
+        /// server's repository is always read at `main`. Also
+        /// `SIGNET_ANCHOR_REPO`.
         #[arg(long = "anchor-repo")]
         anchor_repo: Option<String>,
         /// The owner's watch: scan this epoch's published entries and report

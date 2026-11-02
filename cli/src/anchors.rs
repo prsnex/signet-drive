@@ -50,16 +50,44 @@ const KNOWN_ANCHORS: &[(&str, &str)] = &[
 ];
 
 /// The anchor repository for `server_url`: the explicit override if given,
-/// else the compiled-in map. `None` for a server this CLI does not know.
-pub fn anchor_repo_for(server_url: &str, override_repo: Option<&str>) -> Option<String> {
+/// else the compiled-in map. `None` for a server this CLI does not know. Only
+/// the override may name a branch, `owner/name@branch` (bug266's smoke lane, a
+/// branch per run); the compiled-in repositories are always read at `main`.
+pub fn anchor_repo_for(server_url: &str, override_repo: Option<&str>) -> Result<Option<String>> {
     if let Some(repo) = override_repo.filter(|r| !r.trim().is_empty()) {
-        return Some(repo.trim().to_string());
+        let repo = repo.trim();
+        if repo_and_branch(repo).is_none() {
+            return Err(CliError::invalid_args(format!(
+                "--anchor-repo / SIGNET_ANCHOR_REPO must be owner/name or owner/name@branch, not {repo:?}"
+            )));
+        }
+        return Ok(Some(repo.to_string()));
     }
     let origin = normalize_origin(server_url);
-    KNOWN_ANCHORS
+    Ok(KNOWN_ANCHORS
         .iter()
         .find(|(o, _)| *o == origin)
-        .map(|(_, repo)| (*repo).to_string())
+        .map(|(_, repo)| (*repo).to_string()))
+}
+
+/// `owner/name` → (`owner/name`, `main`); `owner/name@branch` → its branch.
+/// `None` for anything else, so nothing but a repository and a ref name reaches
+/// the fetch URL.
+fn repo_and_branch(repo: &str) -> Option<(&str, &str)> {
+    let (name, branch) = repo.split_once('@').unwrap_or((repo, "main"));
+    let (owner, short) = name.split_once('/')?;
+    let word = |s: &str, extra: &[u8]| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || extra.contains(&b))
+    };
+    let branch_ok = word(branch, b"._-/")
+        && !branch.starts_with(['-', '/', '.'])
+        && !branch.ends_with('/')
+        && !branch.contains("..")
+        && !branch.contains("//");
+    (word(owner, b"-") && word(short, b"._-") && !short.starts_with('.') && branch_ok)
+        .then_some((name, branch))
 }
 
 /// `https://Host/…/` → `https://host`, the key the map and the state use.
@@ -540,7 +568,8 @@ pub fn update_state(state: &mut OriginState, served_epoch: u16, verdict: &EpochV
 
 // ---- fetching the files ----------------------------------------------------
 
-/// Read both files from `repo`'s `main` branch. `vrf-keys.jsonl` not existing
+/// Read both files from `repo`'s branch (`main` unless an override names one).
+/// `vrf-keys.jsonl` not existing
 /// yet (before the first cut) reads as empty; any other failure is `None`, the
 /// caller's `unanchored`.
 pub fn fetch(repo: &str) -> Option<Anchors> {
@@ -550,7 +579,8 @@ pub fn fetch(repo: &str) -> Option<Anchors> {
 
 /// Both files' text, as [`fetch`] reads them.
 fn fetch_raw(repo: &str) -> Option<(String, String)> {
-    let base = format!("https://raw.githubusercontent.com/{repo}/main");
+    let (name, branch) = repo_and_branch(repo)?;
+    let base = format!("https://raw.githubusercontent.com/{name}/{branch}");
     let roots =
         crate::http::get_text_once(&format!("{base}/roots.jsonl"), Duration::from_secs(10)).ok()?;
     let keys = match crate::http::get_text_once(
@@ -1077,7 +1107,7 @@ pub fn anchor_served<'a>(
 ) -> Result<Anchoring<'a>> {
     let served = ServedEpoch::from_server_info(info)?;
     let env_repo = std::env::var("SIGNET_ANCHOR_REPO").ok();
-    let repo = anchor_repo_for(server_url, anchor_repo.or(env_repo.as_deref()));
+    let repo = anchor_repo_for(server_url, anchor_repo.or(env_repo.as_deref()))?;
     let origin = normalize_origin(server_url);
     let path = state_path();
     let mut state = load_state(&path, &origin);

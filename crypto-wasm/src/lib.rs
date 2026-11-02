@@ -29,19 +29,32 @@
 //! constructed off-wasm). JS boundary + vite/CSP/manifest wiring: item 6 +
 //! the item-4 continuation (S107). This crate is the primitive layer those
 //! build on.
+//!
+//! **Two artifacts (§1-67):** the `mlkem` feature is the asset every session
+//! loads; the `vrf` feature is the transparency log's account-index verifier,
+//! which only a share loads, and it carries no randomness. `build-web-pkg.sh`
+//! builds each alone; the default keeps both for the native tests.
 
+#[cfg(feature = "mlkem")]
 use kem::{Decapsulate, Encapsulate};
+#[cfg(feature = "mlkem")]
 use ml_kem::{B32, EncodedSizeUser, KemCore, MlKem1024};
+#[cfg(feature = "mlkem")]
 use zeroize::Zeroizing;
 
 /// FIPS 203 ML-KEM-1024 sizes (PQR Spec §2).
+#[cfg(feature = "mlkem")]
 pub const EK_LEN: usize = 1568;
+#[cfg(feature = "mlkem")]
 pub const CT_LEN: usize = 1568;
+#[cfg(feature = "mlkem")]
 pub const SS_LEN: usize = 32;
 /// The stored secret: the (d,z) seed — 2 × 32 bytes (spec §7).
+#[cfg(feature = "mlkem")]
 pub const SEED_LEN: usize = 64;
 
 /// Split a 64-byte seed into (d, z).
+#[cfg(feature = "mlkem")]
 fn split_seed(seed: &[u8]) -> Result<(B32, B32), &'static str> {
     if seed.len() != SEED_LEN {
         return Err("ml-kem seed must be 64 bytes (d ‖ z)");
@@ -53,6 +66,7 @@ fn split_seed(seed: &[u8]) -> Result<(B32, B32), &'static str> {
 
 /// Regenerate the keypair from the stored seed (FIPS 203 KeyGen determinism —
 /// the spec §7 custody model).
+#[cfg(feature = "mlkem")]
 #[allow(clippy::type_complexity)]
 fn keypair_from_seed(
     seed: &[u8],
@@ -71,6 +85,7 @@ fn keypair_from_seed(
 /// platform CSPRNG (`crypto.getRandomValues` in the browser via getrandom's
 /// js backend). Returns `seed(64) ‖ ek(1568)` — the caller splits, PRF-wraps
 /// the seed (blob layout v2) and publishes the ek.
+#[cfg(feature = "mlkem")]
 pub fn keygen() -> Result<Vec<u8>, &'static str> {
     let mut seed = Zeroizing::new([0u8; SEED_LEN]);
     rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, seed.as_mut());
@@ -83,6 +98,7 @@ pub fn keygen() -> Result<Vec<u8>, &'static str> {
 
 /// Recompute the encapsulation key (1568 B) from a stored seed — the sign-in
 /// path's self-check that the unwrapped seed matches the published directory ek.
+#[cfg(feature = "mlkem")]
 pub fn ek_from_seed(seed: &[u8]) -> Result<Vec<u8>, &'static str> {
     let (_dk, ek) = keypair_from_seed(seed)?;
     Ok(ek.as_bytes().to_vec())
@@ -90,6 +106,7 @@ pub fn ek_from_seed(seed: &[u8]) -> Result<Vec<u8>, &'static str> {
 
 /// Encapsulate to a recipient's ek (the writer side of the hybrid wrap, spec
 /// §4.1): returns `ct(1568) ‖ ss(32)`. Randomness from the platform CSPRNG.
+#[cfg(feature = "mlkem")]
 pub fn encapsulate(recipient_ek: &[u8]) -> Result<Vec<u8>, &'static str> {
     if recipient_ek.len() != EK_LEN {
         return Err("ml-kem encapsulation key must be 1568 bytes");
@@ -111,6 +128,7 @@ pub fn encapsulate(recipient_ek: &[u8]) -> Result<Vec<u8>, &'static str> {
 /// 32-byte shared secret. Per FIPS 203 implicit rejection (spec §10) a
 /// tampered ciphertext does NOT error — it yields a pseudorandom secret; the
 /// failure surfaces downstream at AES-KW.
+#[cfg(feature = "mlkem")]
 pub fn decapsulate(seed: &[u8], ct: &[u8]) -> Result<Vec<u8>, &'static str> {
     if ct.len() != CT_LEN {
         return Err("ml-kem ciphertext must be 1568 bytes");
@@ -126,6 +144,7 @@ pub fn decapsulate(seed: &[u8], ct: &[u8]) -> Result<Vec<u8>, &'static str> {
 
 /// The VRF input for an account: `signet_crypto::vrf::alpha`, byte for byte
 /// (domain ‖ 0x00 ‖ the UUID's 16 bytes; the native test pins the two).
+#[cfg(feature = "vrf")]
 const VRF_ALPHA_DOMAIN: &[u8] = b"signet-pubkey-log-v3-account-index";
 
 /// The transparency log's v3 account index that `proof` proves for
@@ -134,6 +153,7 @@ const VRF_ALPHA_DOMAIN: &[u8] = b"signet-pubkey-log-v3-account-index";
 /// through the same pinned `vrf-r255` the server and the CLI use. Fails
 /// closed: a malformed key or proof, and a proof that does not verify, return
 /// no index.
+#[cfg(feature = "vrf")]
 pub fn vrf_verify(
     public_key: &[u8],
     account_id: &[u8],
@@ -167,26 +187,31 @@ mod js {
         JsError::new(msg)
     }
 
+    #[cfg(feature = "mlkem")]
     #[wasm_bindgen]
     pub fn mlkem1024_keygen() -> Result<Vec<u8>, JsError> {
         super::keygen().map_err(err)
     }
 
+    #[cfg(feature = "mlkem")]
     #[wasm_bindgen]
     pub fn mlkem1024_ek_from_seed(seed: &[u8]) -> Result<Vec<u8>, JsError> {
         super::ek_from_seed(seed).map_err(err)
     }
 
+    #[cfg(feature = "mlkem")]
     #[wasm_bindgen]
     pub fn mlkem1024_encapsulate(recipient_ek: &[u8]) -> Result<Vec<u8>, JsError> {
         super::encapsulate(recipient_ek).map_err(err)
     }
 
+    #[cfg(feature = "mlkem")]
     #[wasm_bindgen]
     pub fn mlkem1024_decapsulate(seed: &[u8], ct: &[u8]) -> Result<Vec<u8>, JsError> {
         super::decapsulate(seed, ct).map_err(err)
     }
 
+    #[cfg(feature = "vrf")]
     #[wasm_bindgen]
     pub fn vrf_r255_verify(
         public_key: &[u8],
@@ -205,6 +230,7 @@ mod tests {
     //! byte-equality leg. The pin detects MISCOMPILES across targets; FIPS
     //! correctness of the crate itself is the ACVP harness's job (item 9).
     use super::*;
+    #[cfg(feature = "mlkem")]
     use sha2::{Digest, Sha256};
 
     #[cfg(target_arch = "wasm32")]
@@ -212,9 +238,12 @@ mod tests {
 
     /// A fixed all-0x42 seed → the ek's SHA-256, pinned. Derived natively from
     /// ml-kem 0.2.3 (S106); the wasm leg must reproduce it byte-for-byte.
+    #[cfg(feature = "mlkem")]
     const KAT_SEED_BYTE: u8 = 0x42;
+    #[cfg(feature = "mlkem")]
     const KAT_EK_SHA256: &str = "dd2e8fe4ffe00e224daab15f6d5f90516754ef13aa25cea525f5d55f520d0137";
 
+    #[cfg(feature = "mlkem")]
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn kat_seed_keygen_is_deterministic_and_pinned() {
@@ -230,6 +259,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "mlkem")]
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn keygen_roundtrip_encaps_decaps() {
@@ -252,6 +282,7 @@ mod tests {
         assert_ne!(ss_bad.as_slice(), ss_writer);
     }
 
+    #[cfg(feature = "mlkem")]
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn input_validation_fails_fast() {
@@ -264,16 +295,21 @@ mod tests {
 
     /// A known answer from the server's own implementation (`signet_crypto::vrf`,
     /// secret key 0x01 × 32): the same bytes on both compile targets.
+    #[cfg(feature = "vrf")]
     const VRF_PK: &str = "3e440469a098036d89ffb2d77a4542928f2f74c2b5769da7480736ace829dc10";
+    #[cfg(feature = "vrf")]
     const VRF_ACCOUNT: [u8; 16] = [
         0xCA, 0xFE, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0xBE, 0xEF,
     ];
+    #[cfg(feature = "vrf")]
     const VRF_PROOF: &str = "02ea537b0797536f1c299db70c48b77ac1a2fba463e45602b3216adea310be06\
                              a207adf81c21914edb94d9c0581f111145df4282e0ab7ef331d9e03d65431897\
                              ab5becdf48a56bd9b26875661db6ba00";
+    #[cfg(feature = "vrf")]
     const VRF_INDEX: &str = "69f8f2ca9cc69e6e18aa9bef8dcbb0f6df0ff32e46b9c60f7b6da89850f82f98\
                              b9a038a32b8c22204821abcfdfd5ae5f2d1bcf55ff3c6d6300accbfa2e1cad55";
 
+    #[cfg(feature = "vrf")]
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn kat_vrf_index_is_pinned() {
@@ -286,6 +322,7 @@ mod tests {
         assert_eq!(hex::encode(index), VRF_INDEX);
     }
 
+    #[cfg(feature = "vrf")]
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn vrf_refuses_another_account_an_altered_proof_and_bad_lengths() {
@@ -304,6 +341,7 @@ mod tests {
 
     /// The native cross-check: what the server proves, this module verifies to
     /// the same index, so the framing here is `signet_crypto::vrf::alpha`'s.
+    #[cfg(feature = "vrf")]
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn vrf_matches_signet_crypto_byte_for_byte() {

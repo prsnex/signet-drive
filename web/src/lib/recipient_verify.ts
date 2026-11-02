@@ -41,7 +41,12 @@ import {
   type ServerInfoResponse,
 } from './api';
 import { b64uDecode, hexDecode, hexEncode, type Bytes } from './crypto/bytes';
-import { EpochChangedError, IntegrityError, InvalidInputError } from './crypto/errors';
+import {
+  EpochChangedError,
+  IntegrityError,
+  InvalidInputError,
+  ModuleLoadError,
+} from './crypto/errors';
 import { hybridRfp } from './crypto/hybrid_wrap';
 import { toCanonicalBytes, type JsonObject, type JsonValue } from './crypto/jcs';
 import { fingerprint, fingerprintRaw } from './crypto/pubkey';
@@ -190,6 +195,9 @@ export class ServerTrust {
         strictHex(proof, 80, 'VRF proof'),
       );
     } catch (e) {
+      // A verifier that never loaded proved nothing either way: it stops the share
+      // with "try again", never the substitution alarm (Bob, §1-67).
+      if (e instanceof ModuleLoadError) throw e;
       throw new IntegrityError(
         `${who}: the account's VRF proof does not verify under the epoch's key — ` +
           `substitution (${e instanceof Error ? e.message : e})`,

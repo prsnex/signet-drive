@@ -2,7 +2,7 @@
 // Copyright 2026 PRSN EX Inc.
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { hexEncode, type Bytes } from './bytes';
 import {
   initMlkem,
@@ -69,5 +69,18 @@ describe('mlkem boundary (committed wasm pkg)', () => {
     await expect(mlkemEkFromSeed(new Uint8Array(63))).rejects.toThrow();
     await expect(mlkemEncapsulate(new Uint8Array(1567))).rejects.toThrow();
     await expect(mlkemDecapsulate(new Uint8Array(64), new Uint8Array(1569))).rejects.toThrow();
+  });
+});
+
+describe('mlkem initialization (§1-67, the twin of initVrf)', () => {
+  it('a failed load is not kept: the next call loads and the module works', async () => {
+    // A fresh module copy, unloaded, as in a page whose first fetch failed.
+    vi.resetModules();
+    const fresh = await import('./mlkem');
+    await expect(fresh.initMlkem(new Uint8Array([0, 1, 2, 3]))).rejects.toThrow();
+    await fresh.initMlkem(wasmBytes);
+    const { seed, ek } = await fresh.mlkemKeygen();
+    expect(seed.length).toBe(MLKEM_SEED_LEN);
+    expect(ek.length).toBe(MLKEM_EK_LEN);
   });
 });

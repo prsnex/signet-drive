@@ -17,14 +17,39 @@
 #
 # Usage: verify-web-bundle.sh [--origin URL] [--anchor-source <path-or-url>]
 #                             [--skip-anchor] [--out DIR] [--keep]
+#        verify-web-bundle.sh --canonical-sha256 <manifest-file>
+# --canonical-sha256 prints the hash step 2 computes, for a local manifest file, and
+# exits: the one canonicalization the publisher anchors and this tool checks
+# (publish-release.sh; Gus, 2026-11-01), so the two cannot drift apart.
 # --skip-anchor checks the bundle against the served manifest only (steps 1,
 # 2, 4). Weaker: it proves internal consistency, not history. Printed loudly.
 set -u
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 SELF_SHA=$(shasum -a 256 "$0" | awk '{print $1}')
 say() { echo "$*" >&2; }
 tool_err() { say "verify-web-bundle: $*"; exit 64; }
+
+# canonical_sha256 <manifest-file> — RFC 8785 canonicalization, then SHA-256.
+# For this manifest's value domain (ASCII string paths, hex hashes, small integers)
+# compact sorted-key JSON is equivalent.
+# EQUIVALENCE BOUND (Hlin review, S131): re-check this approximation if the
+# manifest schema ever gains a non-ASCII string, float, or big-integer field;
+# those are where JCS and compact-sorted JSON diverge.
+canonical_sha256() {
+  python3 - "$1" <<'PY'
+import hashlib, json, sys
+d = json.load(open(sys.argv[1]))
+c = json.dumps(d, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+print(hashlib.sha256(c).hexdigest())
+PY
+}
+
+if [ "${1:-}" = "--canonical-sha256" ]; then
+  [ -f "${2:-}" ] || tool_err "--canonical-sha256 needs a manifest file"
+  canonical_sha256 "$2" || tool_err "manifest parse/canonicalization failed"
+  exit 0
+fi
 
 ORIGIN="https://drive.mysignet.ca"
 ANCHOR_DEFAULT="https://github.com/prsnex/signet-drive-public-hashes"
@@ -55,19 +80,8 @@ MANIFEST="$WORK/bundle-manifest.json"
 curl -fsS --max-time 30 -o "$MANIFEST" "$ORIGIN/.well-known/signet-bundle-manifest.json" \
   || tool_err "manifest fetch failed: $ORIGIN/.well-known/signet-bundle-manifest.json"
 
-# ---- 2. canonicalize + hash ------------------------------------------------
-# RFC 8785 canonicalization. For this manifest's value domain (ASCII string
-# paths, hex hashes, small integers) compact sorted-key JSON is equivalent.
-# EQUIVALENCE BOUND (Hlin review, S131): re-check this approximation if the
-# manifest schema ever gains a non-ASCII string, float, or big-integer field;
-# those are where JCS and compact-sorted JSON diverge.
-MSHA=$(python3 - "$MANIFEST" <<'PY'
-import hashlib, json, sys
-d = json.load(open(sys.argv[1]))
-c = json.dumps(d, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-print(hashlib.sha256(c).hexdigest())
-PY
-) || tool_err "manifest parse/canonicalization failed"
+# ---- 2. canonicalize + hash (canonical_sha256, above) ----------------------
+MSHA=$(canonical_sha256 "$MANIFEST") || tool_err "manifest parse/canonicalization failed"
 BUILD_SHA=$(python3 -c "import json;print(json.load(open('$MANIFEST')).get('build_commit_sha','unknown'))")
 say "manifest hash $MSHA (build_commit_sha $BUILD_SHA)"
 

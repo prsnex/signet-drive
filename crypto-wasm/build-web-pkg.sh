@@ -2,9 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 PRSN EX Inc.
 #
-# Build the committed wasm pkg the web client imports (PQR item 4/6).
+# Build the two committed wasm pkgs the web client imports (PQR item 4/6; §1-67).
 #
-# The wasm-pack output (`web/src/lib/crypto/mlkem-wasm/`) is COMMITTED, not
+#   web/src/lib/crypto/mlkem-wasm/  `--features mlkem`: ML-KEM-1024, loaded by every session
+#   web/src/lib/crypto/vrf-wasm/    `--features vrf`:   the account-index verifier, loaded only
+#                                   by a share (Launch Punch-List §1-67), with no randomness
+#
+# The wasm-pack output is COMMITTED, not
 # built by web-ci: the web pipeline stays Node-only, and the committed .wasm is
 # the deterministic artifact the bundle manifest + SRI story hashes (PQR Spec
 # §7/§9.3). Drift is impossible: the `wasm-pkg-repro` step in ci.yml re-runs
@@ -22,6 +26,17 @@
 # (linux/amd64, emulated on Apple Silicon), same paths (/build,
 # /usr/local/cargo), same toolchain (rust-toolchain.toml inside the mount).
 #
+# THE TWO STEPS wasm-pack ran, by hand, and one flag more (v1.1.1; Gus's ruling,
+# 2026-11-01): `cargo build --lib --release` for wasm32, then the wasm-bindgen CLI with
+# exactly wasm-pack 0.14.0's arguments (`--typescript --target web --out-name`, read
+# from its src/bindgen.rs) plus `--remove-name-section`, which drops only the debug
+# names (154 KB of the ML-KEM asset's 213 KB) and leaves every code byte as the vectors
+# saw it. wasm-pack offered no way to pass that flag. The CLI is built from crates.io
+# source inside this container at the Cargo.lock version, `--locked`, so no release
+# asset is trusted in the crypto artifact's path (Gus, over Bob's prebuilt-by-checksum);
+# its own sha256 is printed, so two builds show the same CLI. No optimizer runs: wasm-pack's
+# `wasm-opt` is binaryen "latest", unpinned (a later, measured change of its own).
+#
 # Requires Docker (already a dev-stack requirement). Regeneration is rare —
 # only when crypto-wasm/ or the toolchain pin changes.
 #
@@ -29,29 +44,36 @@
 
 set -euo pipefail
 
-WASM_PACK_VERSION="0.14.0"
-WASM_PACK_SHA256="278a8d668085821f4d1a637bd864f1713f872b0ae3a118c77562a308c0abfe8d"
-# rust:1.96.0-bookworm, digest-pinned (multi-arch manifest; --platform selects
+# The wasm-bindgen CLI must be the version Cargo.lock resolves for the `wasm-bindgen`
+# crate (the glue and the module must agree); a mismatch stops the build here.
+WASM_BINDGEN_VERSION="0.2.122"
+# rust:1.99.1-bookworm, digest-pinned (multi-arch manifest; --platform selects
 # amd64). Bump together with rust-toolchain.toml — the image toolchain must
 # match the pin or rustup downloads inside the container.
-RUST_IMAGE="rust@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc"
+RUST_IMAGE="rust@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUT_DIR_REL="web/src/lib/crypto/mlkem-wasm"
+locked="$(awk '/^name = "wasm-bindgen"$/{getline; gsub(/version = |"/, ""); print; exit}' "$REPO_ROOT/Cargo.lock")"
+[ "$locked" = "$WASM_BINDGEN_VERSION" ] || {
+  echo "build-web-pkg: Cargo.lock resolves wasm-bindgen $locked, but this script builds the CLI at $WASM_BINDGEN_VERSION: bump them together" >&2
+  exit 1
+}
+# Each pkg: <out-dir under web/src/lib/crypto> <out-name> <cargo feature>.
+PKGS="mlkem-wasm:signet_crypto_wasm:mlkem vrf-wasm:signet_vrf_wasm:vrf"
 
 docker run --rm --platform linux/amd64 \
   -v "$REPO_ROOT":/build -w /build \
-  -e WASM_PACK_VERSION="$WASM_PACK_VERSION" \
-  -e WASM_PACK_SHA256="$WASM_PACK_SHA256" \
+  -e WASM_BINDGEN_VERSION="$WASM_BINDGEN_VERSION" \
+  -e PKGS="$PKGS" \
   "$RUST_IMAGE" \
   bash -euo pipefail -c '
-    # Pinned wasm-pack from the checksummed release tarball (musl = static,
-    # runs anywhere).
-    curl -sSfL -o /tmp/wasm-pack.tar.gz \
-      "https://github.com/rustwasm/wasm-pack/releases/download/v${WASM_PACK_VERSION}/wasm-pack-v${WASM_PACK_VERSION}-x86_64-unknown-linux-musl.tar.gz"
-    echo "${WASM_PACK_SHA256}  /tmp/wasm-pack.tar.gz" | sha256sum -c - >/dev/null
-    tar -xzf /tmp/wasm-pack.tar.gz -C /tmp
-    install -m 0755 "/tmp/wasm-pack-v${WASM_PACK_VERSION}-x86_64-unknown-linux-musl/wasm-pack" /usr/local/bin/wasm-pack
+    # The wasm-bindgen CLI from crates.io source at the exact version, under the
+    # lockfile the crate ships (--locked refuses a drifted dependency set). Built
+    # before RUSTFLAGS is set, in its own target dir, so nothing below sees it.
+    CARGO_TARGET_DIR=/tmp/wasm-bindgen-target cargo install --quiet --locked \
+      wasm-bindgen-cli --version "=${WASM_BINDGEN_VERSION}" --root /tmp/wasm-bindgen
+    WASM_BINDGEN=/tmp/wasm-bindgen/bin/wasm-bindgen
+    echo "wasm-bindgen CLI: $("$WASM_BINDGEN" --version) sha256 $(sha256sum "$WASM_BINDGEN" | cut -c1-64)"
 
     rustup target add wasm32-unknown-unknown >/dev/null 2>&1
 
@@ -61,14 +83,21 @@ docker run --rm --platform linux/amd64 \
     # Keep the host repo target/ free of container artifacts.
     export CARGO_TARGET_DIR=/tmp/wasm-target
 
-    wasm-pack build /build/crypto-wasm --target web --release --no-pack \
-      --out-dir "/build/web/src/lib/crypto/mlkem-wasm"
+    # One artifact per feature, built alone, so each carries only its own code. The two
+    # commands are what wasm-pack 0.14.0 ran for `build --release --no-pack`.
+    for pkg in $PKGS; do
+      dir="${pkg%%:*}"; rest="${pkg#*:}"; name="${rest%%:*}"; feature="${rest#*:}"
+      (cd /build/crypto-wasm && CARGO_BUILD_TARGET=wasm32-unknown-unknown \
+        cargo build --quiet --lib --release --no-default-features --features "$feature")
+      "$WASM_BINDGEN" "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/signet_crypto_wasm.wasm" \
+        --out-dir "/build/web/src/lib/crypto/$dir" --typescript --target web --out-name "$name" \
+        --remove-name-section
+    done
   '
 
-OUT_DIR="$REPO_ROOT/$OUT_DIR_REL"
-# wasm-pack drops a `*`-matching .gitignore into the out-dir; the whole point
-# here is that the pkg IS committed, so remove it.
-rm -f "$OUT_DIR/.gitignore"
+# (wasm-pack dropped a `*`-matching .gitignore into each out-dir; the CLI does not, and
+# the removal stays so a stale one from an older build cannot hide a committed file.)
+for pkg in $PKGS; do rm -f "$REPO_ROOT/web/src/lib/crypto/${pkg%%:*}/.gitignore"; done
 
 # ── The readout (bug204, S179) ──────────────────────────────────────────────────
 #
@@ -109,34 +138,39 @@ sha_of_stdin() {
 echo
 echo "pkg hashes — COMMITTED (git) vs BUILT (on disk):"
 changed=0
-for f in signet_crypto_wasm_bg.wasm signet_crypto_wasm.js signet_crypto_wasm.d.ts \
-         signet_crypto_wasm_bg.wasm.d.ts; do
-  built="$(sha_of_file "$OUT_DIR/$f")"
-  if committed="$(git -C "$REPO_ROOT" cat-file blob "HEAD:$OUT_DIR_REL/$f" 2>/dev/null | sha_of_stdin)" \
-     && [ -n "$committed" ]; then
-    if [ "$committed" = "$built" ]; then
-      printf '  %-32s unchanged  %s\n' "$f" "$built"
+for pkg in $PKGS; do
+  OUT_DIR_REL="web/src/lib/crypto/${pkg%%:*}"; rest="${pkg#*:}"; name="${rest%%:*}"
+  OUT_DIR="$REPO_ROOT/$OUT_DIR_REL"
+  echo "  $OUT_DIR_REL/"
+  for f in "${name}_bg.wasm" "${name}.js" "${name}.d.ts" "${name}_bg.wasm.d.ts"; do
+    built="$(sha_of_file "$OUT_DIR/$f")"
+    if committed="$(git -C "$REPO_ROOT" cat-file blob "HEAD:$OUT_DIR_REL/$f" 2>/dev/null | sha_of_stdin)" \
+       && [ -n "$committed" ]; then
+      if [ "$committed" = "$built" ]; then
+        printf '    %-30s unchanged  %s\n' "$f" "$built"
+      else
+        printf '    %-30s CHANGED    %s -> %s\n' "$f" "$committed" "$built"
+        changed=1
+      fi
     else
-      printf '  %-32s CHANGED    %s -> %s\n' "$f" "$committed" "$built"
+      # No git, or the file is not committed yet (a first generation).
+      printf '    %-30s (not in git) %s\n' "$f" "$built"
       changed=1
     fi
-  else
-    # No git, or the file is not committed yet (a first generation).
-    printf '  %-32s (not in git) %s\n' "$f" "$built"
-    changed=1
-  fi
+  done
 done
 
 echo
 if [ "$changed" -eq 1 ]; then
   echo "=> the pkg CHANGED. Commit it IN THE SAME PR as the version bump (deploy-runbook §3)."
 else
-  # ⚠ Not necessarily an error: a rebuild with no source or version change SHOULD
-  # be identical — that is what byte-reproducibility means. But after a VERSION
-  # BUMP it is a red flag: the crate version feeds rustc symbol metadata, so every
-  # bump must move the .wasm. Stated rather than silently green.
-  echo "=> the pkg is UNCHANGED. Expected for a rebuild with no source/version change;"
-  echo "   ⚠ after a VERSION BUMP this is wrong — every bump must move the .wasm."
+  # Expected for a rebuild with no source change, and since #671 for a version
+  # bump too: the crate version reached the .wasm only through rustc's symbol
+  # hashes in the debug `name` section, which --remove-name-section now drops
+  # (measured at v1.1.1's bump: the rebuild at 1.1.1 reproduced 1.1.0's pkg byte
+  # for byte; v1.1.0's bump, with names, had moved it). Stated rather than silent.
+  echo "=> the pkg is UNCHANGED. Expected for a rebuild with no source change, and"
+  echo "   since #671 (names stripped) for a version bump alone."
 fi
 echo
 echo "   (git is the authority; CI's wasm-pkg-repro gate uses \`git diff --exit-code\`.)"

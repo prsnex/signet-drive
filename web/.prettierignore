@@ -9,3 +9,4 @@ playwright-report
 src/lib/paraglide
 project.inlang
 src/lib/crypto/mlkem-wasm
+src/lib/crypto/vrf-wasm

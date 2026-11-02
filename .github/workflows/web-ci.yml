@@ -55,6 +55,8 @@ on:
       - 'docs/design/test-vectors/golden/wrap-chain.json'
       - 'docs/design/test-vectors/golden/chunk-envelope.json'
       - 'docs/design/test-vectors/golden/hybrid-crossover.json'
+      - 'docs/design/test-vectors/golden/vrf-account-index.json'
+      - 'docs/design/test-vectors/acvp/ml-kem-1024.keygen.*'
       - '.github/workflows/web-ci.yml'
   pull_request:
     paths:
@@ -62,6 +64,8 @@ on:
       - 'docs/design/test-vectors/golden/wrap-chain.json'
       - 'docs/design/test-vectors/golden/chunk-envelope.json'
       - 'docs/design/test-vectors/golden/hybrid-crossover.json'
+      - 'docs/design/test-vectors/golden/vrf-account-index.json'
+      - 'docs/design/test-vectors/acvp/ml-kem-1024.keygen.*'
       - '.github/workflows/web-ci.yml'
 
 # One in-flight web CI per ref: a new push to the same branch cancels the
@@ -80,7 +84,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '24.21.0'
+          node-version: '26.11.1'
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci
@@ -143,7 +147,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '24.21.0'
+          node-version: '26.11.1'
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci

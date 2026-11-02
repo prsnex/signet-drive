@@ -36,6 +36,32 @@ export class PrfNotSupportedError extends InvalidInputError {
   }
 }
 
+/** A passkey prompt in a multi-gesture ceremony returned no credential (the gateway
+ *  resolved null rather than rejecting): the user dismissed it, or the passkey manager
+ *  ended it. Its own type so the UI shows calm try-again copy (bug262); as a plain
+ *  InvalidInputError its developer string reached the rotate dialog. */
+export class PasskeyPromptEndedError extends InvalidInputError {
+  constructor(what: string) {
+    super(`the ${what} was cancelled`);
+    this.name = 'PasskeyPromptEndedError';
+  }
+}
+
+/** A crypto module loaded on first use (the VRF verifier, Launch Punch-List §1-67)
+ *  could not be fetched or compiled: a dropped connection, or a deploy between the
+ *  page load and the share. Nothing was wrapped or sent, and nothing was verified, so
+ *  it is NEVER an {@link IntegrityError} (that would tell a user their recipient's keys
+ *  were substituted) and never a skipped binding (Bob, §1-67). The UI shows "The
+ *  service was updating. Please try again."; the next attempt fetches the module again. */
+export class ModuleLoadError extends Error {
+  constructor(what: string, cause: unknown) {
+    super(
+      `the ${what} could not be loaded (${cause instanceof Error ? cause.message : String(cause)})`,
+    );
+    this.name = 'ModuleLoadError';
+  }
+}
+
 /** The server's transparency-log epoch moved under an operation (design §10.4):
  *  a read refused the epoch the operation anchored (`refusal`), or a part it
  *  read names another one. `onceMoreOnEpochChange` re-reads once from a fresh

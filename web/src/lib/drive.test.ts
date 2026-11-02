@@ -2,7 +2,16 @@
 // Copyright 2026 PRSN EX Inc.
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+  type MockInstance,
+} from 'vitest';
 import type {
   AcceptInvitationResponse,
   AttestationVerificationResponse,
@@ -55,6 +64,7 @@ import {
   type NameEnvelope,
 } from './crypto';
 import { IntegrityError } from './crypto/errors';
+import { initVrf } from './crypto/vrf';
 import type { JsonObject } from './crypto/jcs';
 import { friendlyDriveError } from './errors';
 import { formatBytes } from './format';
@@ -79,12 +89,17 @@ import { RelayBusyError, StallError } from './transfer';
 import { UploadSlots } from './upload-slots';
 import { SignetApiError, type ResumeMultipartResponse } from './api';
 
+const MLKEM_WASM = readFileSync(
+  fileURLToPath(new URL('./crypto/mlkem-wasm/signet_crypto_wasm_bg.wasm', import.meta.url)),
+);
+// The VRF verifier is its own module from §1-67, loaded at the first share.
+const VRF_WASM = readFileSync(
+  fileURLToPath(new URL('./crypto/vrf-wasm/signet_vrf_wasm_bg.wasm', import.meta.url)),
+);
+
 beforeAll(async () => {
-  await initMlkem(
-    readFileSync(
-      fileURLToPath(new URL('./crypto/mlkem-wasm/signet_crypto_wasm_bg.wasm', import.meta.url)),
-    ),
-  );
+  await initMlkem(MLKEM_WASM);
+  await initVrf(VRF_WASM);
 });
 
 // A faithful in-memory DriveApi: stores exactly the opaque JSON the client sends
@@ -3063,5 +3078,86 @@ describe('the epoch-2 binding and one epoch per operation (design §10.4, §10.6
     expect(api.calls.indexOf('write:initiate')).toBeGreaterThan(
       api.calls.lastIndexOf('server-info'),
     );
+  });
+});
+
+// ---- §1-67: the VRF verifier loads at the first share (Bob's and Gus's terms) ----
+//
+// Fresh module copies, so this suite's VRF module starts unloaded, as in a browser
+// session that has not shared yet (the rest of the file keeps its loaded copies).
+// The wasm fetch is the only real `fetch` a share makes here (the DriveApi is in
+// memory), so the spy both fails it and counts it.
+describe('§1-67: the VRF verifier loads at the first share', () => {
+  let fresh: typeof import('./drive');
+  let freshErrors: typeof import('./crypto/errors');
+  let freshMessages: typeof import('./errors');
+  let fetchSpy: MockInstance<typeof fetch>;
+
+  beforeAll(async () => {
+    vi.resetModules();
+    fresh = await import('./drive');
+    freshErrors = await import('./crypto/errors');
+    freshMessages = await import('./errors');
+    // The fresh ML-KEM copy wraps the shares; only the VRF copy stays unloaded.
+    await (await import('./crypto/mlkem')).initMlkem(MLKEM_WASM);
+    fetchSpy = vi.spyOn(globalThis, 'fetch');
+  });
+  afterAll(() => fetchSpy.mockRestore());
+
+  const wasmFetches = () =>
+    fetchSpy.mock.calls.filter(([u]) =>
+      String(u instanceof Request ? u.url : u).endsWith('signet_vrf_wasm_bg.wasm'),
+    ).length;
+
+  /** One share in epoch 2 to alice, from a fresh owner and share folder. */
+  async function shareToAlice(): Promise<{ api: EpochDrive; result: Promise<unknown> }> {
+    const session = await newSession();
+    const api = new EpochDrive();
+    api.ownerAccountId = session.accountId;
+    await registerAlice(api);
+    api.served = 2;
+    const drive = new fresh.Drive(api, session);
+    const folder = await drive.createShareFolder('Shared');
+    const target = {
+      folderId: folder.folder_id,
+      rootFolderId: folder.folder_id,
+      shareFolder: true,
+    };
+    return { api, result: drive.inviteToShareFolder(target, 'alice', 'read_only') };
+  }
+
+  // These three run in order: they follow one session's module through a failed load,
+  // a retry and a later share.
+  it('a verifier that cannot be fetched stops the share with "try again", never the alarm, and sends nothing', async () => {
+    fetchSpy.mockRejectedValueOnce(new TypeError('network connection lost'));
+    const { api, result } = await shareToAlice();
+    const err = await result.then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(freshErrors.ModuleLoadError);
+    expect(err).not.toBeInstanceOf(freshErrors.IntegrityError);
+    expect(freshMessages.friendlyDriveError(err)).toBe(
+      'The service was updating. Please try again.',
+    );
+    expect(api.lastInvitation).toBeNull();
+    expect(wasmFetches()).toBe(1);
+  });
+
+  it('the next share fetches the verifier again and binds (the failed load is not kept)', async () => {
+    fetchSpy.mockResolvedValueOnce(
+      new Response(VRF_WASM, { headers: { 'Content-Type': 'application/wasm' } }),
+    );
+    const { api, result } = await shareToAlice();
+    await result;
+    expect(api.lastInvitation).not.toBeNull();
+    expect(wasmFetches()).toBe(2);
+  });
+
+  it('a later share in the same session fetches nothing (the loaded module is kept)', async () => {
+    const { api, result } = await shareToAlice();
+    await result;
+    expect(api.lastInvitation).not.toBeNull();
+    expect(wasmFetches()).toBe(2);
   });
 });

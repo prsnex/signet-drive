@@ -97,6 +97,9 @@ docs/design/test-vectors/
 # republished NIST data; the pointer + our differential-test results replace it
 # (that one-paragraph edit to the test-vectors README is Hlin's, staged via carve).
 - docs/design/test-vectors/acvp/
+# ... and the web vitest that reads it through the committed ML-KEM module (v1.1.1), which
+# would otherwise fail public web-ci on the missing vectors (Gus's carve; his ruling at the sha).
+- web/src/lib/crypto/committed_mlkem_acvp.test.ts
 # The vector PROSE ships as public editions (same pattern as the design docs;
 # 2026-08-19): the internal working docs stay private; the editions land via the
 # carve and export under clean names. golden/ and gen/ scripts ship unchanged.

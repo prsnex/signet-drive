@@ -24,7 +24,12 @@
 #   7. Anchors against the public history (signet-drive-transparency-log): the
 #      last publicly committed root is present; from epoch 2, the previous
 #      epoch's end line and this epoch's vrf-keys.jsonl line agree with the
-#      genesis (the CLI's genesis check, design §10.7).
+#      genesis (the CLI's genesis check, design §10.7). With --offbox (0.3.0;
+#      epoch-2 design v09 §6.1), a box claiming NO committed root passes when the
+#      history carries no root for its epoch yet, or when the newest one is younger
+#      than the box's observation lag (OFFBOX_LAG_SECS: its 15-minute tick plus the
+#      raw CDN's 5 minutes), because under v09 the box learns of a commit only by
+#      observing it; otherwise it is refused as without the flag.
 # Every mismatch line states its total count and marks a cut list (bug255).
 # Receipt signature spot-checks are not implemented (they need an ES256
 # verifier dependency); their absence is declared in the transcript.
@@ -34,11 +39,14 @@
 # FAILURE (a fetch failed, or the public history does not yet carry the epoch).
 #
 # Usage: verify-translog.sh [--origin URL] [--anchor-source <path-or-url>]
-#                           [--skip-anchor] [--out DIR] [--keep]
+#                           [--skip-anchor] [--offbox] [--out DIR] [--keep]
 #        verify-translog.sh --self-test
 set -u
 
-VERSION="0.2.0"
+VERSION="0.3.0"
+# The read-only box's lag in learning of a public commit (design v09 §6.1): its
+# observation tick (roots::OBSERVE_EVERY, 15 min) plus the raw CDN window (5 min).
+OFFBOX_LAG_SECS=1200
 SELF_SHA=$(shasum -a 256 "$0" | awk '{print $1}')
 say() { echo "$*" >&2; }
 tool_err() { say "verify-translog: $*"; exit 64; }
@@ -250,6 +258,64 @@ sys.exit(3 if not ok else 4 if incomplete else 0)
 PY
 }
 
+# committed_root_check <root.json> <anchor-dir> <offbox:true|false> <now-unix> —
+# step 7 over files on disk. Exit 0 when it passes, 3 on LOG-MISBEHAVIOR (the box
+# claims a committed root the public history does not carry), 4 when it cannot be
+# checked (the box claims none; with --offbox, only past the box's lag or with a
+# root already public for longer). The live run and the self-test both call it.
+committed_root_check() {
+  OFFBOX_LAG_SECS="$OFFBOX_LAG_SECS" python3 - "$@" <<'PY'
+import json, os, sys
+from datetime import datetime
+root_path, adir, offbox, now = sys.argv[1], sys.argv[2], sys.argv[3] == "true", int(sys.argv[4])
+lag = int(os.environ["OFFBOX_LAG_SECS"])
+d = json.load(open(root_path))
+epoch = d.get("epoch", 1)
+claimed = (d.get("last_publicly_committed") or {}).get("merkle_root", "")
+history = ""
+for name in ("roots.jsonl", "vrf-keys.jsonl"):
+    p = os.path.join(adir, name)
+    if os.path.exists(p):
+        history += open(p).read()
+if claimed:
+    if claimed in history:
+        print("anchor OK: last committed root present in the public history", file=sys.stderr)
+        sys.exit(0)
+    print("the box claims a committed root the public history does not carry", file=sys.stderr)
+    sys.exit(3)
+if not offbox:
+    print(f"server reports no publicly committed root for epoch {epoch}; anchor cannot be checked "
+          "(a fresh epoch before its first root, or a publication failure; investigate)", file=sys.stderr)
+    sys.exit(4)
+ages = []
+p = os.path.join(adir, "roots.jsonl")
+for line in (open(p).read().splitlines() if os.path.exists(p) else []):
+    if not line.strip():
+        continue
+    v = json.loads(line)
+    if v.get("epoch", 1) != epoch or v.get("epoch_end"):
+        continue
+    at = v.get("committed_at", "")
+    try:
+        t = datetime.fromisoformat(at.replace("Z", "+00:00"))
+    except ValueError:
+        print(f"a root line for epoch {epoch} has an unreadable committed_at: {at!r}", file=sys.stderr)
+        sys.exit(4)
+    ages.append(now - int(t.timestamp()))
+if not ages:
+    print(f"anchor OK (--offbox): no root of epoch {epoch} is public yet; the box claims none", file=sys.stderr)
+    sys.exit(0)
+newest = min(ages)
+if newest < lag:
+    print(f"anchor OK (--offbox): epoch {epoch}'s newest public root is {newest}s old, inside the box's "
+          f"{lag}s observation lag; the box claims none yet", file=sys.stderr)
+    sys.exit(0)
+print(f"the box claims no committed root for epoch {epoch}, but the public history has carried one "
+      f"for {newest}s (past the box's {lag}s lag): the box is not observing", file=sys.stderr)
+sys.exit(4)
+PY
+}
+
 # --self-test: the checks over fixtures on disk, no network. The epoch-2
 # fixture's hashes and root come from the crypto crate's own entry_hash_v3,
 # epoch_payload_v3 and merkle_root (pinned below), so the Python v3 rule is
@@ -364,8 +430,34 @@ PY
   expect "a key with no account index in epoch 2" 3 'entry 2 names no account index' "$dir/e2-key-without-index"
   expect "a genesis naming another epoch than the served one" 3 'the genesis names epoch 3, but the served epoch is 2' "$dir/e2-genesis-names-epoch-3"
   expect "bug255: twelve mismatches print the total and mark the cut" 3 'entry_hash mismatch at 12 entries: \[1, 2, 3, 4, 5, 6, 7, 8, 9, 10\] \.\.\. and 2 more \(list cut at 10\)' "$dir/e1-twelve-mismatches"
-  echo "self-test: $pass/$ran passed (10 expected)"
-  [ "$ran" -eq 10 ] && [ "$pass" -eq "$ran" ]
+  # Step 7 and --offbox (0.3.0; Gus's four arms, plus the plain claim and no flag).
+  local now=1793534400   # 2026-11-01T12:00:00Z
+  s7() { # s7 <name> <want-rc> <grep> <root-json> <roots-jsonl-line|-> <offbox>
+    ran=$((ran + 1)); local f; f=$(mktemp -d "$dir/s7.XXXXXX")
+    printf '%s\n' "$4" > "$f/root.json"; : > "$f/vrf-keys.jsonl"
+    if [ "$5" = "-" ]; then : > "$f/roots.jsonl"; else printf '%s\n' "$5" > "$f/roots.jsonl"; fi
+    out=$(committed_root_check "$f/root.json" "$f" "$6" "$now" 2>&1); rc=$?
+    if [ "$rc" -eq "$2" ] && printf '%s\n' "$out" | grep -E -- "$3" >/dev/null; then
+      pass=$((pass + 1)); echo "  ok   $1"
+    else
+      echo "  FAIL $1 (rc=$rc, want $2; /$3/)"; printf '%s\n' "$out" | sed 's/^/       /'
+    fi
+  }
+  local ab; ab=$(printf 'ab%.0s' $(seq 32))
+  local none='{"epoch":2,"last_publicly_committed":null}'
+  local claim='{"epoch":2,"last_publicly_committed":{"merkle_root":"'"$ab"'"}}'
+  local inhist='{"epoch":2,"log_size":3,"merkle_root":"'"$ab"'","committed_at":"2026-10-29T00:00:00Z"}'
+  local old='{"epoch":2,"log_size":5,"merkle_root":"cd","committed_at":"2026-10-29T00:00:00Z"}'
+  # 300 s before the fixed "now".
+  local young='{"epoch":2,"log_size":5,"merkle_root":"cd","committed_at":"2026-11-01T11:55:00Z"}'
+  s7 "step 7: a claimed root in the history anchors" 0 '^anchor OK: last committed root' "$claim" "$inhist" false
+  s7 "step 7: a claim the history lacks is LOG-MISBEHAVIOR, with --offbox too" 3 'does not carry' "$claim" "$old" true
+  s7 "step 7: no claim and no flag cannot be anchored, as before" 4 'no publicly committed root' "$none" - false
+  s7 "--offbox: no claim and no public root of the epoch passes (the first root)" 0 'no root of epoch 2 is public yet' "$none" - true
+  s7 "--offbox: no claim beside a root public 5 min passes (inside the box's lag)" 0 'inside the box' "$none" "$young" true
+  s7 "--offbox: no claim beside a root public for days is refused (the box is not observing)" 4 'is not observing' "$none" "$old" true
+  echo "self-test: $pass/$ran passed (16 expected)"
+  [ "$ran" -eq 16 ] && [ "$pass" -eq "$ran" ]
 }
 
 # The self-test is dispatched before anything else touches the network or
@@ -376,12 +468,13 @@ fi
 
 ORIGIN="https://drive.mysignet.ca"
 ANCHOR_DEFAULT="https://github.com/prsnex/signet-drive-transparency-log"
-ANCHOR_SRC="" SKIP_ANCHOR=false OUT="" KEEP=false
+ANCHOR_SRC="" SKIP_ANCHOR=false OFFBOX=false OUT="" KEEP=false
 while [ $# -gt 0 ]; do
   case "$1" in
     --origin) ORIGIN="${2:-}"; shift 2 ;;
     --anchor-source) ANCHOR_SRC="${2:-}"; shift 2 ;;
     --skip-anchor) SKIP_ANCHOR=true; shift ;;
+    --offbox) OFFBOX=true; shift ;;
     --out) OUT="${2:-}"; shift 2 ;;
     --keep) KEEP=true; shift ;;
     *) tool_err "unknown argument: $1" ;;
@@ -393,6 +486,7 @@ say "sha256 $SELF_SHA"
 say "origin $ORIGIN"
 $SKIP_ANCHOR && say "OVERRIDE: anchor check skipped; root consistency is checked against the server only"
 [ -n "$ANCHOR_SRC" ] && say "OVERRIDE: anchor source is not the default transparency-log history"
+$OFFBOX && say "mode: --offbox (the box observes commits; its ${OFFBOX_LAG_SECS}s lag is allowed in step 7)"
 say "note: receipt signature spot-checks are not implemented (declared, not silent)"
 
 WORK="${OUT:-$(mktemp -d "${TMPDIR:-/tmp}/verify-translog.XXXXXX")}"
@@ -454,17 +548,12 @@ esac
 
 # ---- 7. the last committed root is in the public history ------------------------
 if ! $SKIP_ANCHOR; then
-  COMMITTED_ROOT=$(python3 -c "
-import json
-d = json.load(open('$WORK/root.json'))
-lc = d.get('last_publicly_committed') or {}
-print(lc.get('merkle_root',''))")
-  if [ -z "$COMMITTED_ROOT" ]; then
-    tool_err "server reports no publicly committed root for epoch $EPOCH; anchor cannot be checked (a fresh epoch before its first root, or a publication failure; investigate)"
-  fi
-  grep -rq "$COMMITTED_ROOT" "$ADIR" 2>/dev/null \
-    || { echo "verdict=LOG-MISBEHAVIOR origin=$ORIGIN epoch=$EPOCH reason=committed-root-not-in-public-history script_sha=$SELF_SHA"; exit 20; }
-  say "anchor OK: last committed root present in the public history"
+  committed_root_check "$WORK/root.json" "$ADIR" "$OFFBOX" "$(date -u +%s)"
+  case $? in
+    0) ;;
+    3) echo "verdict=LOG-MISBEHAVIOR origin=$ORIGIN epoch=$EPOCH reason=committed-root-not-in-public-history script_sha=$SELF_SHA"; exit 20 ;;
+    *) tool_err "step 7 could not anchor the box's committed root (see the line above)" ;;
+  esac
 fi
 
 echo "verdict=VERIFIED origin=$ORIGIN epoch=$EPOCH entries=$TOTAL script_sha=$SELF_SHA"

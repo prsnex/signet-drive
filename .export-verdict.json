@@ -1,10 +1,10 @@
 {
   "contract_version": 1,
-  "input_tag": "v1.1.0",
-  "input_commit": "40438b6175c4e26fba1495a0e7f1294c642814b1",
+  "input_tag": "v1.1.2",
+  "input_commit": "4d7a086ebe0a55f63ca910f77878d599c2b909a7",
   "tool_version": "0.2.2",
-  "tool_sha256": "c8543615bfe3689d03e25ca554c9946f4350b31a827cbc9de00bb5210d7db011",
-  "allowlist_sha256": "0cfa7018ec69aed8c628989e4ff7654d453bdea8493ae85e6fce3b12780e600c",
+  "tool_sha256": "ebb15efa478d372a40953d39e87ef4d91bf8f62b50a8f05563df4bc3372543d7",
+  "allowlist_sha256": "369c7229572bcc70c02a495ebb1d2337f98404ff7f2840f665a320366422a21b",
   "dry_run": false,
   "checks": [
     {"id":"leak.paths","result":"pass","findings":0},{"id":"leak.substrate","result":"pass","findings":0},{"id":"leak.secrets","result":"pass","findings":0},{"id":"leak.hostnames","result":"pass","findings":0},{"id":"docs.allowlist","result":"pass","findings":0},{"id":"lockfile.identity","result":"pass","findings":0},{"id":"license.spdx","result":"pass","findings":0},{"id":"bloat.vendored","result":"pass","findings":0},{"id":"style.lint","result":"pass","findings":0},{"id":"refs.closure","result":"pass","findings":0},{"id":"root.required","result":"pass","findings":0},{"id":"copy.complete","result":"pass","findings":0},{"id":"lockfile.subset","result":"pass","findings":0},{"id":"lockfile.frozen","result":"pass","findings":0}
