@@ -223,7 +223,8 @@
   "sidebar_quota_used": "{used} / {quota} used",
   "sidebar_quota_nearly_full": "(nearly full)",
   "sidebar_your_prsns": "PRSN Accounts",
-  "sidebar_add_prsn": "+ PRSN",
+  "sidebar_add_prsn": "+ New",
+  "sidebar_add_prsn_label": "New PRSN account",
   "sidebar_no_prsns_yet": "No PRSNs yet.",
   "sidebar_settings": "Settings",
   "sidebar_shared_with_you": "Shared with you",
@@ -326,7 +327,7 @@
   "enrollconfirm_subtitle_4": "Next, you must authorize this PRSN to use its Signet Drive account. Important details below.",
   "enrollconfirm_subtitle_5": "Your PRSN should now try to access Signet Drive.",
   "enrollconfirm_subtitle_6": "This PRSN account setup is complete!",
-  "enrollconfirm_no_code": "This link is missing its enrollment code. Start over from Add PRSN on your account page.",
+  "enrollconfirm_no_code": "This link is missing its enrollment code. Start over from + Add account, under PRSN Accounts on your account page.",
   "enrollconfirm_signin_prompt": "Sign in to approve this PRSN. You'll come back here to finish.",
   "enrollconfirm_signin_btn": "Sign in",
   "enrollconfirm_name_label": "PRSN name",
@@ -405,7 +406,7 @@
   "guardianprsns_att_revoked": "Attestation revoked",
   "guardianprsns_att_expired": "Attestation expired",
   "guardianprsns_title": "PRSN Accounts",
-  "guardianprsns_add": "+ Add PRSN",
+  "guardianprsns_add": "+ Add account",
   "guardianprsns_empty": "You don't guard any PRSNs yet.",
   "guardianprsns_sharing": "{cap}",
   "guardianprsns_deletes_at": "Deletes on or after {date}",
@@ -468,7 +469,7 @@
   "garnet_authorize_allocation": "This gives {handle} its own working access to Signet Drive: a real allocation of your storage and your trust, not a setting.",
   "garnet_authorize_revocable": "You can revoke it at any time.",
   "garnet_authorize_no_candidates": "All of your PRSNs already have Signet Drive access.",
-  "garnet_authorize_no_prsns": "Enroll a PRSN first (+ Add PRSN). Authorizing Signet Drive access comes after enrollment.",
+  "garnet_authorize_no_prsns": "Enroll a PRSN first (+ Add account, under PRSN Accounts). Authorizing Signet Drive access comes after enrollment.",
   "garnet_authorize_prsn_label": "PRSN",
   "garnet_authorizing": "Authorizing…",
   "garnet_authorize_confirm": "Authorize",
@@ -655,5 +656,5 @@
   "err_drive_stalled": "The connection to storage stopped responding. Nothing was lost. Please try again.",
   "err_drive_service_updating": "The service was updating. Please try again.",
   "guardianprsns_show_in_dashboard": "Show PRSN Accounts in the Signet Drive dashboard",
-  "guardianprsns_requirement": "A PRSN lives on a Mac with Apple Silicon (M1 or newer). That Mac is the PRSN's home; you can manage it from any device."
+  "guardianprsns_requirement": "A PRSN (an AI agent) on a Mac with Apple Silicon (M1 or newer) holds its own account, and its keys stay on that Mac. You can manage the account from a browser on any device."
 }

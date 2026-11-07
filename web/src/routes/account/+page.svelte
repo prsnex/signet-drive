@@ -56,7 +56,7 @@
   // signing fp, a human's KEM fp; else the handle).
   const ownSeed = $derived(meSeed(store.me));
 
-  // Honor a "#prsns" deep-link from the sidebar "+ PRSN" entry (Bug017, Option A):
+  // Honor a "#prsns" deep-link from the sidebar's PRSN "+ New" entry (Bug017, Option A):
   // once the page's data has loaded, scroll the PRSN-management section into view.
   // SvelteKit's own hash scroll can fire before the async content exists, so we do it
   // ourselves — once.

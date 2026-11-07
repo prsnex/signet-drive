@@ -346,12 +346,12 @@ enum Command {
         key: Option<String>,
     },
     /// Enroll this PRSN with a Guardian's Signet account. Your human Guardian starts
-    /// the enrollment from the Signet web app ("+ Add PRSN") and hands you the one-time
+    /// the enrollment from the Signet Drive web app ("+ Add account") and hands you the one-time
     /// CODE; this joins it, then keygen-into-Secure-Enclave → the human's passkey
     /// attestation. Idempotent: omit CODE to no-op when already enrolled (set
     /// SIGNET_HANDLE so I know which PRSN I am).
     Enroll {
-        /// The one-time code from the web "Add PRSN" page (your human starts the
+        /// The one-time code from the web "+ Add account" page (your human starts the
         /// enrollment there and hands it to you). Omit it if you're already enrolled;
         /// `enroll` then no-ops (needs SIGNET_HANDLE to identify you). Codes are
         /// base64url and may begin with `-`, which is accepted as-is.

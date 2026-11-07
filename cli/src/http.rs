@@ -61,12 +61,34 @@ pub(crate) fn pq_tls_config() -> Arc<rustls::ClientConfig> {
         .clone()
 }
 
+/// The TCP connect bound for every request through [`agent`], per attempt. ureq 2.12.1's
+/// default is 30 s, so a black-holed server held a command about 127 s across
+/// `MAX_RETRIES` and the backoff (Bob, S216); at 10 s it is about 47 s. Rate-free: a TCP
+/// handshake carries no payload, so its time never grows with a file's size (the
+/// governing invariant in [`bucket_transport`]).
+///
+/// **No read bound, on purpose.** This agent carries the synchronous multipart complete
+/// (the server waits on the bucket's CompleteMultipartUpload, silent for a time that
+/// grows with the part count) and `signet update`'s download, so a read bound here would
+/// be a wall-time constant on a size-dependent quantity, the failure bug060 measured.
+/// The TLS handshake runs on first I/O, under no bound; a server that accepts the
+/// connection and then never answers still holds the command.
+const API_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The shared HTTP agent — all module requests go through it so every TLS
 /// connection uses [`pq_tls_config`] (ureq's free functions would silently use
 /// its internal ring-provider default instead).
 fn agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| ureq::builder().tls_config(pq_tls_config()).build())
+    AGENT.get_or_init(|| api_agent(API_CONNECT_TIMEOUT))
+}
+
+/// The agent [`agent`] holds, with its connect bound as a parameter so a test can pin it.
+fn api_agent(connect: std::time::Duration) -> ureq::Agent {
+    ureq::builder()
+        .timeout_connect(connect)
+        .tls_config(pq_tls_config())
+        .build()
 }
 
 fn network(message: impl Into<String>) -> CliError {
@@ -930,6 +952,88 @@ fn get_presigned_range_impl(
 #[cfg(test)]
 mod tests {
     use std::io::Read;
+
+    /// A local black hole for the connect-bound tests (Bob's case, S216): a listener that
+    /// never accepts, its accept queue full, so later SYNs go unanswered. A raw connect
+    /// timing out is the control that the black hole is real. Linux only: there a full
+    /// accept queue drops later SYNs; macOS's loopback refused some overflow connects and
+    /// accepted others when measured (S216). The gate and CI run Linux.
+    #[cfg(target_os = "linux")]
+    fn black_hole() -> (
+        std::net::SocketAddr,
+        socket2::Socket,
+        Vec<std::net::TcpStream>,
+    ) {
+        use std::time::Duration;
+        let sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+            .expect("socket");
+        let local: std::net::SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        sock.bind(&local.into()).expect("bind");
+        sock.listen(0).expect("listen");
+        let addr = sock
+            .local_addr()
+            .expect("local addr")
+            .as_socket()
+            .expect("an inet address");
+        let mut held = Vec::new();
+        for _ in 0..64 {
+            match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)) {
+                Ok(stream) => held.push(stream),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return (addr, sock, held),
+                Err(e) => panic!("filling the accept queue: {e}"),
+            }
+        }
+        panic!("the accept queue never filled: no black hole to test against");
+    }
+
+    /// How long `agent` takes to give up on a connect into `addr`, which must fail.
+    #[cfg(target_os = "linux")]
+    fn connect_took(agent: &ureq::Agent, addr: std::net::SocketAddr) -> std::time::Duration {
+        let started = std::time::Instant::now();
+        let outcome = agent.get(&format!("http://{addr}/")).call();
+        assert!(
+            outcome.is_err(),
+            "a connect into the black hole cannot succeed"
+        );
+        started.elapsed()
+    }
+
+    /// The bound holds, checked from both sides so a fast refusal cannot pass for it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_api_agent_bounds_a_connect_that_never_completes() {
+        use std::time::Duration;
+        let (addr, _listener, _held) = black_hole();
+        let bound = Duration::from_millis(800);
+        let took = connect_took(&api_agent(bound), addr);
+        assert!(
+            took >= bound / 2,
+            "returned in {took:?}: a fast refusal, not the {bound:?} bound"
+        );
+        assert!(
+            took < Duration::from_secs(5),
+            "the connect took {took:?} under a {bound:?} bound"
+        );
+    }
+
+    /// The shared agent every request uses is built with `API_CONNECT_TIMEOUT` (Bob's
+    /// reading on PR B: the test above proves `api_agent`, not `agent()`'s wiring). About
+    /// 10 s; ureq's own default would take 30.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_shared_agent_carries_the_connect_bound() {
+        use std::time::Duration;
+        let (addr, _listener, _held) = black_hole();
+        let took = connect_took(agent(), addr);
+        assert!(
+            took >= API_CONNECT_TIMEOUT / 2,
+            "returned in {took:?}: a fast refusal, not the {API_CONNECT_TIMEOUT:?} bound"
+        );
+        assert!(
+            took < API_CONNECT_TIMEOUT + Duration::from_secs(5),
+            "the shared agent's connect took {took:?}; its bound is {API_CONNECT_TIMEOUT:?}"
+        );
+    }
 
     use super::*;
     use crate::keystore::{Purpose, SoftwareKeystore};

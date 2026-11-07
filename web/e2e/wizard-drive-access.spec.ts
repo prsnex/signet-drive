@@ -183,7 +183,7 @@ test('Cancel at the hand-off step removes the pre-account enrollment and returns
   });
 
   // Name → Continue mints the enrollment (Step 2, hand-off).
-  await page.getByRole('button', { name: '+ Add PRSN' }).click();
+  await page.getByRole('button', { name: '+ Add account' }).click();
   await expect(page.getByRole('heading', { name: 'Add a PRSN' })).toBeVisible({ timeout: 15_000 });
   await page.getByLabel('PRSN name').fill('cancelme');
   await page.getByRole('button', { name: 'Continue' }).click();

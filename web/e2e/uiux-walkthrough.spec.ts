@@ -212,7 +212,7 @@ test('walk every human-web screen and state', async ({ page, browser }) => {
   });
   await shot(page, 'account-dashboard-full');
 
-  await page.getByRole('button', { name: '+ Add PRSN' }).click();
+  await page.getByRole('button', { name: '+ Add account' }).click();
   await expect(page.getByRole('heading', { name: 'Add a PRSN' })).toBeVisible({
     timeout: 15_000,
   });

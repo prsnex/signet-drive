@@ -5,7 +5,7 @@
 //! human-initiated only; canonical design: `Signet-Drive-PRSN-Account-and-Kit-Spec`
 //! §a–c).
 //!
-//! The human Guardian starts the enrollment from the Signet web app ("+ Add PRSN")
+//! The human Guardian starts the enrollment from the Signet Drive web app ("+ Add account")
 //! and hands the agent the one-time `code`. This drives the agent's side of the
 //! server-mediated rendezvous. **The Kit is retired** (S076 — Account-and-Kit §c):
 //! identity is *discovered* (the channel pin / `SIGNET_HANDLE`), not carried in a
@@ -96,7 +96,7 @@ struct EnrollResult {
 /// `signet enroll [CODE]`.
 ///
 /// S063: **human-initiated only.** The human Guardian opens the enrollment from the
-/// web "Add PRSN" page and hands the agent the one-time `CODE`; the agent joins it
+/// web "+ Add account" page and hands the agent the one-time `CODE`; the agent joins it
 /// (claiming its `submit_token`), waits for the human to confirm, then keygen →
 /// submit → attestation. There is no agent-first path: only a logged-in human can open
 /// an enrollment.
@@ -154,11 +154,11 @@ pub fn enroll(base_url: &str, code: Option<&str>, config: &Config, out: &OutputM
     }
 
     // Not enrolled → a one-time enrollment CODE is required (the guardian opens
-    // "+ Add PRSN" in Signet and hands it to the agent — S063 human-initiated).
+    // "+ Add account" in Signet Drive and hands it to the agent — S063 human-initiated).
     let code = code.ok_or_else(|| {
         CliError::invalid_args(
             "not enrolled yet, and no enrollment CODE was given. Ask your guardian to open \
-             \"+ Add PRSN\" in Signet and hand you the one-time code, then run \
+             \"+ Add account\" under PRSN Accounts in Signet Drive and hand you the one-time code, then run \
              `signet enroll <CODE>`. (If you ARE enrolled, set SIGNET_HANDLE so I can tell.)",
         )
     })?;
@@ -414,7 +414,7 @@ fn poll_until(base: &str, code: &str, target: &str, waiting_for: &str) -> Result
                 // `signet enroll` again", which re-submits the same dead code).
                 return Err(CliError::generic(format!(
                     "the enrollment expired while waiting for {waiting_for}. Ask your \
-                     guardian for a fresh code (they start over from \"+ Add PRSN\"), \
+                     guardian for a fresh code (they start over from \"+ Add account\"), \
                      then run `signet enroll <NEW-CODE>`"
                 )));
             }
@@ -422,7 +422,7 @@ fn poll_until(base: &str, code: &str, target: &str, waiting_for: &str) -> Result
                 return Err(CliError::generic(format!(
                     "the enrollment was cancelled while waiting for {waiting_for}. If \
                      this is unexpected, ask your guardian; they can start over from \
-                     \"+ Add PRSN\" with a fresh code"
+                     \"+ Add account\" with a fresh code"
                 )));
             }
             "failed" => {

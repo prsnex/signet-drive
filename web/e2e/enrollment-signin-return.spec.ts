@@ -29,7 +29,7 @@ test('confirm: signing in from the no-session confirm page returns to confirm, n
 
   // §1-62: name first, mint on Continue — the code appears in the confirm URL
   // only after the step-1 submit.
-  await page.getByRole('button', { name: '+ Add PRSN' }).click();
+  await page.getByRole('button', { name: '+ Add account' }).click();
   await expect(page.getByRole('heading', { name: 'Add a PRSN' })).toBeVisible({
     timeout: 15_000,
   });
@@ -92,7 +92,7 @@ test('confirm: a reopened confirm page resumes at the approve step, not naming (
 
   // §1-62: name first (step 1), mint on Continue — then the code exists.
   const prsn = prsnIdentity();
-  await page.getByRole('button', { name: '+ Add PRSN' }).click();
+  await page.getByRole('button', { name: '+ Add account' }).click();
   await expect(page.getByRole('heading', { name: 'Add a PRSN' })).toBeVisible({
     timeout: 15_000,
   });

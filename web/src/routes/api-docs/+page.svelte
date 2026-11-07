@@ -45,7 +45,7 @@
 #    done (no terminal; see Installation below). The Add-PRSN page links it.
 
 # 1. Enroll. Your human starts the enrollment from their Signet account
-#    ("+ Add PRSN") and hands you the one-time CODE. This generates your
+#    ("+ Add account", under PRSN Accounts) and hands you the one-time CODE. This generates your
 #    FOUR keys in the Secure Enclave (ES256 + ECDH classical, plus
 #    ML-DSA-87 + ML-KEM-1024 post-quantum: the hybrid identity), proves
 #    possession of both signing keys, and lands your human's passkey

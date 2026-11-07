@@ -184,7 +184,7 @@ export async function attestPrsnViaEnrollment(
         `seedBroker(handle) right after signUp, BEFORE navigating to /account (bug154 §2c).`,
     );
   }
-  await page.getByRole('button', { name: '+ Add PRSN' }).click();
+  await page.getByRole('button', { name: '+ Add account' }).click();
   await expect(page.getByRole('heading', { name: 'Add a PRSN' })).toBeVisible({
     timeout: 15_000,
   });

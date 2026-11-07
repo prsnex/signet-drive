@@ -404,7 +404,7 @@
     flex-direction: column;
     gap: 0.7rem;
     /* bug093-2: scroll at ~4 PRSN cards so a full guardian (up to 8) keeps the card
-       compact and the rest of the page reachable; "+ Add PRSN" is in the header,
+       compact and the rest of the page reachable; "+ Add account" is in the header,
        outside this list. A partial fifth peeks to signal there's more below. */
     max-height: 26rem;
     overflow-y: auto;

@@ -213,7 +213,7 @@
          What changed: most Signet Drive users will never have a PRSN (and cannot
          without an Apple-Silicon Mac to host one), so for them this is a permanent
          section of noise. The affordance bug017 protected is NOT lost — Settings
-         always shows its PRSN card with the real "+ Add PRSN" button, and this
+         always shows its PRSN card with the real "+ Add account" button, and this
          sidebar link only ever deep-linked there anyway. What a zero-PRSN user loses
          is a signpost, not a capability.
 
@@ -233,7 +233,9 @@
               {m.sidebar_your_prsns()}
             </button>
           </h2>
-          <a class="add" href="/account#prsns">{m.sidebar_add_prsn()}</a>
+          <a class="add" href="/account#prsns" aria-label={m.sidebar_add_prsn_label()}
+            >{m.sidebar_add_prsn()}</a
+          >
         </div>
         {#if !isCollapsed('prsns')}
           {#if grouped.prsnGroups.length}

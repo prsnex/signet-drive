@@ -11,6 +11,7 @@
 //! every primitive goes through `signet-crypto`; secret material (DEKs, KEKs,
 //! shared secrets) is held in `Zeroizing` and never crosses the command line.
 
+use std::collections::BTreeSet;
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -170,8 +171,53 @@ fn config_default(purpose: Purpose, config: &Config) -> Option<String> {
 /// catch — incompleteness hides the multiplicity (v05 §11). `keys list` enumerates for
 /// display only; resolution requires an explicit source. (Enumeration-as-a-convenience
 /// is gated on the §12 hardware validation and is not wired here.)
-fn resolve_label(label_arg: Option<&str>, purpose: Purpose, config: &Config) -> Result<KeyLabel> {
-    resolve_label_for(asserted_handle().as_deref(), label_arg, purpose, config)
+///
+/// **One use of enumeration, and it only refuses (bug280, Chris: refuse).** When the
+/// config default would be used (no `--key`, no `SIGNET_HANDLE`), the keystore is listed
+/// and the default is refused if this host holds keys for more than one PRSN handle: on
+/// a shared Mac, a tool that names no identity must not act as whichever PRSN the config
+/// happens to name. The list never picks an identity. An incomplete list (1-of-N) falls
+/// back to the default the config names on purpose, never to an identity nobody named;
+/// a list that fails refuses. A single-identity host keeps its default.
+fn resolve_label(
+    keystore: &dyn Keystore,
+    label_arg: Option<&str>,
+    purpose: Purpose,
+    config: &Config,
+) -> Result<KeyLabel> {
+    resolve_label_with(
+        asserted_handle().as_deref(),
+        keystore,
+        label_arg,
+        purpose,
+        config,
+    )
+}
+
+/// [`resolve_label`] with the asserted handle passed in, so the keystore wiring every caller
+/// uses is testable without touching the process `SIGNET_HANDLE` (Bob's B.26 on PR B: with
+/// the list stubbed out here, every other test still passed).
+fn resolve_label_with(
+    asserted: Option<&str>,
+    keystore: &dyn Keystore,
+    label_arg: Option<&str>,
+    purpose: Purpose,
+    config: &Config,
+) -> Result<KeyLabel> {
+    resolve_label_for(asserted, label_arg, purpose, config, || {
+        held_handles(keystore)
+    })
+}
+
+/// The distinct PRSN handles this host's keystore holds keys for (bug280). Read only to
+/// refuse a config default on a multi-identity host; never a resolution source.
+fn held_handles(keystore: &dyn Keystore) -> Result<BTreeSet<String>> {
+    Ok(keystore
+        .list()?
+        .iter()
+        .filter_map(|meta| KeyLabel::parse(&meta.label, None).ok())
+        .map(|label| label.handle().to_string())
+        .collect())
 }
 
 /// The pure resolver decision (no environment read) — split out so the full
@@ -182,6 +228,7 @@ fn resolve_label_for(
     label_arg: Option<&str>,
     purpose: Purpose,
     config: &Config,
+    held: impl FnOnce() -> Result<BTreeSet<String>>,
 ) -> Result<KeyLabel> {
     let label = match label_arg {
         // An explicit --key names the exact label; verified against SIGNET_HANDLE below.
@@ -193,7 +240,32 @@ fn resolve_label_for(
         }
         // No --key, no SIGNET_HANDLE → the optional config default (single-PRSN native).
         None => match config_default(purpose, config) {
-            Some(cfg_label) => KeyLabel::parse(&cfg_label, Some(purpose))?,
+            Some(cfg_label) => {
+                // bug280: the default is refused on a host holding more than one PRSN
+                // identity. The list only refuses; it never selects.
+                let p = purpose.as_str();
+                let handles = held().map_err(|mut e| {
+                    e.message = format!(
+                        "could not list this host's PRSN identities, so default_{p}_key is \
+                         not used: {}. Set SIGNET_HANDLE or pass --key <handle>-{p}.",
+                        e.message
+                    );
+                    e
+                })?;
+                if handles.len() > 1 {
+                    return Err(CliError::invalid_args(format!(
+                        "this host holds more than one PRSN identity ({}), so default_{p}_key \
+                         is not used: set SIGNET_HANDLE (the handle your harness injects) or \
+                         pass --key <handle>-{p}; `signet` never guesses which PRSN you are.",
+                        handles
+                            .iter()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+                KeyLabel::parse(&cfg_label, Some(purpose))?
+            }
             None => {
                 return Err(CliError::invalid_args(format!(
                     "no identity to act as: set SIGNET_HANDLE (the handle your harness injects), \
@@ -240,7 +312,7 @@ pub fn fingerprint(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
-    let label = resolve_label(key, purpose, config)?;
+    let label = resolve_label(keystore, key, purpose, config)?;
     let meta = keystore.meta(&label)?;
     if json {
         out.print_json(&serde_json::json!({
@@ -263,7 +335,7 @@ pub fn pubkey(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
-    let label = resolve_label(key, purpose, config)?;
+    let label = resolve_label(keystore, key, purpose, config)?;
     let pk = keystore.meta(&label)?.public_key;
     // PQ keys are raw FIPS bytes (an ML-DSA-87 vk / an ML-KEM-1024 ek) — no
     // SPKI/JWK form exists for them in v1; `raw` (or the default) emits the
@@ -530,7 +602,7 @@ pub fn sign(
     dual: bool,
     config: &Config,
 ) -> Result<()> {
-    let label = resolve_label(key, Purpose::Signing, config)?;
+    let label = resolve_label(keystore, key, Purpose::Signing, config)?;
     let message = decode_sign_input(&read_input(in_path)?, input_format)?;
     if message.len() > SIGN_INPUT_MAX {
         return Err(CliError::invalid_args("input exceeds the 1 MB sign limit"));
@@ -729,7 +801,7 @@ pub fn decrypt(
     config: &Config,
 ) -> Result<()> {
     let file_id = parse_uuid16(aad_file_id)?;
-    let label = resolve_label(key, Purpose::Kem, config)?;
+    let label = resolve_label(keystore, key, Purpose::Kem, config)?;
     let ciphertext = read_input(Some(in_path))?;
     let envelope: Value = read_json_arg(wrap_envelope, "wrap envelope")?;
     let dek = unwrap_dek_value(keystore, &envelope, &label)?;
@@ -761,7 +833,7 @@ pub fn rewrap(
     key: Option<&str>,
     config: &Config,
 ) -> Result<()> {
-    let label = resolve_label(key, Purpose::Kem, config)?;
+    let label = resolve_label(keystore, key, Purpose::Kem, config)?;
     let envelope: Value = read_json_arg(wrap_envelope_in, "wrap envelope")?;
     // The standalone command takes explicit --to-pubkey / --to-pq-pubkey
     // recipient keys (no directory bundle exists offline). Mandatory hybrid
@@ -835,7 +907,7 @@ fn unwrap_metadata_key(
     key: Option<&str>,
     config: &Config,
 ) -> Result<Zeroizing<[u8; 32]>> {
-    let label = resolve_label(key, Purpose::Kem, config)?;
+    let label = resolve_label(keystore, key, Purpose::Kem, config)?;
     let value: Value = read_json_arg(metadata_key_wrap, "metadata-key wrap envelope")?;
     unwrap_metadata_key_envelope(keystore, &value, root, &label)
 }
@@ -1606,7 +1678,7 @@ fn transparency_verify_self_once(
 ) -> Result<()> {
     use crate::anchors::{EpochVerdict, LogMode};
 
-    let label = resolve_label(key, Purpose::Signing, config)?;
+    let label = resolve_label(keystore, key, Purpose::Signing, config)?;
     let me = http::get_json_signed(keystore, &label, server_url, "/v1/me")?;
     let account_id = me
         .get("account_id")
@@ -2179,7 +2251,7 @@ pub fn audit(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
-    let label = resolve_label(key, Purpose::Signing, config)?;
+    let label = resolve_label(keystore, key, Purpose::Signing, config)?;
     let mut path = format!("/v1/me/audit?limit={limit}");
     if let Some(s) = since {
         path.push_str(&format!("&since={s}"));
@@ -2252,7 +2324,7 @@ pub fn whoami(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
-    let label = resolve_label(key, Purpose::Signing, config)?;
+    let label = resolve_label(keystore, key, Purpose::Signing, config)?;
     let me = http::get_json_signed(keystore, &label, server_url, "/v1/me")?;
     out.print_json(&shape_whoami(&me))
 }
@@ -2299,7 +2371,7 @@ pub fn quota(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
-    let label = resolve_label(key, Purpose::Signing, config)?;
+    let label = resolve_label(keystore, key, Purpose::Signing, config)?;
     let q = http::get_json_signed(keystore, &label, server_url, "/v1/me/quota")?;
     out.print_json(&shape_quota(&q)?)
 }
@@ -2346,8 +2418,8 @@ pub fn folder_list(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
-    let signing = resolve_label(signing_key, Purpose::Signing, config)?;
-    let kem = resolve_label(kem_key, Purpose::Kem, config)?;
+    let signing = resolve_label(keystore, signing_key, Purpose::Signing, config)?;
+    let kem = resolve_label(keystore, kem_key, Purpose::Kem, config)?;
     let mut resolver = Resolver::new(keystore, &signing, &kem, server_url);
 
     let parent = match (path, parent_id) {
@@ -2399,8 +2471,8 @@ pub fn file_list(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
-    let signing = resolve_label(signing_key, Purpose::Signing, config)?;
-    let kem = resolve_label(kem_key, Purpose::Kem, config)?;
+    let signing = resolve_label(keystore, signing_key, Purpose::Signing, config)?;
+    let kem = resolve_label(keystore, kem_key, Purpose::Kem, config)?;
     let mut resolver = Resolver::new(keystore, &signing, &kem, server_url);
 
     let (folder, root) = match (path, folder_id) {
@@ -2719,8 +2791,8 @@ pub fn share_create(
     if name.len() > 255 {
         return Err(CliError::name_too_long("name exceeds 255 bytes"));
     }
-    let signing_label = resolve_label(signing_key, Purpose::Signing, config)?;
-    let kem_label = resolve_label(kem_key, Purpose::Kem, config)?;
+    let signing_label = resolve_label(keystore, signing_key, Purpose::Signing, config)?;
+    let kem_label = resolve_label(keystore, kem_key, Purpose::Kem, config)?;
 
     // A top-level share folder is its own root.
     let folder_id = Uuid::new_v4();
@@ -2811,8 +2883,8 @@ pub fn folder_create(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
-    let signing_label = resolve_label(signing_key, Purpose::Signing, config)?;
-    let kem_label = resolve_label(kem_key, Purpose::Kem, config)?;
+    let signing_label = resolve_label(keystore, signing_key, Purpose::Signing, config)?;
+    let kem_label = resolve_label(keystore, kem_key, Purpose::Kem, config)?;
 
     // Determine (parent, new_name): a <path>'s last segment is the new name and the
     // rest is the parent; otherwise --name (+ optional --parent-id/--root-folder-id).
@@ -3033,8 +3105,8 @@ pub fn folder_rename(
     if new_name.len() > 255 {
         return Err(CliError::name_too_long("name exceeds 255 bytes"));
     }
-    let signing = resolve_label(signing_key, Purpose::Signing, config)?;
-    let kem = resolve_label(kem_key, Purpose::Kem, config)?;
+    let signing = resolve_label(keystore, signing_key, Purpose::Signing, config)?;
+    let kem = resolve_label(keystore, kem_key, Purpose::Kem, config)?;
     let mut resolver = Resolver::new(keystore, &signing, &kem, server_url);
     let (fid, root) = resolve_folder_target(&mut resolver, path, folder_id, root_folder_id)?;
     let metadata_key = resolver.metadata_key(root)?;
@@ -3074,8 +3146,8 @@ pub fn file_rename(
     if new_name.len() > 255 {
         return Err(CliError::name_too_long("name exceeds 255 bytes"));
     }
-    let signing = resolve_label(signing_key, Purpose::Signing, config)?;
-    let kem = resolve_label(kem_key, Purpose::Kem, config)?;
+    let signing = resolve_label(keystore, signing_key, Purpose::Signing, config)?;
+    let kem = resolve_label(keystore, kem_key, Purpose::Kem, config)?;
     let mut resolver = Resolver::new(keystore, &signing, &kem, server_url);
     let (fid, root) = resolve_file_target(&mut resolver, path, file_id, root_folder_id)?;
     let metadata_key = resolver.metadata_key(root)?;
@@ -3114,8 +3186,8 @@ pub fn folder_move(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
-    let signing = resolve_label(signing_key, Purpose::Signing, config)?;
-    let kem = resolve_label(kem_key, Purpose::Kem, config)?;
+    let signing = resolve_label(keystore, signing_key, Purpose::Signing, config)?;
+    let kem = resolve_label(keystore, kem_key, Purpose::Kem, config)?;
     let mut resolver = Resolver::new(keystore, &signing, &kem, server_url);
     let (fid, _root) = resolve_folder_target(&mut resolver, path, folder_id, None)?;
     let dest = resolve_dest_folder(&mut resolver, to, to_parent_id, "--to-parent-id")?;
@@ -3148,8 +3220,8 @@ pub fn file_move(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
-    let signing = resolve_label(signing_key, Purpose::Signing, config)?;
-    let kem = resolve_label(kem_key, Purpose::Kem, config)?;
+    let signing = resolve_label(keystore, signing_key, Purpose::Signing, config)?;
+    let kem = resolve_label(keystore, kem_key, Purpose::Kem, config)?;
     let mut resolver = Resolver::new(keystore, &signing, &kem, server_url);
     let fid = resolve_file_id(&mut resolver, path, file_id)?;
     let dest = resolve_dest_folder(&mut resolver, to, to_folder_id, "--to-folder-id")?;
@@ -3223,8 +3295,8 @@ pub fn folder_delete(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
-    let signing = resolve_label(signing_key, Purpose::Signing, config)?;
-    let kem = resolve_label(kem_key, Purpose::Kem, config)?;
+    let signing = resolve_label(keystore, signing_key, Purpose::Signing, config)?;
+    let kem = resolve_label(keystore, kem_key, Purpose::Kem, config)?;
     let mut resolver = Resolver::new(keystore, &signing, &kem, server_url);
     let mut ids: Vec<Uuid> = Vec::new();
     for p in paths {
@@ -3248,8 +3320,8 @@ pub fn file_delete(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
-    let signing = resolve_label(signing_key, Purpose::Signing, config)?;
-    let kem = resolve_label(kem_key, Purpose::Kem, config)?;
+    let signing = resolve_label(keystore, signing_key, Purpose::Signing, config)?;
+    let kem = resolve_label(keystore, kem_key, Purpose::Kem, config)?;
     let mut resolver = Resolver::new(keystore, &signing, &kem, server_url);
     let mut ids: Vec<Uuid> = Vec::new();
     for p in paths {
@@ -3335,8 +3407,8 @@ pub fn upload(
             "--chunk-size must be between 1 and 2147483647 bytes",
         ));
     }
-    let signing_label = resolve_label(signing_key, Purpose::Signing, config)?;
-    let kem_label = resolve_label(kem_key, Purpose::Kem, config)?;
+    let signing_label = resolve_label(keystore, signing_key, Purpose::Signing, config)?;
+    let kem_label = resolve_label(keystore, kem_key, Purpose::Kem, config)?;
 
     // Destination: a positional <path> carries folder AND name (its last segment —
     // the same split as `folder create`; S040 path-first, Bug034). Otherwise
@@ -4514,8 +4586,8 @@ pub fn download(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
-    let signing_label = resolve_label(signing_key, Purpose::Signing, config)?;
-    let kem_label = resolve_label(kem_key, Purpose::Kem, config)?;
+    let signing_label = resolve_label(keystore, signing_key, Purpose::Signing, config)?;
+    let kem_label = resolve_label(keystore, kem_key, Purpose::Kem, config)?;
 
     // bug050 rider: no idle sleep while a (possibly hours-long) download runs.
     let _awake = crate::power::TransferAssertion::hold();
@@ -5145,7 +5217,7 @@ pub fn recipient(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
-    let signing = resolve_label(signing_key, Purpose::Signing, config)?;
+    let signing = resolve_label(keystore, signing_key, Purpose::Signing, config)?;
     let (_pubkey, resp) = resolve_recipient_pubkey(keystore, &signing, server_url, handle)?;
     out.print_json(&resp)
 }
@@ -5226,8 +5298,8 @@ pub fn share_list(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
-    let signing = resolve_label(signing_key, Purpose::Signing, config)?;
-    let kem = resolve_label(kem_key, Purpose::Kem, config)?;
+    let signing = resolve_label(keystore, signing_key, Purpose::Signing, config)?;
+    let kem = resolve_label(keystore, kem_key, Purpose::Kem, config)?;
     // bug130 (F-12): `share list` shows folders shared WITH me, which now has its own path.
     let resp = http::get_json_signed(keystore, &signing, server_url, "/v1/shared-with-me")?;
     let folders = resp
@@ -5266,8 +5338,8 @@ pub fn share_recipients(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
-    let signing = resolve_label(signing_key, Purpose::Signing, config)?;
-    let kem = resolve_label(kem_key, Purpose::Kem, config)?;
+    let signing = resolve_label(keystore, signing_key, Purpose::Signing, config)?;
+    let kem = resolve_label(keystore, kem_key, Purpose::Kem, config)?;
     let mut resolver = Resolver::new(keystore, &signing, &kem, server_url);
     let (folder, _root) = resolve_folder_target(&mut resolver, path, folder_id, None)?;
 
@@ -5330,7 +5402,7 @@ pub fn share_preview(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
-    let signing = resolve_label(signing_key, Purpose::Signing, config)?;
+    let signing = resolve_label(keystore, signing_key, Purpose::Signing, config)?;
     let resp = http::get_json_signed(
         keystore,
         &signing,
@@ -5351,7 +5423,7 @@ pub fn share_accept(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
-    let signing = resolve_label(signing_key, Purpose::Signing, config)?;
+    let signing = resolve_label(keystore, signing_key, Purpose::Signing, config)?;
     let text = http::post_signed(
         keystore,
         &signing,
@@ -5380,8 +5452,8 @@ pub fn share_invitations(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
-    let signing = resolve_label(signing_key, Purpose::Signing, config)?;
-    let kem = resolve_label(kem_key, Purpose::Kem, config)?;
+    let signing = resolve_label(keystore, signing_key, Purpose::Signing, config)?;
+    let kem = resolve_label(keystore, kem_key, Purpose::Kem, config)?;
     let mut resolver = Resolver::new(keystore, &signing, &kem, server_url);
     let (folder, _root) = resolve_folder_target(&mut resolver, path, folder_id, None)?;
 
@@ -5442,8 +5514,8 @@ pub fn share_cancel_invite(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
-    let signing = resolve_label(signing_key, Purpose::Signing, config)?;
-    let kem = resolve_label(kem_key, Purpose::Kem, config)?;
+    let signing = resolve_label(keystore, signing_key, Purpose::Signing, config)?;
+    let kem = resolve_label(keystore, kem_key, Purpose::Kem, config)?;
     let mut resolver = Resolver::new(keystore, &signing, &kem, server_url);
     let (folder, _root) = resolve_folder_target(&mut resolver, path, folder_id, None)?;
     let iid = parse_uuid_arg(invitation_id, "--invitation-id")?;
@@ -5475,8 +5547,8 @@ pub fn share_remove(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
-    let signing = resolve_label(signing_key, Purpose::Signing, config)?;
-    let kem = resolve_label(kem_key, Purpose::Kem, config)?;
+    let signing = resolve_label(keystore, signing_key, Purpose::Signing, config)?;
+    let kem = resolve_label(keystore, kem_key, Purpose::Kem, config)?;
     let mut resolver = Resolver::new(keystore, &signing, &kem, server_url);
     let (folder, _root) = resolve_folder_target(&mut resolver, path, folder_id, None)?;
     let rid = parse_uuid_arg(recipient_id, "--recipient-id")?;
@@ -5507,8 +5579,8 @@ pub fn share_leave(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
-    let signing = resolve_label(signing_key, Purpose::Signing, config)?;
-    let kem = resolve_label(kem_key, Purpose::Kem, config)?;
+    let signing = resolve_label(keystore, signing_key, Purpose::Signing, config)?;
+    let kem = resolve_label(keystore, kem_key, Purpose::Kem, config)?;
     let mut resolver = Resolver::new(keystore, &signing, &kem, server_url);
     let (folder, _root) = resolve_folder_target(&mut resolver, path, folder_id, None)?;
     http::post_signed(
@@ -5567,8 +5639,8 @@ pub fn share_invite(
     config: &Config,
     out: &OutputMode,
 ) -> Result<()> {
-    let signing = resolve_label(signing_key, Purpose::Signing, config)?;
-    let kem = resolve_label(kem_key, Purpose::Kem, config)?;
+    let signing = resolve_label(keystore, signing_key, Purpose::Signing, config)?;
+    let kem = resolve_label(keystore, kem_key, Purpose::Kem, config)?;
     let mut resolver = Resolver::new(keystore, &signing, &kem, server_url);
 
     // The share folder (its own root) + the recipient's verified hybrid bundle
@@ -5827,10 +5899,28 @@ mod tests {
         }
     }
 
+    /// The PRSN handles a test's host holds, as the keystore list would give them (bug280).
+    fn holds(handles: &'static [&'static str]) -> impl FnOnce() -> Result<BTreeSet<String>> {
+        move || Ok(handles.iter().map(|h| h.to_string()).collect())
+    }
+
+    /// For a route that must never list the keystore: `--key`, `SIGNET_HANDLE`, or no
+    /// config default. Calling it fails the test.
+    fn not_listed() -> Result<BTreeSet<String>> {
+        panic!("the keystore was listed on a route that must not consult it")
+    }
+
     #[test]
     fn resolver_explicit_key_wins_without_a_handle() {
         let cfg = cfg_defaults(None, None);
-        let l = resolve_label_for(None, Some("hlin-ai-signing"), Purpose::Signing, &cfg).unwrap();
+        let l = resolve_label_for(
+            None,
+            Some("hlin-ai-signing"),
+            Purpose::Signing,
+            &cfg,
+            not_listed,
+        )
+        .unwrap();
         assert_eq!(l.full(), "hlin-ai-signing");
     }
 
@@ -5838,13 +5928,13 @@ mod tests {
     fn resolver_signet_handle_derives_both_labels() {
         let cfg = cfg_defaults(None, None);
         assert_eq!(
-            resolve_label_for(Some("mira-ai"), None, Purpose::Signing, &cfg)
+            resolve_label_for(Some("mira-ai"), None, Purpose::Signing, &cfg, not_listed)
                 .unwrap()
                 .full(),
             "mira-ai-signing"
         );
         assert_eq!(
-            resolve_label_for(Some("mira-ai"), None, Purpose::Kem, &cfg)
+            resolve_label_for(Some("mira-ai"), None, Purpose::Kem, &cfg, not_listed)
                 .unwrap()
                 .full(),
             "mira-ai-kem"
@@ -5857,7 +5947,7 @@ mod tests {
         // harness-asserted handle (SIGNET_HANDLE is authoritative).
         let cfg = cfg_defaults(Some("zain-ai-signing"), None);
         assert_eq!(
-            resolve_label_for(Some("mira-ai"), None, Purpose::Signing, &cfg)
+            resolve_label_for(Some("mira-ai"), None, Purpose::Signing, &cfg, not_listed)
                 .unwrap()
                 .full(),
             "mira-ai-signing"
@@ -5868,13 +5958,13 @@ mod tests {
     fn resolver_uses_config_default_when_no_handle() {
         let cfg = cfg_defaults(Some("hlin-ai-signing"), Some("hlin-ai-kem"));
         assert_eq!(
-            resolve_label_for(None, None, Purpose::Signing, &cfg)
+            resolve_label_for(None, None, Purpose::Signing, &cfg, holds(&["hlin-ai"]))
                 .unwrap()
                 .full(),
             "hlin-ai-signing"
         );
         assert_eq!(
-            resolve_label_for(None, None, Purpose::Kem, &cfg)
+            resolve_label_for(None, None, Purpose::Kem, &cfg, holds(&["hlin-ai"]))
                 .unwrap()
                 .full(),
             "hlin-ai-kem"
@@ -5886,7 +5976,7 @@ mod tests {
         // No --key, no SIGNET_HANDLE, no config default → an actionable refusal naming
         // SIGNET_HANDLE, never a silent pick.
         let cfg = cfg_defaults(None, None);
-        let err = resolve_label_for(None, None, Purpose::Signing, &cfg).unwrap_err();
+        let err = resolve_label_for(None, None, Purpose::Signing, &cfg, not_listed).unwrap_err();
         assert_eq!(err.exit_code, 2);
         assert_eq!(err.code, "invalid_arguments");
         assert!(err.message.contains("SIGNET_HANDLE"));
@@ -5902,6 +5992,7 @@ mod tests {
             Some("zain-ai-signing"),
             Purpose::Signing,
             &cfg,
+            not_listed,
         )
         .unwrap_err();
         assert_eq!(err.exit_code, 61);
@@ -5912,8 +6003,14 @@ mod tests {
     #[test]
     fn resolver_cross_check_passes_when_key_handle_matches_signet_handle() {
         let cfg = cfg_defaults(None, None);
-        let l =
-            resolve_label_for(Some("mira-ai"), Some("mira-ai-kem"), Purpose::Kem, &cfg).unwrap();
+        let l = resolve_label_for(
+            Some("mira-ai"),
+            Some("mira-ai-kem"),
+            Purpose::Kem,
+            &cfg,
+            not_listed,
+        )
+        .unwrap();
         assert_eq!(l.full(), "mira-ai-kem");
     }
 
@@ -5922,8 +6019,139 @@ mod tests {
         // A SIGNET_HANDLE that isn't a valid PRSN handle (no `-ai`) → an actionable arg
         // error, not a panic or a silent miss.
         let cfg = cfg_defaults(None, None);
-        let err = resolve_label_for(Some("not-a-prsn"), None, Purpose::Signing, &cfg).unwrap_err();
+        let err = resolve_label_for(Some("not-a-prsn"), None, Purpose::Signing, &cfg, not_listed)
+            .unwrap_err();
         assert_eq!(err.exit_code, 2);
+    }
+
+    // ── bug280: the config default is refused on a multi-identity host ──────────────
+    // The list only refuses; it never selects (Chris: refuse; Gus's shape).
+
+    #[test]
+    fn resolver_refuses_the_config_default_when_the_host_holds_two_identities() {
+        let cfg = cfg_defaults(Some("hlin-ai-signing"), Some("hlin-ai-kem"));
+        for purpose in [Purpose::Signing, Purpose::Kem] {
+            let err = resolve_label_for(None, None, purpose, &cfg, holds(&["gus-ai", "hlin-ai"]))
+                .unwrap_err();
+            assert_eq!(err.exit_code, 2);
+            assert_eq!(err.code, "invalid_arguments");
+            assert!(
+                err.message.contains("gus-ai") && err.message.contains("hlin-ai"),
+                "the refusal names the handles: {}",
+                err.message
+            );
+            assert!(err.message.contains("SIGNET_HANDLE"), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn resolver_keeps_the_config_default_on_a_single_identity_host() {
+        let cfg = cfg_defaults(Some("hlin-ai-signing"), None);
+        let l = resolve_label_for(None, None, Purpose::Signing, &cfg, holds(&["hlin-ai"])).unwrap();
+        assert_eq!(l.full(), "hlin-ai-signing");
+    }
+
+    #[test]
+    fn resolver_signet_handle_acts_on_a_two_identity_host_without_listing() {
+        let cfg = cfg_defaults(Some("hlin-ai-signing"), None);
+        let l =
+            resolve_label_for(Some("gus-ai"), None, Purpose::Signing, &cfg, not_listed).unwrap();
+        assert_eq!(l.full(), "gus-ai-signing");
+    }
+
+    #[test]
+    fn resolver_explicit_key_acts_on_a_two_identity_host_without_listing() {
+        let cfg = cfg_defaults(Some("hlin-ai-signing"), None);
+        let l = resolve_label_for(
+            None,
+            Some("gus-ai-signing"),
+            Purpose::Signing,
+            &cfg,
+            not_listed,
+        )
+        .unwrap();
+        assert_eq!(l.full(), "gus-ai-signing");
+    }
+
+    #[test]
+    fn resolver_refuses_the_config_default_when_the_list_fails() {
+        let cfg = cfg_defaults(Some("hlin-ai-signing"), None);
+        let err = resolve_label_for(None, None, Purpose::Signing, &cfg, || {
+            Err(CliError::generic(
+                "Secure Enclave key list: planted failure",
+            ))
+        })
+        .unwrap_err();
+        assert!(
+            err.message.contains("default_signing_key is not used")
+                && err.message.contains("planted failure"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn held_handles_counts_each_prsn_once_and_drives_the_refusal() {
+        // A real (software) keystore: one PRSN's two keys are one handle; a second
+        // PRSN's key makes two, and the config default is then refused.
+        let dir =
+            std::env::temp_dir().join(format!("signet-held-handles-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ks = crate::keystore::SoftwareKeystore::open(dir.clone()).expect("open keystore");
+        let cfg = cfg_defaults(Some("hlin-ai-signing"), None);
+        for l in ["hlin-ai-signing", "hlin-ai-kem"] {
+            let label = KeyLabel::parse(l, None).expect("label");
+            ks.generate(&label, label.purpose().default_alg())
+                .expect("generate");
+        }
+        let one: Vec<String> = held_handles(&ks).unwrap().into_iter().collect();
+        assert_eq!(one, ["hlin-ai"]);
+        let l =
+            resolve_label_for(None, None, Purpose::Signing, &cfg, || held_handles(&ks)).unwrap();
+        assert_eq!(l.full(), "hlin-ai-signing");
+
+        let gus = KeyLabel::parse("gus-ai-signing", None).expect("label");
+        ks.generate(&gus, gus.purpose().default_alg())
+            .expect("generate");
+        let two: Vec<String> = held_handles(&ks).unwrap().into_iter().collect();
+        assert_eq!(two, ["gus-ai", "hlin-ai"]);
+        let err = resolve_label_for(None, None, Purpose::Signing, &cfg, || held_handles(&ks))
+            .unwrap_err();
+        assert_eq!(err.code, "invalid_arguments");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_label_lists_the_keystore_it_is_given() {
+        // The wiring every caller uses (Bob's B.26 on PR B): the keystore handed in is the
+        // one listed. One identity keeps the default; a second makes the same call refuse;
+        // the harness's handle through the same wiring still acts.
+        let dir =
+            std::env::temp_dir().join(format!("signet-resolve-wiring-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ks = crate::keystore::SoftwareKeystore::open(dir.clone()).expect("open keystore");
+        let cfg = cfg_defaults(Some("hlin-ai-signing"), None);
+        let hlin = KeyLabel::parse("hlin-ai-signing", None).expect("label");
+        ks.generate(&hlin, hlin.purpose().default_alg())
+            .expect("generate");
+        let l = resolve_label_with(None, &ks, None, Purpose::Signing, &cfg).unwrap();
+        assert_eq!(l.full(), "hlin-ai-signing");
+
+        let gus = KeyLabel::parse("gus-ai-signing", None).expect("label");
+        ks.generate(&gus, gus.purpose().default_alg())
+            .expect("generate");
+        let err = resolve_label_with(None, &ks, None, Purpose::Signing, &cfg).unwrap_err();
+        assert_eq!(err.exit_code, 2);
+        assert!(
+            err.message.contains("gus-ai") && err.message.contains("hlin-ai"),
+            "{}",
+            err.message
+        );
+        let l = resolve_label_with(Some("gus-ai"), &ks, None, Purpose::Signing, &cfg).unwrap();
+        assert_eq!(l.full(), "gus-ai-signing");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

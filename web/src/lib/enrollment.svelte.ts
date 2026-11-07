@@ -32,7 +32,7 @@ import { browserGateway } from './webauthn';
  *  wording matches the agent-side CLI's equivalent message. */
 function friendlyEnrollError(error: unknown): string {
   if (error instanceof SignetApiError && error.code === 'not_found') {
-    return 'This enrollment expired — start over from + Add PRSN.';
+    return 'This enrollment expired — start over from + Add account.';
   }
   return friendlyCeremonyError(error);
 }
@@ -117,15 +117,15 @@ export class EnrollmentStore {
           return;
         case 'expired':
           this.phase = 'confirm';
-          this.error = 'This enrollment expired — start over from + Add PRSN.';
+          this.error = 'This enrollment expired — start over from + Add account.';
           return;
         case 'cancelled':
           this.phase = 'confirm';
-          this.error = 'This enrollment was cancelled — start over from + Add PRSN.';
+          this.error = 'This enrollment was cancelled — start over from + Add account.';
           return;
         case 'failed':
           this.phase = 'confirm';
-          this.error = 'This enrollment failed — start over from + Add PRSN.';
+          this.error = 'This enrollment failed — start over from + Add account.';
           return;
         default:
           // 'pending' — the ordinary fresh flow.
@@ -186,13 +186,13 @@ export class EnrollmentStore {
           this.phase = 'approve';
           return; // stop polling — the human approves next
         case 'expired':
-          this.fail('This enrollment expired. Start over from Add PRSN.');
+          this.fail('This enrollment expired. Start over from + Add account.');
           return;
         case 'cancelled':
           this.fail('This enrollment was cancelled.');
           return;
         case 'failed':
-          this.fail('This enrollment failed. Start over from Add PRSN.');
+          this.fail('This enrollment failed. Start over from + Add account.');
           return;
         default:
           // pending / confirmed — keep waiting.
