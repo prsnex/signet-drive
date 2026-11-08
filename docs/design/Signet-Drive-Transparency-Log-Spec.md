@@ -4,7 +4,7 @@
 
 This document specifies the public key transparency log that supports Signet Drive's verifiable trust posture. It is a load-bearing component of the trust model. Passive zero-access comes from cryptography. Verifiable trust comes from open source, reproducible builds, this transparency log, and community watchers.
 
-This is the public edition of the specification of record. It is regenerated when the mechanism changes, and substantive changes are noted in release notes. This edition describes the log through its second epoch.
+This is the public edition of the specification of record. It is regenerated when the mechanism changes, and substantive changes are noted in release notes. This edition describes the log through its second epoch, and how a server installed on release 1.1.0 or later starts in epoch 2 with no epoch 1 entries at all (section 3.8).
 
 **Reference points.**
 
@@ -52,14 +52,16 @@ The log is stored in two PostgreSQL tables.
 
 From the second epoch the entries table lives in its own schema, owned by an administrative role that the application never connects as. The application holds the right to read and to insert, and nothing else. Database triggers are a second layer. They refuse any update or delete of an entry in the second epoch or later, any update that would move an entry into one, and any truncation. These are defense-in-depth measures. The cryptographic guarantee comes from the Merkle hash chain and the public root commits.
 
+**After the contract (release 1.1.0).** An operator step removes the account identifier column from the entries table, with its foreign key and its index, and re-adds the account field check without it. The migrations of a new installation still create the column, null in every entry of the second epoch and later under that check, until the operator runs the step. The server's code never reads or writes the column either way.
+
 ### 3.2 Entry format
 
 | Field | Type | Description |
 |---|---|---|
-| `epoch` | integer | The epoch the entry belongs to (section 3.8). Entries before the first cut are epoch 1. |
+| `epoch` | integer | The epoch the entry belongs to (section 3.8). Epoch 1 holds the entries a log had before its first cut. A log that began on release 1.1.0 or later has none (section 3.8). |
 | `entry_id` | integer | 1-based position within its epoch. |
 | `entry_version` | integer | The canonical-bytes rule for this entry. 1, 2 or 3. |
-| `account_id` | UUID | Whose key. Present for epoch 1 entries other than the hybrid checkpoint. Null from epoch 2. |
+| `account_id` | UUID | Whose key, in epoch 1 only, other than the hybrid checkpoint. From epoch 2 no entry stores or serves an account identifier. The identifier is only the input to the VRF index (section 3.8), and after the contract the column is gone (section 3.1). |
 | `account_index` | 64 bytes | The account's VRF index (section 3.8). Present from epoch 2. Null for a genesis entry. |
 | `key_purpose` | string | `signing`, `kem`, `signing_pq`, `kem_pq`, or `epoch`. |
 | `algorithm` | string | `ES256`, `ECDH-ES+A256KW`, `ML-DSA-87`, `ML-KEM-1024`, and similar identifiers. |
@@ -165,6 +167,8 @@ Deltas from v1, each load-bearing.
 
 The log is a sequence of **epochs**. Each epoch is its own chain and its own Merkle tree, with entries `1..=size` within the epoch, its own roots, and its own proofs. Epoch 1 is the log as it stood before the first cut. From epoch 2 every entry is **v3**.
 
+**The empty root.** An epoch with no entries has size 0 and the root `SHA-256("")`, which is `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`, the RFC 6962 hash of the empty list. This specification uses that one definition throughout.
+
 **Why epochs exist.** In epoch 1 an entry names its account by the account identifier. When an account is deleted, an entry that names it cannot be deleted without breaking the hash chain, and cannot be kept without keeping the identifier. The second epoch resolves this. From epoch 2 an entry names its account by a **VRF account index**. The index is the output of a verifiable random function over a fixed framing of the account identifier under the epoch's VRF key. The suite is ECVRF-RISTRETTO255-SHA512, specified at c2sp.org/vrf-r255, which is RFC 9381's ECVRF construction over the RFC 9496 ristretto255 group. The VRF input is not the bare identifier. It is the domain string, a zero byte, and the 16 raw bytes of the account identifier, so that a proof made for the log's index can never be presented as a VRF value for any other use of the key.
 
 ```
@@ -207,6 +211,10 @@ So the boundary lives in the chain. A client accepts an epoch only when the publ
 
 **The cut.** An epoch cut is an operator procedure with four steps in a fixed order. First, epoch N is built, with its genesis and every live key re-logged, and not yet served. Second, the end line of epoch N minus 1 and the VRF key of epoch N are published (section 5.2). Third, the operator waits out the anchor files' cache window, and the server begins to serve epoch N. Fourth, the rows of epoch N minus 1 are deleted. A retired epoch stays on the public record through its end line, its root tags, and its successor's genesis.
 
+**First boot (release 1.1.0).** On a log that has never held an entry, the server opens epoch 2 at boot, before it logs its own keys. The genesis binds epoch 1's empty end state, size 0 and the empty root, and a fresh VRF key. The epoch is built and served in one transaction under the append lock, so the server never runs in epoch 1. There is no cut and nothing to delete, and epoch 1 never holds an entry. The anchor lines follow at the publisher's next run (section 5.2). Serving before those lines exist is the one exception to the order in which a cut serves an epoch.
+
+**Epoch 1 takes no entries (release 1.1.0).** An append into epoch 1 is refused. A server that finds entries in epoch 1 and no later epoch, for example a backup from before the first cut restored onto release 1.1.0, refuses to start. Such a log is cut to epoch 2 first, with the previous release, because the cut builds on epoch 1's last committed root, which a running server commits.
+
 **Receipts for v3 entries.** The receipt of a v3 entry has the v2 receipt shape, with `epoch` and `account_index` present and no `account_id`. It is built and signed once at insert and stored whole, and it is served as stored. `"v"` names the receipt's object shape and `entry_version` the entry's canonical-bytes rule.
 
 **Binding a key to an account from epoch 2.** A client that binds a key to an account computes the index from the account's proof, `index = VRF-verify(epoch public key, alpha(account_id), proof)` with `alpha` as above, and requires every receipt it binds to carry that `account_index` and that `epoch`. The proof is served beside every account identifier a client binds. In epoch 1 a client binds by `account_id`, as before.
@@ -227,7 +235,7 @@ A new entry is added for each of the following events.
 
 4. **PRSN attestation revocation.** No new entry. Revocation is recorded in attestation state and reflected in the verification response, with status "revoked". The transparency log records what was published. Revocation is a separate state on top.
 
-5. **Server signing key rotation.** Entries for the server's signing public keys, both halves (`signing` for ES256, `signing_pq` for ML-DSA-87), under a reserved account created at deploy time and labeled as such. A substituted server PQ verification key is therefore watcher-detectable like any other published key.
+5. **Server signing key rotation.** Entries for the server's signing public keys, both halves (`signing` for ES256, `signing_pq` for ML-DSA-87), under the reserved server account, created at deploy time. In epoch 1 that account's identifier names the entries. From epoch 2 its VRF index names them, like any other account's. A substituted server PQ verification key is therefore watcher-detectable like any other published key.
 
 6. **PRSN attestation re-issuance after revocation.** If a Guardian revokes a PRSN's attestation and issues a new one with new keys, the new keys get new entries. If the same keys are re-attested, there are no new entries.
 
@@ -257,7 +265,7 @@ This eliminates the "key in log but not yet committed" gap entirely. Verifiers d
 
 ### 4a.2 Receipt format
 
-JSON shape. The bytes-on-the-wire specification is in [Signet Drive Envelope Format](Signet-Drive-Envelope-Format.md), section 10a.
+JSON shape. The bytes-on-the-wire specification is in [Signet Drive Envelope Format](Signet-Drive-Envelope-Format.md), section 10a. This is the epoch 1 receipt, `"v": 1`. From epoch 2 the receipt is `"v": 2`. It adds `epoch`, `entry_version` and `server_pq_key_id`, and it names the account by `account_index`, the VRF index in lowercase hex, null for a genesis entry, with no `account_id` (section 3.8, receipts for v3 entries).
 
 ```json
 {
@@ -333,6 +341,8 @@ A line with no `epoch` field is epoch 1. Every later root line carries `"epoch":
 ```json
 {"epoch": 1, "epoch_end": true, "log_size": 101, "merkle_root": "<hex>", "reason": "<text>", "committed_at": "<ISO 8601>"}
 ```
+
+**The end line at a first boot.** A log that began in epoch 2 has had no cut. The publisher's first run after the boot appends epoch 1's end line at `"log_size": 0`, with the empty root of section 3.8 as its `merkle_root` and the reason `a new log: epoch 1 never held an entry`, then epoch 2's VRF key line, once each.
 
 **The VRF key file.** `vrf-keys.jsonl` carries one line per epoch from the second.
 
@@ -529,7 +539,7 @@ A watcher is any party that periodically fetches the log and the public roots an
 
 ### 7.1 Initial state
 
-The watcher remembers the most recent `(epoch, log_size, merkle_root)` triple it has verified. On first run it has none. It does not start from epoch 1 at size 0, because after a cut the server answers 410 for epoch 1 and a boundary check against an empty root would be a false alarm. Instead a first run verifies the served epoch from its genesis against the anchor files, exactly as the published `verify/verify-translog.sh` does. It downloads the whole served epoch, recomputes every entry hash and the root, checks that the roots file carries exactly one end line for the previous epoch equal to what the genesis binds and that the VRF key file carries exactly one line for the served epoch whose key hashes to the genesis payload's value, and checks that the last committed root is present in the public history. Then it records the triple.
+The watcher remembers the most recent `(epoch, log_size, merkle_root)` triple it has verified. On first run it has none. It does not start from epoch 1 at size 0, because after a cut the server answers 410 for epoch 1 and a boundary check against an empty root would be a false alarm. Instead a first run verifies the served epoch from its genesis against the anchor files, exactly as the published `verify/verify-translog.sh` does. It downloads the whole served epoch, recomputes every entry hash and the root, checks that the roots file carries exactly one end line for the previous epoch equal to what the genesis binds and that the VRF key file carries exactly one line for the served epoch whose key hashes to the genesis payload's value, and checks that the last committed root is present in the public history. Then it records the triple. On a server that began in epoch 2 (release 1.1.0) the genesis binds epoch 1's empty end state, size 0 and the empty root, and the end line says the same at size 0 (section 5.2). By mechanism the boundary check is the same as for any other genesis. A fresh installation has not yet been run against the published verifier.
 
 ### 7.2 Periodic check
 

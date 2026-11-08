@@ -21,9 +21,12 @@
 //! parameter). Requires macOS 26 (the SE-PQC floor); older macOS fails closed
 //! with `unsupported_platform`.
 //!
-//! Access policy (CLI Spec v08 §"Key storage"): `kSecAttrAccessibleWhenUnlocked-
-//! ThisDeviceOnly`, no biometry flag — usable by the macOS user's processes while
-//! the session is unlocked, with no per-use Touch ID. Keys are permanent in the
+//! Access policy (CLI Spec §"Key storage"; v1.2.0, Chris 2026-11-07): `kSecAttrAccessible-
+//! AfterFirstUnlockThisDeviceOnly`, no biometry flag — usable by the macOS user's processes
+//! from the first unlock after the Mac starts until it shuts down, locked screen or not,
+//! with no per-use Touch ID, so an always-on agent works through a locked screen. Keys made
+//! before v1.2.0 keep `WhenUnlockedThisDeviceOnly`: the class is fixed in each key at
+//! generation, and nothing re-keys. Keys are permanent in the
 //! data-protection keychain, looked up by `kSecAttrLabel` (= the `<handle>-<purpose>`
 //! label; the safe `security-framework` crate exposes set/query for `kSecAttrLabel`
 //! but not `kSecAttrApplicationTag`, so the label serves as the application handle).
@@ -50,8 +53,7 @@ use core_foundation::string::CFString;
 
 use security_framework::access_control::{ProtectionMode, SecAccessControl};
 use security_framework::item::{
-    ItemAddOptions, ItemAddValue, ItemClass, ItemSearchOptions, KeyClass, Limit, Location,
-    Reference, SearchResult,
+    ItemClass, ItemSearchOptions, KeyClass, Limit, Location, Reference, SearchResult,
 };
 use security_framework::key::{Algorithm, GenerateKeyOptions, KeyType, SecKey, Token};
 use security_framework_sys::base::errSecItemNotFound;
@@ -60,20 +62,25 @@ use super::{KeyLabel, KeyMeta, Keystore, Purpose, Tier, se_shim};
 use crate::error::{CliError, Result};
 
 /// Apple `errSecInteractionNotAllowed` (SecBase.h): the keychain/Secure Enclave
-/// refused because the macOS session is LOCKED (`kSecAttrAccessibleWhenUnlocked-
-/// ThisDeviceOnly`). Not exported by security-framework-sys.
+/// refused because the key's class is not open yet: for a key made since v1.2.0
+/// (`AfterFirstUnlockThisDeviceOnly`), the Mac has not been unlocked since it started; for
+/// an older key (`WhenUnlockedThisDeviceOnly`), the Mac is locked. Not exported by
+/// security-framework-sys.
 const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
 
 /// bug057: translate the lock-gated refusal into the *situation* instead of
-/// leaking Apple's "User interaction is not allowed." Fail-closed under lock is
-/// by design (1-Pager Resolved #8); the state is temporary and clears when a
-/// human unlocks the Mac. Exit 52 `se_locked` so a harness can branch on it.
-/// The broker runs this same keystore, so the translation reaches the
-/// broker-relayed path at the same chokepoint.
+/// leaking Apple's "User interaction is not allowed." The refusal cannot tell a key's
+/// class, so the message names both (Gus, v1.2.0): a key made since v1.2.0 answers from
+/// the first unlock after the Mac starts, an older key only while the Mac is unlocked.
+/// Either way the state is temporary and clears when a human unlocks the Mac. Exit 52
+/// `se_locked` so a harness can branch on it. The broker runs this same keystore, so the
+/// translation reaches the broker-relayed path at the same chokepoint.
 fn se_locked_err(what: impl std::fmt::Display) -> CliError {
     CliError::se_locked(format!(
-        "this Mac is locked. Secure Enclave keys are unavailable until a human \
-         unlocks it ({what} is lock-gated by design; safe to retry after unlock)"
+        "this Mac's Secure Enclave keys are unavailable until a human unlocks it: it has \
+         not been unlocked since it started, or it is locked and this key predates v1.2.0 \
+         (keys made since v1.2.0 work through a locked screen once the Mac has been \
+         unlocked after starting). {what} is gated by design; safe to retry after unlock."
     ))
 }
 
@@ -96,11 +103,15 @@ impl SecureEnclaveKeystore {
     }
 }
 
-/// The spec access policy: `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`, no
-/// access-control flags (no biometry / user-presence) — so no per-use Touch ID.
+/// The one key class, for every Secure Enclave key this client makes (the agents' P-256
+/// keys, the broker's K3, and the PQ keys' sealed-blob items through [`pq_blob_store`]):
+/// `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` (v1.2.0, Chris 2026-11-07), no
+/// access-control flags (no biometry / user-presence), so no per-use Touch ID. The shim's
+/// `suiteAccessControl()` names the same class for the PQ keys themselves;
+/// `cli/tests/key_class_consistency.rs` fails if the two ever differ.
 fn access_control() -> Result<SecAccessControl> {
     SecAccessControl::create_with_protection(
-        Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
+        Some(ProtectionMode::AccessibleAfterFirstUnlockThisDeviceOnly),
         0,
     )
     .map_err(|e| CliError::generic(format!("creating Secure Enclave access control: {e}")))
@@ -129,35 +140,65 @@ fn access_control() -> Result<SecAccessControl> {
 /// exactly ours.
 const PQ_BLOB_SERVICE: &str = "ai.prsnex.signet.se-pq";
 
-/// Store a sealed PQ key blob under `label`. Fails if the add fails (including
-/// a duplicate — callers check `exists` first, mirroring classical keygen).
+/// Store a sealed PQ key blob under `label`. Fails if the add fails, including a
+/// duplicate (`errSecDuplicateItem`): an add never replaces an existing key's blob
+/// (callers check `exists` first, mirroring classical keygen).
+///
+/// A raw `SecItemAdd`, because the item must carry the key class (v1.2.0): the crate's
+/// `ItemAddOptions` takes no class, and its `set_generic_password_options` is "creates or
+/// updates", which could silently replace a key's sealed blob. Without an explicit class
+/// the item would take the data-protection keychain's default, `WhenUnlocked`, and a
+/// locked Mac would refuse the PQ half of a hybrid while the classical half answered.
 fn pq_blob_store(label: &str, blob: &[u8]) -> Result<()> {
-    ItemAddOptions::new(ItemAddValue::Data {
-        class: ItemClass::generic_password(),
-        data: CFData::from_buffer(blob),
-    })
-    .set_location(Location::DataProtectionKeychain)
-    .set_service(PQ_BLOB_SERVICE)
-    .set_account_name(label)
-    .set_label(label)
-    .add()
-    .map_err(|e| {
-        let detail = format!("{e:?}");
-        if detail.contains("-34018") {
-            CliError::unsupported_platform(format!(
-                "storing the Secure-Enclave PQ key blob '{label}' failed: \
-                 errSecMissingEntitlement (-34018). The signet binary must be codesigned \
-                 with a provisioning-profile-authorized keychain-access-groups entitlement; \
-                 for local/dev use SIGNET_KEY_TIER=software."
-            ))
-        } else if detail_is_se_locked(&detail) {
-            se_locked_err(format_args!("storing the PQ key blob '{label}'"))
-        } else {
-            CliError::generic(format!(
-                "storing the Secure-Enclave PQ key blob '{label}': {e}"
-            ))
-        }
-    })
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::dictionary::CFMutableDictionary;
+    use security_framework_sys::base::errSecDuplicateItem;
+    use security_framework_sys::item::{
+        kSecAttrAccessControl, kSecAttrAccount, kSecAttrLabel, kSecAttrService, kSecClass,
+        kSecClassGenericPassword, kSecUseDataProtectionKeychain, kSecValueData,
+    };
+    use security_framework_sys::keychain_item::SecItemAdd;
+
+    let ac = access_control()?;
+    let service = CFString::new(PQ_BLOB_SERVICE);
+    let account = CFString::new(label);
+    let data = CFData::from_buffer(blob);
+    let mut query = CFMutableDictionary::new();
+    // SAFETY: the `kSec*` keys are Security.framework's static CFStrings; every value is a
+    // live CF object owned above, retained by the dictionary for the call's duration.
+    unsafe {
+        query.add(&kSecClass.to_void(), &kSecClassGenericPassword.to_void());
+        query.add(
+            &kSecUseDataProtectionKeychain.to_void(),
+            &CFBoolean::true_value().to_void(),
+        );
+        query.add(&kSecAttrService.to_void(), &service.to_void());
+        query.add(&kSecAttrAccount.to_void(), &account.to_void());
+        query.add(&kSecAttrLabel.to_void(), &account.to_void());
+        query.add(&kSecValueData.to_void(), &data.to_void());
+        query.add(&kSecAttrAccessControl.to_void(), &ac.to_void());
+    }
+    // SAFETY: a well-formed attribute dictionary; no result is requested.
+    let status = unsafe { SecItemAdd(query.as_concrete_TypeRef(), std::ptr::null_mut()) };
+    match status {
+        0 => Ok(()),
+        -34018 => Err(CliError::unsupported_platform(format!(
+            "storing the Secure-Enclave PQ key blob '{label}' failed: \
+             errSecMissingEntitlement (-34018). The signet binary must be codesigned \
+             with a provisioning-profile-authorized keychain-access-groups entitlement; \
+             for local/dev use SIGNET_KEY_TIER=software."
+        ))),
+        ERR_SEC_INTERACTION_NOT_ALLOWED => Err(se_locked_err(format_args!(
+            "storing the PQ key blob '{label}'"
+        ))),
+        s if s == errSecDuplicateItem => Err(CliError::generic(format!(
+            "a Secure-Enclave PQ key blob already exists under '{label}'; refusing to \
+             replace it (errSecDuplicateItem)"
+        ))),
+        other => Err(CliError::generic(format!(
+            "storing the Secure-Enclave PQ key blob '{label}': OSStatus {other}"
+        ))),
+    }
 }
 
 /// Load the sealed PQ key blob for `label`. `None` if absent.
@@ -1088,9 +1129,16 @@ mod tests {
         let e = se_locked_err("the PQ key lookup 'x-signing-pq'");
         assert_eq!(e.exit_code, 52);
         assert_eq!(e.code, "se_locked");
-        // The situation, not the mechanism: says locked + retryable, and does NOT
-        // leak Apple's wording as the primary line.
-        assert!(e.message.contains("this Mac is locked"));
+        // The situation, not the mechanism: names both gates (no unlock since start, or a
+        // locked screen with a key older than v1.2.0), names what was asked, says
+        // retryable, and does NOT leak Apple's wording as the primary line.
+        assert!(e.message.contains("until a human unlocks it"));
+        assert!(e.message.contains("not been unlocked since it started"));
+        assert!(
+            e.message
+                .contains("it is locked and this key predates v1.2.0")
+        );
+        assert!(e.message.contains("the PQ key lookup 'x-signing-pq'"));
         assert!(e.message.contains("retry after unlock"));
         assert!(!e.message.starts_with("User interaction"));
     }

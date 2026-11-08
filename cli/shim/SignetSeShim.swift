@@ -14,9 +14,11 @@
 //   is the SE-sealed `dataRepresentation` blob (opaque, useless off this device),
 //   public-key bytes, ciphertexts, signatures, and the decapsulated shared secret.
 //   Private key material never exists in extractable form on either side.
-// - Access policy matches the existing SE P-256 keys: `kSecAttrAccessibleWhen-
-//   UnlockedThisDeviceOnly`, no biometry flag (CLI Spec §"Key storage") — passed
-//   explicitly because CryptoKit's default is the weaker AfterFirstUnlock.
+// - Access policy matches the SE P-256 keys: `kSecAttrAccessibleAfterFirstUnlock-
+//   ThisDeviceOnly` since v1.2.0 (Chris, 2026-11-07), no biometry flag (CLI Spec §"Key
+//   storage"), so an always-on agent works through a locked screen once the Mac has been
+//   unlocked after starting. Passed explicitly, so the class is a decision in the code
+//   and never CryptoKit's default; keys made before v1.2.0 keep WhenUnlockedThisDeviceOnly.
 // - ML-DSA signing is HEDGED (the SE default; FIPS 204) and the context string is
 //   supplied as the FIPS 204 context PARAMETER — never prepended to the message
 //   (spec §8.7). The ≤255-byte ceiling is re-validated here (defense in depth; the
@@ -80,13 +82,14 @@ private func copyOut(
     return true
 }
 
-/// The suite access policy for SE keys: WhenUnlockedThisDeviceOnly, no
-/// biometry/user-presence flags — identical to the P-256 keys' policy
-/// (cli/src/keystore/secure_enclave.rs `access_control()`).
+/// The suite access policy for SE keys: AfterFirstUnlockThisDeviceOnly, no
+/// biometry/user-presence flags — identical to the P-256 keys' policy and the PQ blob
+/// items' (cli/src/keystore/secure_enclave.rs `access_control()`); the test
+/// cli/tests/key_class_consistency.rs fails if they ever differ.
 private func suiteAccessControl() -> SecAccessControl? {
     SecAccessControlCreateWithFlags(
         nil,
-        kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+        kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
         [],
         nil
     )

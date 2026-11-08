@@ -109,9 +109,11 @@ impl CliError {
         Self::new(51, "unsupported_platform", message)
     }
 
-    /// 52 — the Mac is locked: Secure-Enclave keys are lock-gated
-    /// (`kSecAttrAccessibleWhenUnlockedThisDeviceOnly`) and unavailable until a
-    /// human unlocks the session (bug057). Temporary and externally-clearable —
+    /// 52 — a Secure-Enclave key is lock-gated and unavailable until a human unlocks the
+    /// Mac (bug057): the Mac has not been unlocked since it started, or it is locked and the
+    /// key predates v1.2.0. Keys made since v1.2.0 are
+    /// `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` and answer through a locked screen;
+    /// older keys keep `…WhenUnlockedThisDeviceOnly`. Temporary and externally-clearable —
     /// a harness can branch "wait for unlock, then retry" off this code, the way
     /// 32 `transfer_stalled` keys retry-later on the network path.
     pub fn se_locked(message: impl Into<String>) -> Self {
