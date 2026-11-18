@@ -186,6 +186,8 @@
   "filelist_upload_menu_folder": "Folder…",
   "err_drop_not_readable": "Nothing was uploaded: this browser could not read {names} as a file or a folder.",
   "err_drop_unreadable": "Nothing was uploaded: {path} could not be read. Check it, then try again.",
+  "err_rename_name_taken": "A file named {name} is already in this folder. Nothing was renamed. Choose another name, or rename or remove that file first.",
+  "err_move_name_taken": "A file named {name} is already in that folder, or among the files you are moving. Nothing was moved. Rename one of them first.",
   "err_drop_folders_not_owner": "Nothing was uploaded: only this folder's owner can add folders here. You can still drop the files themselves.",
   "err_drop_unsupported": "This browser cannot read dropped items. Use the Upload button instead.",
   "err_folder_create_failed": "The folder {name} could not be created, so no files were uploaded. {reason}",

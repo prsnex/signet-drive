@@ -30,12 +30,13 @@
 //!    spec §8.7) and unwrap the nonce through our own keystore — the end-to-end
 //!    self-test of the whole hybrid wrap path (SE · shim · combiner · both halves) —
 //!    then `keys/pop` to reach `keys_submitted`.
-//! 5. Poll until `completed` (the human's Touch ID issues the attestation).
-//! 6. Write the optional hidden config default (no visible Kit) and report.
+//! 5. Poll until `completed` (the human's passkey approval issues the attestation).
+//! 6. Write the optional hidden config default (no visible Kit), best-effort, and report.
+//!    The step can never fail the enrollment (bug282): the server has attested the keys.
 //!
 //! The agent is **never authenticated** — it holds only the single-use `code` the
 //! human handed it and the `submit_token` it claimed; ALL authorization is the
-//! human's (their session created + confirms the enrollment, their Touch ID attests).
+//! human's (their session created + confirms the enrollment, their passkey attests).
 //! If anything fails after keygen, the just-generated keys + any partial Kit are
 //! cleaned up (orphaned-Kit cleanup, §b).
 //!
@@ -43,6 +44,7 @@
 //! Enclave. The containerized host-delegation path is a committed-v1 but gated build
 //! (Account-and-Kit §Gates), so it isn't wired in this increment.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -283,13 +285,23 @@ fn complete(
         &sig_mldsa87,
         &nonce[..],
     )?;
-    progress("submitted. Waiting for your human's Touch ID (the attestation)…");
+    progress("submitted. Waiting for your human to approve with their passkey (the attestation)…");
 
     let completed = poll_until(base, code, "completed", "the attestation")?;
     // The Kit is retired (Account-and-Kit §c): no visible folder, no `keys.pub`, no
     // `container/` record (the host-side registry is authoritative). Write at most the
-    // optional hidden config default — the single-PRSN native convenience, clobber-safe.
-    let config_path = write_default_config(base, &signing_meta, &kem_meta)?;
+    // optional hidden config default — the single-PRSN native convenience.
+    // ⛔ bug282 (Gus): no `?` here. The server has attested these keys, and an error out
+    // of `complete()` runs `cleanup_keys`, which would delete the Secure Enclave keys of a
+    // completed enrollment — irreversibly — over an optional file.
+    let config_path = write_default_config(
+        base,
+        ks,
+        handle,
+        &signing_meta,
+        &kem_meta,
+        &config::config_file_path(),
+    );
 
     Ok(EnrollResult {
         handle: handle.to_string(),
@@ -445,46 +457,156 @@ fn poll_until(base: &str, code: &str, target: &str, waiting_for: &str) -> Result
 
 // ── The optional hidden config (the Kit is retired — Account-and-Kit §c) ──────
 
-/// Write the optional, hidden per-PRSN config default (Account-and-Kit §c — the Kit is
-/// retired). At `~/.config/signet/config.toml` (the default `Config::load` location), it
-/// records the server URL + this PRSN's default key labels, so a single-PRSN native host
-/// resolves identity ambiently (no `SIGNET_HANDLE` needed). **Clobber-safe:** if a config
-/// already names a *different* PRSN's default, we don't overwrite it — that host is
-/// multi-PRSN, where `SIGNET_HANDLE` (not a shared default) is the resolution mechanism
-/// (v05 §11); we leave the existing default and return `None`. Returns the path written,
-/// or `None` when skipped. Private keys are never written here (they live in the SE).
-fn write_default_config(
-    base: &str,
-    signing_meta: &KeyMeta,
-    kem_meta: &KeyMeta,
-) -> Result<Option<PathBuf>> {
-    let existing = Config::load().ok().and_then(|c| c.default_signing_key);
-    if !should_write_default(existing.as_deref(), &signing_meta.label) {
-        progress(&format!(
-            "left this Mac's existing default ({}) in place. Set SIGNET_HANDLE to select \
-             this PRSN.",
-            existing.as_deref().unwrap_or("")
-        ));
-        return Ok(None);
-    }
-
-    let path = config::config_file_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| CliError::filesystem(format!("creating {}: {e}", parent.display())))?;
-    }
-    write_file(&path, &default_config_toml(base, signing_meta, kem_meta))?;
-    Ok(Some(path))
+/// What `enroll` does with the Mac's one shared config file (bug282). Pure; unit-tested.
+#[derive(Debug, PartialEq, Eq)]
+enum ConfigPlan {
+    /// No other agent on this Mac and no config file yet: write one (the single-agent
+    /// native convenience — the agent then resolves its identity with no `SIGNET_HANDLE`).
+    Write,
+    /// The keystore holds keys for other agents: leave the config alone, whatever it holds.
+    /// A default naming one agent is exactly what bug280 refuses on a multi-identity host.
+    OtherAgents(Vec<String>),
+    /// A config file exists: never rewrite it. Its `server_base_url` and any default in it
+    /// are the user's (bug282 condition 2).
+    Existing,
 }
 
-/// Whether `enroll` may (over)write the shared default config: yes when there is no
-/// existing default, or it already names *this* PRSN; no when a *different* PRSN owns the
-/// default (a multi-PRSN host — don't clobber; `SIGNET_HANDLE` selects there). Pure;
-/// unit-tested.
-fn should_write_default(existing_default_signing: Option<&str>, new_signing_label: &str) -> bool {
-    match existing_default_signing {
-        None => true,
-        Some(cur) => cur == new_signing_label,
+/// Decide from the handles the keystore holds and whether the file exists. `held`
+/// includes the NEW agent (its four keys exist by now), so it is excluded here — a
+/// "held is not empty" test would stop writing on every fresh single-agent Mac (Gus).
+fn plan_config(held: &BTreeSet<String>, new_handle: &str, file_exists: bool) -> ConfigPlan {
+    let others: Vec<String> = held
+        .iter()
+        .filter(|h| h.as_str() != new_handle)
+        .cloned()
+        .collect();
+    if !others.is_empty() {
+        ConfigPlan::OtherAgents(others)
+    } else if file_exists {
+        ConfigPlan::Existing
+    } else {
+        ConfigPlan::Write
+    }
+}
+
+/// Write the optional hidden config default at `path`, **best-effort**: any error (the
+/// keystore listing, the existence read, the directory, the write) prints one line and
+/// returns `None`. It never fails the enrollment (see the call site). Returns the path
+/// written, or `None` when skipped. Private keys are never written here (they live in
+/// the Secure Enclave).
+fn write_default_config(
+    base: &str,
+    ks: &dyn Keystore,
+    handle: &str,
+    signing_meta: &KeyMeta,
+    kem_meta: &KeyMeta,
+    path: &Path,
+) -> Option<PathBuf> {
+    match try_write_default_config(base, ks, handle, signing_meta, kem_meta, path) {
+        Ok(written) => written,
+        Err(e) => {
+            progress(&format!(
+                "could not set up this Mac's optional config ({}). Your enrollment is \
+                 complete. Set SIGNET_HANDLE={handle} to act as this agent.",
+                e.message
+            ));
+            None
+        }
+    }
+}
+
+fn try_write_default_config(
+    base: &str,
+    ks: &dyn Keystore,
+    handle: &str,
+    signing_meta: &KeyMeta,
+    kem_meta: &KeyMeta,
+    path: &Path,
+) -> Result<Option<PathBuf>> {
+    let held = commands::held_handles(ks)?;
+    // Existence from the path itself, never `Config::load().ok()`: that reads an
+    // unparsable file as "no default" and would have rewritten it (Gus).
+    let file_exists = match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            return Err(CliError::filesystem(format!(
+                "reading {}: {e}",
+                path.display()
+            )));
+        }
+    };
+    match plan_config(&held, handle, file_exists) {
+        ConfigPlan::OtherAgents(others) => {
+            let n = others.len();
+            progress(&format!(
+                "this Mac holds {n} other agent{}, so its shared config is left as it is. \
+                 Set SIGNET_HANDLE={handle} to act as this agent.",
+                if n == 1 { "" } else { "s" }
+            ));
+            Ok(None)
+        }
+        ConfigPlan::Existing => {
+            progress(&existing_config_line(
+                path,
+                base,
+                &signing_meta.label,
+                handle,
+            ));
+            Ok(None)
+        }
+        ConfigPlan::Write => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    CliError::filesystem(format!("creating {}: {e}", parent.display()))
+                })?;
+            }
+            // `create_new`: never replace a file that appeared after the existence read.
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|e| CliError::filesystem(format!("writing {}: {e}", path.display())))?;
+            std::io::Write::write_all(
+                &mut file,
+                default_config_toml(base, signing_meta, kem_meta).as_bytes(),
+            )
+            .map_err(|e| CliError::filesystem(format!("writing {}: {e}", path.display())))?;
+            Ok(Some(path.to_path_buf()))
+        }
+    }
+}
+
+/// The one line `enroll` prints when the config file already exists. Read only to word
+/// the line; an unreadable or unparsable file is left alone like any other.
+fn existing_config_line(path: &Path, base: &str, new_signing_label: &str, handle: &str) -> String {
+    let table: Option<toml::Table> = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let field = |k: &str| {
+        table
+            .as_ref()
+            .and_then(|t| t.get(k))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let server = field("server_base_url");
+    let default = field("default_signing_key");
+    if default.as_deref() == Some(new_signing_label) && server.as_deref() == Some(base) {
+        return "this Mac's config already names this agent.".to_string();
+    }
+    match server {
+        Some(other) if other != base => format!(
+            "left this Mac's config ({}) as it is. It names the server {other}, and this \
+             account is on {base}: set SIGNET_HANDLE={handle} and pass --server-url {base} \
+             to act as this agent.",
+            path.display()
+        ),
+        _ => format!(
+            "left this Mac's config ({}) as it is. Set SIGNET_HANDLE={handle} to act as \
+             this agent.",
+            path.display()
+        ),
     }
 }
 
@@ -584,11 +706,6 @@ fn opt_str(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(Value::as_str).map(String::from)
 }
 
-fn write_file(path: &Path, content: &str) -> Result<()> {
-    std::fs::write(path, content)
-        .map_err(|e| CliError::filesystem(format!("writing {}: {e}", path.display())))
-}
-
 fn cleanup_keys(ks: &dyn Keystore, labels: &EnrollLabels) {
     progress("cleaning up the keys from this incomplete enrollment…");
     for label in [
@@ -634,20 +751,159 @@ mod tests {
         assert_eq!(cfg.default_kem_key.as_deref(), Some("mira-ai-kem"));
     }
 
+    fn handles(hs: &[&str]) -> BTreeSet<String> {
+        hs.iter().map(|h| h.to_string()).collect()
+    }
+
     #[test]
-    fn should_write_default_only_when_absent_or_same_prsn() {
-        // No existing default → write (first PRSN on this Mac).
-        assert!(should_write_default(None, "hlin-ai-signing"));
-        // The same PRSN is already the default → write (idempotent overwrite).
-        assert!(should_write_default(
-            Some("hlin-ai-signing"),
-            "hlin-ai-signing"
-        ));
-        // A *different* PRSN owns the default → don't clobber (a multi-PRSN host, where
-        // SIGNET_HANDLE selects).
-        assert!(!should_write_default(
-            Some("zain-ai-signing"),
-            "hlin-ai-signing"
-        ));
+    fn plan_config_writes_only_for_the_first_agent_with_no_file() {
+        // The keystore already holds the NEW agent's keys when the step runs: that alone
+        // is the single-agent Mac, the main path, and must still write (Gus).
+        assert_eq!(
+            plan_config(&handles(&["tester-ai"]), "tester-ai", false),
+            ConfigPlan::Write
+        );
+        assert_eq!(
+            plan_config(&handles(&[]), "tester-ai", false),
+            ConfigPlan::Write
+        );
+        // bug282 condition 1: any other agent on this Mac → no default, file or not.
+        assert_eq!(
+            plan_config(&handles(&["tester-ai", "zain-ai"]), "tester-ai", false),
+            ConfigPlan::OtherAgents(vec!["zain-ai".to_string()])
+        );
+        assert_eq!(
+            plan_config(&handles(&["tester-ai", "zain-ai"]), "tester-ai", true),
+            ConfigPlan::OtherAgents(vec!["zain-ai".to_string()])
+        );
+        // bug282 condition 2: an existing file is never rewritten.
+        assert_eq!(
+            plan_config(&handles(&["tester-ai"]), "tester-ai", true),
+            ConfigPlan::Existing
+        );
+    }
+
+    /// A software keystore whose `list()` fails — the listing the config step now reads.
+    struct ListFails(crate::keystore::SoftwareKeystore);
+    impl Keystore for ListFails {
+        fn tier(&self) -> Tier {
+            self.0.tier()
+        }
+        fn generate(&self, label: &KeyLabel, algorithm: &str) -> Result<KeyMeta> {
+            self.0.generate(label, algorithm)
+        }
+        fn meta(&self, label: &KeyLabel) -> Result<KeyMeta> {
+            self.0.meta(label)
+        }
+        fn sign(&self, label: &KeyLabel, msg: &[u8]) -> Result<[u8; 64]> {
+            self.0.sign(label, msg)
+        }
+        fn ecdh(&self, label: &KeyLabel, peer_pub_x963: &[u8]) -> Result<[u8; 32]> {
+            self.0.ecdh(label, peer_pub_x963)
+        }
+        fn ml_kem_decapsulate(&self, label: &KeyLabel, ek: &[u8]) -> Result<[u8; 32]> {
+            self.0.ml_kem_decapsulate(label, ek)
+        }
+        fn ml_dsa_sign(&self, label: &KeyLabel, msg: &[u8], ctx: &[u8]) -> Result<Vec<u8>> {
+            self.0.ml_dsa_sign(label, msg, ctx)
+        }
+        fn list(&self) -> Result<Vec<KeyMeta>> {
+            Err(CliError::filesystem("the keystore listing failed (test)"))
+        }
+        fn delete(&self, label: &KeyLabel) -> Result<()> {
+            self.0.delete(label)
+        }
+        fn exists(&self, label: &KeyLabel) -> Result<bool> {
+            self.0.exists(label)
+        }
+    }
+
+    /// bug282 (Gus's requirement): the config step never fails, so it can never route an
+    /// attested enrollment into `cleanup_keys`. A failing listing and an unwritable path
+    /// each give `None`, and the agent's keys are untouched.
+    #[test]
+    fn the_config_step_is_best_effort_and_never_touches_the_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let soft = crate::keystore::SoftwareKeystore::open(dir.path().join("keys")).unwrap();
+        let signing = KeyLabel::from_handle("tester-ai", Purpose::Signing).unwrap();
+        let kem = KeyLabel::from_handle("tester-ai", Purpose::Kem).unwrap();
+        let s_meta = soft
+            .generate(&signing, Purpose::Signing.default_alg())
+            .unwrap();
+        let k_meta = soft.generate(&kem, Purpose::Kem.default_alg()).unwrap();
+
+        // (1) The keystore listing fails.
+        let ks = ListFails(soft);
+        let path = dir.path().join("cfg").join("config.toml");
+        let out = write_default_config(
+            "https://drive.mysignet.ca",
+            &ks,
+            "tester-ai",
+            &s_meta,
+            &k_meta,
+            &path,
+        );
+        assert_eq!(out, None);
+        assert!(!path.exists(), "no config written when the listing failed");
+        assert!(
+            ks.exists(&signing).unwrap() && ks.exists(&kem).unwrap(),
+            "the keys are untouched"
+        );
+
+        // (2) An unwritable path: its parent is a regular file, so no directory can be made.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let soft = crate::keystore::SoftwareKeystore::open(dir.path().join("keys")).unwrap();
+        let path = blocker.join("config.toml");
+        let out = write_default_config(
+            "https://drive.mysignet.ca",
+            &soft,
+            "tester-ai",
+            &s_meta,
+            &k_meta,
+            &path,
+        );
+        assert_eq!(out, None);
+        assert!(
+            soft.exists(&signing).unwrap() && soft.exists(&kem).unwrap(),
+            "the keys are untouched"
+        );
+    }
+
+    #[test]
+    fn an_existing_config_naming_this_agent_reads_as_no_warning() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "server_base_url = \"https://drive.mysignet.ca\"\ndefault_signing_key = \"tester-ai-signing\"\n",
+        )
+        .unwrap();
+        let line = existing_config_line(
+            &path,
+            "https://drive.mysignet.ca",
+            "tester-ai-signing",
+            "tester-ai",
+        );
+        assert_eq!(line, "this Mac's config already names this agent.");
+        let line = existing_config_line(
+            &path,
+            "https://staging.drive.mysignet.ca",
+            "tester-ai-signing",
+            "tester-ai",
+        );
+        assert!(
+            line.contains("names the server https://drive.mysignet.ca"),
+            "{line}"
+        );
+        // An unparsable file is left alone, and the line still says what to set.
+        std::fs::write(&path, "this is = = not toml").unwrap();
+        let line = existing_config_line(
+            &path,
+            "https://drive.mysignet.ca",
+            "tester-ai-signing",
+            "tester-ai",
+        );
+        assert!(line.contains("SIGNET_HANDLE=tester-ai"), "{line}");
     }
 }

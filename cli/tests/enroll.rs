@@ -211,6 +211,48 @@ fn run_enroll(tmp: &TempDir, port: u16, extra: &[&str]) -> Output {
         .expect("spawn signet enroll")
 }
 
+/// Like [`run_enroll`], with the config at `config` instead of `<tmp>/absent.toml`.
+fn run_enroll_with_config(
+    tmp: &TempDir,
+    port: u16,
+    config: &std::path::Path,
+    extra: &[&str],
+) -> Output {
+    let keys = tmp.path().join("keys");
+    let server = format!("http://127.0.0.1:{port}");
+    let mut args = vec!["--server-url", &server, "enroll"];
+    args.extend_from_slice(extra);
+    Command::new(env!("CARGO_BIN_EXE_signet"))
+        .env("SIGNET_KEY_TIER", "software")
+        .env("SIGNET_KEYS_DIR", &keys)
+        .env("SIGNET_CONFIG", config)
+        .env("SIGNET_ENROLL_POLL_MS", "20")
+        .args(&args)
+        .output()
+        .expect("spawn signet enroll")
+}
+
+/// Put another agent's signing key in the test keystore: a multi-identity Mac.
+fn seed_other_agent(tmp: &TempDir, handle: &str) {
+    let out = Command::new(env!("CARGO_BIN_EXE_signet"))
+        .env("SIGNET_KEY_TIER", "software")
+        .env("SIGNET_KEYS_DIR", tmp.path().join("keys"))
+        .env("SIGNET_CONFIG", tmp.path().join("unused.toml"))
+        .args([
+            "keygen",
+            "--signing",
+            "--label",
+            &format!("{handle}-signing"),
+        ])
+        .output()
+        .expect("spawn signet keygen");
+    assert!(
+        out.status.success(),
+        "seeding {handle} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 fn happy() -> MockScript {
     MockScript {
         confirm_status: "confirmed",
@@ -343,6 +385,96 @@ fn failure_after_keygen_cleans_up_the_keys() {
     assert!(
         !has_handle_keys(&tmp),
         "the keys generated before the failure must be cleaned up"
+    );
+}
+
+/// bug282 condition 1: on a Mac that holds another agent, enrolling writes no default,
+/// and creates neither the config file nor its directory.
+#[test]
+fn enroll_on_a_mac_with_another_agent_writes_no_config() {
+    let tmp = TempDir::new().unwrap();
+    seed_other_agent(&tmp, "zain-ai");
+    let port = start_mock(happy());
+    let config = tmp.path().join("cfgdir").join("config.toml");
+
+    let out = run_enroll_with_config(&tmp, port, &config, &["testcode"]);
+    assert!(
+        out.status.success(),
+        "enroll should succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let result: Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    assert!(
+        result["config_path"].is_null(),
+        "no config written: {result}"
+    );
+    assert!(
+        !config.exists() && !config.parent().unwrap().exists(),
+        "neither the file nor its directory"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("holds 1 other agent,") && stderr.contains("SIGNET_HANDLE=tester-ai"),
+        "{stderr}"
+    );
+}
+
+/// bug282 condition 2: an existing config is never rewritten — byte-identical after, its
+/// `server_base_url` (another server) and its lack of a default both kept.
+#[test]
+fn enroll_never_rewrites_an_existing_config() {
+    let tmp = TempDir::new().unwrap();
+    let port = start_mock(happy());
+    let config = tmp.path().join("config.toml");
+    let before = "# the human's own\nserver_base_url = \"https://staging.drive.mysignet.ca\"\n";
+    std::fs::write(&config, before).unwrap();
+
+    let out = run_enroll_with_config(&tmp, port, &config, &["testcode"]);
+    assert!(
+        out.status.success(),
+        "enroll should succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        before,
+        "the config must be byte-identical"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("names the server https://staging.drive.mysignet.ca"),
+        "{stderr}"
+    );
+}
+
+/// Gus's requirement on bug282: nothing may fail an enrollment the server has attested.
+/// A config path that cannot be written must leave the enrollment `Ok` and all four keys
+/// in place — before 1.2.1 this routed into `cleanup_keys` and deleted them.
+#[test]
+fn enroll_survives_a_config_it_cannot_write_and_keeps_its_keys() {
+    let tmp = TempDir::new().unwrap();
+    let port = start_mock(happy());
+    let blocker = tmp.path().join("blocker");
+    std::fs::write(&blocker, b"a file, so no directory can be made here").unwrap();
+    let config = blocker.join("config.toml");
+
+    let out = run_enroll_with_config(&tmp, port, &config, &["testcode"]);
+    assert!(
+        out.status.success(),
+        "the enrollment must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let result: Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    assert_eq!(result["handle"], HANDLE);
+    assert!(result["config_path"].is_null());
+    let keys = std::fs::read_dir(tmp.path().join("keys"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(HANDLE))
+        .count();
+    assert!(
+        keys >= 4,
+        "all four keys must remain, found {keys} key files"
     );
 }
 

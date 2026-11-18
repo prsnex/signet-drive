@@ -72,7 +72,7 @@ Specific exit codes within each range are documented per subcommand below.
 
 ## Configuration
 
-The configuration file is `~/.config/signet/config.toml`, in TOML, created on first run if absent.
+The configuration file is `~/.config/signet/config.toml`, in TOML, created on first run if absent. `signet enroll` writes it only for the first agent on a Mac that has no configuration file, with the server URL and that agent's two default key labels. It never rewrites an existing file, and it writes nothing when the keystore already holds another agent's keys.
 
 ```toml
 # ~/.config/signet/config.toml
@@ -226,8 +226,9 @@ Behavior.
 4. Begin proof of possession. `POST /v1/prsn-enrollments/keys` submits the four public keys, their fingerprints and the key protection, which the server requires to be the Secure Enclave. The server returns a challenge and a nonce wrapped to the just-submitted hybrid KEM pair.
 5. Complete proof of possession. `POST /v1/prsn-enrollments/keys/pop` submits the dual signature, ES256 and ML-DSA-87 over the shared challenge, and the decrypted nonce. Every enrollment is thereby an end-to-end self-test of the whole hybrid path on this machine. Begin may be called again while confirmed, so a crashed enrollment restarts cleanly.
 6. Poll until completed. The human's passkey gesture issues the four-key attestation, which enters the transparency log as four entries.
+7. Write the optional configuration, best-effort. When the keystore holds no other agent's keys and no configuration file exists, the client writes `~/.config/signet/config.toml` with the server URL and this agent's default key labels. The file is created and never replaced. With another agent on the Mac, or with an existing file, nothing is written, and one line on standard error says what to set instead, which is `SIGNET_HANDLE=<handle>`, and `--server-url` as well when the file names another server. An error in this step prints one line and the enrollment still succeeds, because the server has already attested the keys.
 
-Any failure after key generation removes all four just-generated keys.
+Any failure after key generation and before completion removes all four just-generated keys. After completion nothing removes them.
 
 Output, to standard output, as JSON, with progress narrated to standard error.
 
@@ -235,9 +236,13 @@ Output, to standard output, as JSON, with progress narrated to standard error.
 {
   "handle": "<handle>",
   "key_protection": "secure_enclave",
-  "attestation_id": "<uuid>"
+  "attestation_id": "<uuid>",
+  "config_path": "<path>",
+  "already_enrolled": false
 }
 ```
+
+`config_path` is the path written in step 7, and the field is absent when nothing was written. For the already-enrolled no-op, `already_enrolled` is `true`, `attestation_id` is `null` and no configuration is written.
 
 Exit codes. 0 on success, including the already-enrolled no-op. 1 when the enrollment expired, was cancelled or failed while waiting. 2 invalid arguments. 31 network error.
 
@@ -632,13 +637,15 @@ All take `[--key] [--kem-key]`.
 - `upload [DEST-PATH] --in <FILE>`, or `--in <FILE> (--to <folder-path> | --folder-id <ID> [--root-folder-id <ID>]) --name <N>`, optionally `--chunk-size <BYTES>`. Uploads through the multipart direct-to-storage transport, where the API issues pre-signed URLs and is never in the byte path. A fresh DEK seals each chunk and is wrapped to the owner, and the name is encrypted under the folder's metadata key. Output is `file_id`, `folder_id`, `plaintext_bytes` and `chunk_count`. Each part transfer runs with stall detection and retries on a fresh connection up to a server-tuned budget, with retries announced on standard error as counts only. An exhausted budget pauses the upload with exit 32, and re-running the same command resumes from the parts storage already holds.
 - `download (<path> | --file-id <ID>) --out <FILE>`. Fetches and decrypts, reading each chunk by range and streaming to disk.
 - `list (<folder-path> | --folder-id <ID> [--root-folder-id <ID>])`. A folder's files with names decrypted, as rows of `name`, `file_id`, `size_bytes`, `created_at` and `modified_at`, where `size_bytes` is the stored ciphertext size.
-- `rename (<path> | --file-id <ID> --root-folder-id <ID>) --name <NEW>`.
-- `move (<path> | --file-id <ID>) (--to <dest-folder-path> | --to-folder-id <ID>)`. Within the same root.
+- `rename (<path> | --file-id <ID> --root-folder-id <ID>) --name <NEW>`. Re-encrypts the name under the file's root key. Refuses a name another file in the folder already has, with exit 27 `conflict`, so no folder is left with two files of one name. The `--root-folder-id` must be the file's own root, or the rename is refused with exit 2.
+- `move (<path> | --file-id <ID>) (--to <dest-folder-path> | --to-folder-id <ID>)`. Within the same root. Refuses when the destination already holds a file of the same name, with exit 27 `conflict`.
 - `delete (<path>... | --file-id <ID>...)`.
+
+The name check, for `rename` and `move`. File names are ciphertext to the server, so the client is the one that checks. Both forms, by path and by identifier, take one route. The client reads the file with `GET /v1/files/{file_id}`, which returns the file's row as its folder's listing shows it together with `root_folder_id`. It then decrypts the name, lists the folder, and compares the names. The comparison is the one `upload` uses when it resolves a taken name. It is exact, with no case folding and no Unicode normalization. It is made against the other files by identifier, so renaming a file to its own name or moving it into its own folder is no collision, and one of two files that already share a name can be renamed away with `--file-id`. A name that cannot be decoded cannot be compared and is not, as on upload, and a move says so on standard error. Two clients racing between the read and the write can still collide. Against a server without the read, which answers HTTP 405, both commands refuse with exit 31 and change nothing.
 
 ### `signet share`
 
-Sharing is per top-level share folder. Initiating a share, with `create` or `invite`, is capability-gated for a PRSN. The server enforces the owner's `prsn_sharing_capability`, which is `none`, `read_only` or `read_write`, and refuses cleanly when the PRSN may not issue the requested permission. Receiving a share, with `preview`, `accept`, `list` and download, is not gated. All take `[--key]`, and the commands that touch keys also take `[--kem-key]`.
+Sharing is per top-level share folder. Adding a recipient, with `invite`, is capability-gated for a PRSN. The server enforces the owner's `prsn_sharing_capability`, which is `none`, `read_only` or `read_write`, and refuses cleanly when the PRSN may not issue the requested permission. Creating a share folder, with `create`, is not gated, because it adds no one but the mandatory Guardian. Receiving a share, with `preview`, `accept`, `list` and download, is not gated. All take `[--key]`, and the commands that touch keys also take `[--kem-key]`.
 
 - `create [NAME]`, or `--name <N>`. Creates a top-level share folder. Mints a metadata key, wraps it to the owner and, for a PRSN owner, to the Guardian, who is the mandatory recipient, resolved and fingerprint-verified, encrypts the name, and posts. From epoch 2 the Guardian's key is bound to the Guardian's VRF index.
 - `list`. The share folders shared with the caller, with names decrypted through the caller's own metadata-key wrap. A name that cannot be decrypted lists as `null` and never hides the rest.

@@ -29,6 +29,17 @@ pub fn dedupe_name(desired: &str, taken: &HashSet<String>) -> String {
     unreachable!("the u32 candidate space cannot be exhausted");
 }
 
+/// bug283: does `name` collide with a name another file in the folder already has?
+/// `others` is the folder's readable names, the file being renamed or moved excluded
+/// (by id, so renaming a file to its own name, or moving it into its own folder, is no
+/// collision). Equality is EXACTLY upload's ([`dedupe_name`]'s `taken.contains`): no case
+/// folding and no Unicode normalization, so the two rules can never disagree. A rename
+/// or move expresses a name the user chose, so the caller refuses rather than renaming.
+/// The web client's `collides` in `names.ts` is the same rule, pinned by matching vectors.
+pub fn collides(name: &str, others: &HashSet<String>) -> bool {
+    others.contains(name)
+}
+
 /// `"report.pdf"` → `("report", ".pdf")` · `"archive.tar.gz"` →
 /// `("archive.tar", ".gz")` (the LAST dot splits) · `".env"` → `(".env", "")`
 /// (a leading dot is not an extension boundary) · `"README"` / `"trailing."`
@@ -77,6 +88,28 @@ mod tests {
                 dedupe_name(desired, &taken(existing)),
                 *expected,
                 "dedupe({desired:?}, {existing:?})"
+            );
+        }
+    }
+
+    /// bug283's rule, the same vectors as `names.test.ts` (bug048's parity discipline).
+    #[test]
+    fn shared_collision_vectors() {
+        let cases: &[(&str, &[&str], bool)] = &[
+            ("notes.txt", &[], false),
+            ("notes.txt", &["notes.txt"], true),
+            // exact equality, as upload's: a name differing only in case is free
+            ("Notes.txt", &["notes.txt"], false),
+            // and no Unicode normalization: NFC "café" is not NFD "café"
+            ("caf\u{e9}", &["cafe\u{301}"], false),
+            ("a (1).txt", &["a.txt", "a (1).txt"], true),
+            (" notes.txt", &["notes.txt"], false),
+        ];
+        for (name, others, expected) in cases {
+            assert_eq!(
+                collides(name, &taken(others)),
+                *expected,
+                "collides({name:?}, {others:?})"
             );
         }
     }

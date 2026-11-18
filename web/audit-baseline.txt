@@ -19,7 +19,21 @@
 #
 # ── Accepted ──────────────────────────────────────────────────────────────────
 #
-# (none at present)
+# GHSA-3r8g-jcqq-3p5j, waived 2026-11-17 on Chris's word ("Waive and ship"), read by Hlin,
+# Gus and Bob, each with their own instruments: @sveltejs/kit (high) DoS while parsing
+# form data from a remote functions `form`, range >=2.42.0 <=3.1.0, fixed only in 3.1.1
+# (a major version); no 2.x fix exists, and we lock 2.66.0. Unreachable here on TWO
+# independent grounds, each re-checkable:
+#   (1) the feature is unused. Expect all three empty:
+#       git ls-files web/src | grep -E '\.remote\.(ts|js)$'
+#       grep -rn "\$app/server" web/src
+#       grep -n "remoteFunctions" web/svelte.config.js
+#   (2) no SvelteKit server runs: web/svelte.config.js uses `adapter-static`, and
+#       server/Dockerfile's runtime stage is Debian with `signet-server` only; Node exists
+#       only in its `web-builder` stage.
+# Exit: the SvelteKit 3 migration, its own change after v1.2.1 (Gus's board), which
+# deletes this entry; revisit no later than 2026-12-31 either way.
+GHSA-3r8g-jcqq-3p5j | @sveltejs/kit remote-functions form DoS: unreachable (no remote functions used; adapter-static, no SvelteKit server at runtime). Exit: the SvelteKit 3 migration; revisit by 2026-12-31. Waived 2026-11-17, Chris.
 #
 # HISTORY: GHSA-834v-8h66-3h79 (happy-dom 20.11.2, high; incomplete fix of CVE-2026-33943:
 # host code execution through an unsanitized import alias when happy-dom evaluates page

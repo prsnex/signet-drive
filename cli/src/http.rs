@@ -108,6 +108,16 @@ fn network(message: impl Into<String>) -> CliError {
 /// tell an expired URL from a network fault, so it retried dead signatures and
 /// then died. Kept corrected rather than deleted — prose that asserted a policy
 /// nothing should have implemented.)
+/// Is `e` [`api_status_error`]'s fallback for this HTTP status? It lives beside the format
+/// that produces it, so the two cannot drift. bug283: a 1.2.1 client meeting a 1.2.0
+/// server's 405 on `GET /v1/files/{id}` in the minutes between the client's publish and
+/// the server's deploy, which must refuse the rename, never fall through to it.
+pub(crate) fn is_unmapped_status(e: &CliError, code: u16) -> bool {
+    e.code == "network_error"
+        && e.message
+            .starts_with(&format!("server returned HTTP {code}:"))
+}
+
 fn api_status_error(code: u16, body: String) -> CliError {
     if let Some(refusal) = epoch_refusal(code, &body) {
         return refusal;
@@ -1235,6 +1245,22 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bug283: a 405 keeps its exit (31, retry later) and is recognisable as itself.
+    #[test]
+    fn a_405_is_recognisable_as_itself() {
+        let e = api_status_error(405, String::new());
+        assert_eq!(
+            e.exit_code, 31,
+            "the exit is unchanged: the network family, retry later"
+        );
+        assert!(is_unmapped_status(&e, 405));
+        assert!(!is_unmapped_status(&e, 404));
+        assert!(!is_unmapped_status(
+            &api_status_error(404, String::new()),
+            405
+        ));
     }
 
     /// API HTTP refusals the server answered map to precise exit codes, not

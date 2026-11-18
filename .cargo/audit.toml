@@ -34,4 +34,18 @@ ignore = [
     # stable for a few weeks, after Gus's review. EXIT: that migration release deletes
     # this entry, and its audit passing without it is part of its acceptance.
     "RUSTSEC-2026-0387",
+
+    # libsqlite3-sys 0.30.1 — CVE-2026-119375 / GHSA-72w2-rjgg-q729 (published 2026-10-30;
+    # CVSS 4.0 AV:L, user interaction): bundled SQLite before 3.54.0 can return
+    # uninitialized page-cache memory when a process opens a crafted database file with a
+    # mismatched `-wal` sibling. Fixed in 0.39.0. NOT in any build graph, like `rsa` above:
+    # `cargo tree -i libsqlite3-sys -e all --target all --all-features` prints nothing (and
+    # `-i sqlx-sqlite` nothing; the control `-i sqlx-postgres` prints its path into
+    # signet-server). It is locked only as a transitive of `sqlx-sqlite`, an OPTIONAL sqlx
+    # backend we do not enable (server/Cargo.toml: default-features off, `postgres` only),
+    # so no binary of ours links SQLite. NO sqlx release takes the fix: sqlx-sqlite 0.8.6
+    # requires ^0.30.1 and 0.9.0 <0.38.0 (crates index, read 2026-11-10). Found by Bob,
+    # 2026-11-10. EXIT: the sqlx release whose sqlx-sqlite admits libsqlite3-sys >= 0.39
+    # deletes this entry, its audit passing without it.
+    "RUSTSEC-2026-0459",
 ]

@@ -24,7 +24,7 @@ import { friendlyDriveError } from './errors';
 import { UploadWakeLock, type WakeLockApiLike } from './wake-lock';
 import { DownloadCancelledError, openSwStreamedSink } from './sw-download';
 import { groupSharedByOwner, type GroupedShares } from './grouping';
-import { dedupeName } from './names';
+import { UNREADABLE_NAME, collides, dedupeName, moveClash, readableNames } from './names';
 import { UploadBatch, type UploadBatchState } from './upload-batch';
 import {
   DropReadError,
@@ -1570,6 +1570,19 @@ export class Browser {
     if (!dialog || dialog.kind !== 'rename') return;
     const trimmed = newName.trim();
     if (!trimmed) return;
+    // bug283: no folder may hold two files with one name after a rename. Names are
+    // ciphertext to the server, so the check is the client's (bug048's ground, the
+    // CLI's identical rule). The dialog stays open with the reason, as on a failure.
+    if (dialog.file) {
+      const me = dialog.file.view.file_id;
+      const others = readableNames(
+        this.files.filter((f) => f.view.file_id !== me).map((f) => f.name),
+      );
+      if (collides(trimmed, others)) {
+        this.error = m.err_rename_name_taken({ name: trimmed });
+        return;
+      }
+    }
     await this.mutate(async () => {
       if (dialog.file) {
         await this.drive.renameFile(dialog.file.view, this.currentRootId ?? '', trimmed);
@@ -1580,6 +1593,21 @@ export class Browser {
   }
 
   async moveTo(targetFolderId: string): Promise<void> {
+    // bug283: no folder may hold two files with one name after a move: not with a file
+    // already in the target, and not between two of the moved files. Nothing moves if
+    // any one would collide.
+    const moving = this.files.filter((f) => this.selectedFiles.has(f.view.file_id));
+    let clash: string | null;
+    try {
+      clash = await this.moveCollision(moving, targetFolderId);
+    } catch (e) {
+      this.error = friendlyDriveError(e);
+      return;
+    }
+    if (clash !== null) {
+      this.error = m.err_move_name_taken({ name: clash });
+      return;
+    }
     await this.mutate(async () => {
       for (const id of this.selectedFiles) await this.drive.moveFile(id, targetFolderId);
       for (const id of this.selectedFolders) await this.drive.moveFolder(id, targetFolderId);
@@ -1837,15 +1865,35 @@ export class Browser {
     try {
       return await this.drive.folderName(view);
     } catch {
-      return '(unreadable)';
+      return UNREADABLE_NAME;
     }
+  }
+
+  /** bug283: the first name the move would give two files in the target, or null. A
+   *  move stays within its root, so the target's names decrypt under the current one. */
+  private async moveCollision(moving: NamedFile[], targetFolderId: string): Promise<string | null> {
+    const rootId = this.currentRootId;
+    if (moving.length === 0 || rootId === null || targetFolderId === this.current?.folderId) {
+      return null;
+    }
+    const movingIds = new Set(moving.map((f) => f.view.file_id));
+    const { files } = await this.drive.listFiles(targetFolderId);
+    const there = await Promise.all(
+      files
+        .filter((view) => !movingIds.has(view.file_id))
+        .map(async (view) => ({ view, name: await this.safeFileName(view, rootId) })),
+    );
+    return moveClash(
+      moving.map((f) => f.name),
+      there.map((f) => f.name),
+    );
   }
 
   private async safeFileName(view: FileView, rootFolderId: string): Promise<string> {
     try {
       return await this.drive.fileName(view, rootFolderId);
     } catch {
-      return '(unreadable)';
+      return UNREADABLE_NAME;
     }
   }
 }

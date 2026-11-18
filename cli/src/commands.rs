@@ -211,7 +211,7 @@ fn resolve_label_with(
 
 /// The distinct PRSN handles this host's keystore holds keys for (bug280). Read only to
 /// refuse a config default on a multi-identity host; never a resolution source.
-fn held_handles(keystore: &dyn Keystore) -> Result<BTreeSet<String>> {
+pub(crate) fn held_handles(keystore: &dyn Keystore) -> Result<BTreeSet<String>> {
     Ok(keystore
         .list()?
         .iter()
@@ -3130,6 +3130,70 @@ pub fn folder_rename(
 }
 
 /// `signet file rename (<path>|--file-id --root-folder-id) --name <NEW>`.
+/// bug283: one file as `GET /v1/files/{id}` returns it — its folder, its root, and its
+/// decrypted name (`None` when it cannot be decoded, exactly as in a listing). The ONE
+/// read a rename or a move compares names through, whether the file was named by path
+/// or by `--file-id` (Gus: one code path).
+struct LookedUpFile {
+    folder_id: Uuid,
+    root_folder_id: Uuid,
+    name: Option<String>,
+}
+
+fn look_up_file(
+    resolver: &mut Resolver,
+    keystore: &dyn Keystore,
+    signing: &KeyLabel,
+    server_url: &str,
+    fid: Uuid,
+) -> Result<LookedUpFile> {
+    let v = http::get_json_signed(keystore, signing, server_url, &format!("/v1/files/{fid}"))
+        .map_err(|e| {
+            if http::is_unmapped_status(&e, 405) {
+                // A 1.2.1 client against a 1.2.0 server, in the minutes between the
+                // client's publish and the server's deploy: refuse, never rename unchecked.
+                CliError::new(
+                    31,
+                    "network_error",
+                    "this server does not offer the file lookup that rename and move now \
+                     check names against (it is probably being updated). Nothing was \
+                     changed. Try again in a few minutes.",
+                )
+            } else {
+                e
+            }
+        })?;
+    let id = |field: &str| -> Result<Uuid> {
+        v.get(field)
+            .and_then(Value::as_str)
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .ok_or_else(|| CliError::invalid_data(format!("the file lookup lacks {field}")))
+    };
+    let folder_id = id("folder_id")?;
+    let root_folder_id = id("root_folder_id")?;
+    let name = v
+        .get("encrypted_name")
+        .and_then(|en| resolver.decrypt_name(root_folder_id, fid, en).ok());
+    Ok(LookedUpFile {
+        folder_id,
+        root_folder_id,
+        name,
+    })
+}
+
+/// bug283: the readable names of `rows` other than `me` — what a name must not equal.
+/// By id, so renaming a file to its own name or moving it into its own folder is no
+/// collision, and one of two files that already share a name can be renamed away.
+fn names_of_others(
+    rows: &[crate::resolve::FileEntry],
+    me: Uuid,
+) -> std::collections::HashSet<String> {
+    rows.iter()
+        .filter(|r| r.file_id != me)
+        .filter_map(|r| r.name.clone())
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn file_rename(
     keystore: &dyn Keystore,
@@ -3150,6 +3214,22 @@ pub fn file_rename(
     let kem = resolve_label(keystore, kem_key, Purpose::Kem, config)?;
     let mut resolver = Resolver::new(keystore, &signing, &kem, server_url);
     let (fid, root) = resolve_file_target(&mut resolver, path, file_id, root_folder_id)?;
+    // bug283: no folder may hold two files with one name after a rename. Names are
+    // ciphertext to the server, so the check is the client's (bug048's ground).
+    let found = look_up_file(&mut resolver, keystore, &signing, server_url, fid)?;
+    if found.root_folder_id != root {
+        return Err(CliError::invalid_args(format!(
+            "--root-folder-id names {root}, but the file's root is {}; nothing was renamed",
+            found.root_folder_id
+        )));
+    }
+    let siblings = resolver.list_files(found.folder_id, found.root_folder_id)?;
+    if crate::names::collides(new_name, &names_of_others(&siblings, fid)) {
+        return Err(CliError::conflict(format!(
+            "a file named {new_name:?} is already in this folder; nothing was renamed. \
+             Choose another name, or rename or remove that file first."
+        )));
+    }
     let metadata_key = resolver.metadata_key(root)?;
     let encrypted_name = signet_crypto::encname::encrypt_name(
         &metadata_key,
@@ -3225,6 +3305,27 @@ pub fn file_move(
     let mut resolver = Resolver::new(keystore, &signing, &kem, server_url);
     let fid = resolve_file_id(&mut resolver, path, file_id)?;
     let dest = resolve_dest_folder(&mut resolver, to, to_folder_id, "--to-folder-id")?;
+    // bug283: no folder may hold two files with one name after a move.
+    let found = look_up_file(&mut resolver, keystore, &signing, server_url, fid)?;
+    if found.folder_id != dest {
+        match &found.name {
+            Some(name) => {
+                // A move stays within its root (the server refuses one that leaves it).
+                let in_dest = resolver.list_files(dest, found.root_folder_id)?;
+                if crate::names::collides(name, &names_of_others(&in_dest, fid)) {
+                    return Err(CliError::conflict(format!(
+                        "a file named {name:?} is already in the destination folder; nothing \
+                         was moved. Rename one of them first."
+                    )));
+                }
+            }
+            // Stated, not hidden: a name we cannot decode cannot be compared (as on upload).
+            None => eprintln!(
+                "signet: this file's name could not be decoded, so the destination was not \
+                 checked for a file of the same name"
+            ),
+        }
+    }
     let body = serde_json::to_vec(&serde_json::json!({ "folder_id": dest.to_string() }))
         .map_err(|e| CliError::generic(format!("serializing move: {e}")))?;
     let view = http::patch_json_signed(
@@ -6088,6 +6189,39 @@ mod tests {
             "{}",
             err.message
         );
+    }
+
+    /// bug283: a rename or move compares against the OTHER files by id. One of two files
+    /// that already share a name (what 1.2.0 allowed) renames away to a free name — the
+    /// repair path — and renaming a lone file to its own name collides with nothing.
+    #[test]
+    fn a_rename_compares_names_against_the_other_files_by_id() {
+        use crate::names::collides;
+        use crate::resolve::FileEntry;
+        let row = |id: Uuid, name: Option<&str>| FileEntry {
+            file_id: id,
+            name: name.map(str::to_string),
+            size_bytes: 0,
+            plaintext_bytes: None,
+            created_at: 0,
+            modified_at: 0,
+        };
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let dupes = vec![row(a, Some("x")), row(b, Some("x")), row(c, None)];
+        assert!(
+            !collides("y", &names_of_others(&dupes, a)),
+            "a renames away: the repair"
+        );
+        assert!(
+            collides("x", &names_of_others(&dupes, a)),
+            "b still holds x"
+        );
+        assert!(
+            !collides("x", &names_of_others(&[row(a, Some("x"))], a)),
+            "its own name"
+        );
+        // An unreadable name is no name: it cannot collide (as on upload).
+        assert_eq!(names_of_others(&dupes, a).len(), 1);
     }
 
     #[test]
