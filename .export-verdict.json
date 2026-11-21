@@ -1,7 +1,7 @@
 {
   "contract_version": 1,
-  "input_tag": "v1.2.1",
-  "input_commit": "ba54fdb60dfbf7b5b9c67c7b939c4b543cefb629",
+  "input_tag": "v1.2.2",
+  "input_commit": "efef5d5cf501ad2cd353ac569a0d6e09d168c2b0",
   "tool_version": "0.2.2",
   "tool_sha256": "ebb15efa478d372a40953d39e87ef4d91bf8f62b50a8f05563df4bc3372543d7",
   "allowlist_sha256": "369c7229572bcc70c02a495ebb1d2337f98404ff7f2840f665a320366422a21b",

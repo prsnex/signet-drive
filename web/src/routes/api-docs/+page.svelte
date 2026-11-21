@@ -487,6 +487,12 @@ signet transparency-verify --fingerprint "$KEM_FINGERPRINT" --purpose kem</code
           ></tr
         >
         <tr
+          ><td>409</td><td><code>folder_pending_deletion</code></td><td
+            >The share folder is being deleted with its owner's account: it can be read and
+            downloaded until then, and every write is refused.</td
+          ></tr
+        >
+        <tr
           ><td>403</td><td
             ><code>permission_denied</code> / <code>sharing_capability_insufficient</code></td
           ><td>Not allowed; a PRSN's sharing capability is too low for this action.</td></tr

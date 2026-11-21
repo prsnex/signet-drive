@@ -221,6 +221,10 @@ export function friendlyDriveError(error: unknown): string {
         // lock for its whole TTL, so "try again in a moment" was misleading
         // (S121 review, W6). The Share dialog lists + cancels pending invites.
         return m.err_drive_folder_locked_pending();
+      case 'folder_pending_deletion':
+        // bug285: the share folder is being deleted with its owner's account. The
+        // recipient grace is for copying files out, so say that, not "try again".
+        return m.err_drive_folder_pending_deletion();
       case 'not_found':
         return m.err_drive_item_gone();
       case 'prsn_cannot_create_private_folder':

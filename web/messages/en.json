@@ -651,6 +651,7 @@
   "err_drive_cross_root_move": "Items can only be moved within the same top-level folder.",
   "err_drive_name_in_use": "That name is already in use here. Please try again.",
   "err_drive_folder_locked_pending": "This folder has a pending share invitation. Changes resume once it is accepted, canceled (Share → Pending invitations), or expires.",
+  "err_drive_folder_pending_deletion": "This shared folder is being deleted along with its owner's account. You can still download its files until then, but nothing in it can be added, changed, or deleted.",
   "err_drive_item_gone": "That item no longer exists. Refreshing your view.",
   "err_drive_prsn_private_folder": "Private folders are available to human accounts only.",
   "err_drive_transfer_exhausted_upload": "Upload stopped after several attempts. Your progress is saved, so start it again and it will continue from where it stopped.",

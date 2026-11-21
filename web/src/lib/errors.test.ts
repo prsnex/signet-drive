@@ -120,6 +120,17 @@ describe('friendlyAdminError', () => {
 
 // bug060: failure notices are a product requirement (Chris, S126) — every
 // failure must say what happened, that nothing was lost, and what to do next.
+describe('friendlyDriveError — a folder pending deletion (bug285)', () => {
+  it('tells the person they can still download, not to try again', () => {
+    const msg = friendlyDriveError(
+      new SignetApiError(409, 'folder_pending_deletion', 'server sentence'),
+    );
+    expect(msg).toBe(m.err_drive_folder_pending_deletion());
+    expect(msg).toContain('download');
+    expect(msg).not.toBe(m.err_drive_folder_locked_pending());
+  });
+});
+
 describe('friendlyDriveError — transfer failures (bug060)', () => {
   it('explains an exhausted UPLOAD honestly, never blames the server, and offers resume', () => {
     const msg = friendlyDriveError(
