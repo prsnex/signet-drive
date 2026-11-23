@@ -231,6 +231,21 @@ export function mayDelete(
   return selectionIncludesAFolder ? ownsRoot : canAddContent;
 }
 
+/** bug284 (Chris's ruling 2026-11-21, v1.2.3) — may this account RENAME or MOVE,
+ *  given what is selected? A FILE now resolves `sharing::folder_authority` on the
+ *  server (`files.rs` `update_file`), so the owner and every `read_write` member may
+ *  rename or move it, as they may delete it. A FOLDER stays owner-only. So this is
+ *  delete's rule, and a mixed selection takes the stricter bar for the same reason.
+ *  Kept as its own name because it answers a different server route; the test pins
+ *  that the two agree, so a divergence has to be a decision. */
+export function mayChange(
+  ownsRoot: boolean,
+  canWrite: boolean,
+  selectionIncludesAFolder: boolean,
+): boolean {
+  return selectionIncludesAFolder ? ownsRoot : canWrite;
+}
+
 export function attachChangeListeners(target: ChangeEventTarget, onChange: () => void): void {
   for (const name of CHANGE_EVENTS) {
     target.addEventListener(name, () => onChange());
@@ -379,7 +394,7 @@ export class Browser {
     y: number;
     file?: NamedFile;
     folder?: NamedFolder;
-    owned: boolean;
+    renamable: boolean;
     deletable: boolean;
   } | null>(null);
   /** Active upload progress, or null when idle — the BATCH record (F2,
@@ -525,6 +540,17 @@ export class Browser {
    *  for the ⋯ menu, which always acts on exactly one file or one folder. */
   canDeleteItem(item: { file?: NamedFile; folder?: NamedFolder }): boolean {
     return mayDelete(this.ownsCurrentRoot, this.canWriteCurrentRoot, item.folder !== undefined);
+  }
+
+  /** bug284: may the current SELECTION be renamed or moved? Write authority for
+   *  files, ownership once a folder is in it (see `mayChange`). */
+  get canChangeSelection(): boolean {
+    return mayChange(this.ownsCurrentRoot, this.canWriteCurrentRoot, this.selectedFolders.size > 0);
+  }
+
+  /** bug284: may THIS row's item be renamed? The per-item form, for the ⋯ menu. */
+  canChangeItem(item: { file?: NamedFile; folder?: NamedFolder }): boolean {
+    return mayChange(this.ownsCurrentRoot, this.canWriteCurrentRoot, item.folder !== undefined);
   }
 
   /** The lone selected item, when exactly one is selected (rename targets it). */
@@ -1094,11 +1120,18 @@ export class Browser {
     // uploading concurrently, and this decides whether to start at all. A failed read
     // yields null, which `capacityRefusal` treats as fail-open by contract.
     let remaining: number | null = null;
-    try {
-      const fresh = await this.drive.quota();
-      remaining = Math.max(0, fresh.bytes_quota - fresh.bytes_used);
-    } catch {
-      remaining = null;
+    // v1.2.3 (bug286, design v03 §4.7): an upload into a folder someone else owns is
+    // charged to that OWNER's pool, which this caller cannot read, so the pool half of
+    // the pre-check runs only in a folder the caller owns. Elsewhere `remaining` stays
+    // null (fail-open by contract) and the server's refusal decides, naming the owner's
+    // storage. The per-file ceiling below still applies everywhere.
+    if (this.ownsCurrentRoot) {
+      try {
+        const fresh = await this.drive.quota();
+        remaining = Math.max(0, fresh.bytes_quota - fresh.bytes_used);
+      } catch {
+        remaining = null;
+      }
     }
 
     return capacityRefusal(candidates, cap ?? null, remaining);
@@ -1682,20 +1715,23 @@ export class Browser {
     this.error = '';
   }
 
-  /** bug101: open/close the single top-level ⋯ actions menu (see `contextMenu`). */
+  /** bug101: open/close the single top-level ⋯ actions menu (see `contextMenu`).
+   *  `renamable` is the caller's answer for this item: a tree folder's ownership
+   *  (`FolderTree`, whose folder may sit in another root), or `canChangeItem` for a
+   *  row of the current folder (`FileList`; bug284). */
   openContextMenu(
     x: number,
     y: number,
     item: { file?: NamedFile; folder?: NamedFolder },
-    owned: boolean,
+    renamable: boolean,
   ): void {
     this.contextMenu = {
       x,
       y,
       file: item.file,
       folder: item.folder,
-      owned,
-      // bug223: rename stays owner-gated; delete asks the per-item question.
+      renamable,
+      // bug223: delete asks its own per-item question.
       deletable: this.canDeleteItem(item),
     };
   }

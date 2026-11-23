@@ -51,6 +51,13 @@
   const hasSelection = $derived(browser.selectionCount > 0);
   const hasFileSelection = $derived(browser.selectedFiles.size > 0);
   const folderInSelection = $derived(browser.selectedFolders.size > 0);
+  // bug284 (Chris's ruling 2026-11-21): renaming or moving a FILE is write authority on
+  // the folder, for its owner and every `read_write` member alike (as delete is). A
+  // FOLDER stays owner-only (`browser.canChangeSelection`); the tip names whichever bar
+  // the selection meets.
+  const changeTip = $derived(
+    folderInSelection ? m.filelist_action_not_owner() : m.filelist_change_read_only(),
+  );
   const inFolder = $derived(browser.current !== null);
 
   // bug101: open the ⋯ / right-click actions menu (Rename + Delete) for a row's item.
@@ -58,12 +65,12 @@
   type RowItem = { file?: NamedFile; folder?: NamedFolder };
   function openRowMenuAt(e: MouseEvent, item: RowItem) {
     e.preventDefault();
-    browser.openContextMenu(e.clientX, e.clientY, item, browser.ownsCurrentRoot);
+    browser.openContextMenu(e.clientX, e.clientY, item, browser.canChangeItem(item));
   }
   function openRowMenuButton(e: MouseEvent, item: RowItem) {
     e.stopPropagation();
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    browser.openContextMenu(r.left, r.bottom + 2, item, browser.ownsCurrentRoot);
+    browser.openContextMenu(r.left, r.bottom + 2, item, browser.canChangeItem(item));
   }
 
   // A TEXT-ENTRY field (not every <input> — a focused row checkbox is an <input>
@@ -309,6 +316,13 @@
     </p>
   {/if}
 
+  <!-- bug286 (v1.2.3, design v03 §7, Gus's C3): a file belongs to its folder's owner
+       from upload, so a member who can write into someone else's folder is told so here,
+       the one place they are told in time. Its wording follows C3 (Chris and Katia). -->
+  {#if inFolder && browser.canWriteCurrentRoot && !browser.ownsCurrentRoot}
+    <p class="share-kept">{m.filelist_share_kept_by_owner()}</p>
+  {/if}
+
   <div class="toolbar">
     <!-- Standing actions: always present, never disabled-gray as a group. -->
     <!-- bug223 F1: upload gates on WRITE authority, not on ownership and not on
@@ -396,28 +410,26 @@
             {m.filelist_download()}
           </button>
         </span>
-        <!-- bug101 + bug223: Rename and Move are owner-only (server-enforced,
-             account_id = you) and disable for any recipient. DELETE IS NOT: the
+        <!-- bug284 (v1.2.3): Rename and Move of FILES are write authority, for the
+             owner and any `read_write` member; a selection holding a FOLDER stays
+             owner-only (`browser.canChangeSelection`). Before v1.2.3 they were owner-only here
+             while the server allowed only the uploader (bug101 + bug223 history). DELETE IS NOT: the
              server grants a `read_write` recipient delete authority
              (sharing::folder_authority, bug208 §3b), so it gates on
              `canWriteCurrentRoot` and stays enabled for a Guardian inside a PRSN's
              folder. The reason goes on the wrapper (a disabled button swallows
              hover). Download stays — a recipient can read. -->
-        <span
-          class="tipwrap"
-          use:tooltip={!browser.ownsCurrentRoot ? m.filelist_action_not_owner() : ''}
-        >
+        <span class="tipwrap" use:tooltip={!browser.canChangeSelection ? changeTip : ''}>
           <button
-            disabled={!single || browser.busy || !browser.ownsCurrentRoot}
+            disabled={!single || browser.busy || !browser.canChangeSelection}
             onclick={() => browser.openRename()}>{m.filelist_rename()}</button
           >
         </span>
-        <span
-          class="tipwrap"
-          use:tooltip={!browser.ownsCurrentRoot ? m.filelist_action_not_owner() : ''}
-        >
+        <span class="tipwrap" use:tooltip={!browser.canChangeSelection ? changeTip : ''}>
           <button
-            disabled={browser.moveTargets.length === 0 || browser.busy || !browser.ownsCurrentRoot}
+            disabled={browser.moveTargets.length === 0 ||
+              browser.busy ||
+              !browser.canChangeSelection}
             onclick={() => browser.openMove()}
           >
             {m.filelist_move()}
@@ -898,6 +910,11 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  .share-kept {
+    margin: 0 0 0.5rem;
+    font-size: 0.875rem;
+    color: var(--muted);
   }
   .toolbar {
     display: flex;

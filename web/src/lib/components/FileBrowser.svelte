@@ -347,14 +347,14 @@
     items={[
       {
         label: m.filelist_rename(),
-        disabled: !cm.owned,
-        tip: m.filelist_action_not_owner(),
+        disabled: !cm.renamable,
+        tip: cm.folder ? m.filelist_action_not_owner() : m.filelist_change_read_only(),
         onSelect: () => browser.openRenameItem({ file: cm.file, folder: cm.folder }),
       },
       {
         label: m.filelist_delete(),
         danger: true,
-        // bug223: NOT `!cm.owned`. A read_write recipient may delete a FILE
+        // bug223: its own per-item answer. A read_write recipient may delete a FILE
         // (folder_authority, bug208 §3b) but not a FOLDER (folders.rs is
         // owner-only), so the answer is per-item and computed at open time.
         disabled: !cm.deletable,

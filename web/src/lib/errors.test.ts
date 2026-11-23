@@ -120,6 +120,23 @@ describe('friendlyAdminError', () => {
 
 // bug060: failure notices are a product requirement (Chris, S126) — every
 // failure must say what happened, that nothing was lost, and what to do next.
+describe('friendlyDriveError — whose storage is full (v1.2.3, bug286)', () => {
+  it("tells a member it is the folder owner's storage, never theirs", () => {
+    const msg = friendlyDriveError(
+      new SignetApiError(413, 'folder_owner_quota_exceeded', 'server sentence'),
+    );
+    expect(msg).toBe(m.err_drive_owner_quota_exceeded());
+    expect(msg).toMatch(/owner/);
+    expect(msg).not.toBe(m.err_drive_quota_exceeded());
+  });
+
+  it("keeps the your-quota copy for the caller's own pool", () => {
+    expect(friendlyDriveError(new SignetApiError(413, 'quota_exceeded', 'x'))).toBe(
+      m.err_drive_quota_exceeded(),
+    );
+  });
+});
+
 describe('friendlyDriveError — a folder pending deletion (bug285)', () => {
   it('tells the person they can still download, not to try again', () => {
     const msg = friendlyDriveError(

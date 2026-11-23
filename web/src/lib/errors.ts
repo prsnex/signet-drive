@@ -212,6 +212,10 @@ export function friendlyDriveError(error: unknown): string {
     switch (error.code) {
       case 'quota_exceeded':
         return m.err_drive_quota_exceeded();
+      // v1.2.3 (bug286): in a folder someone else owns, it is the OWNER's pool that is
+      // full; never tell a member it is their storage (Gus's review).
+      case 'folder_owner_quota_exceeded':
+        return m.err_drive_owner_quota_exceeded();
       case 'cross_root_move_not_supported':
         return m.err_drive_cross_root_move();
       case 'version_conflict':

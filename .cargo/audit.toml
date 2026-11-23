@@ -48,4 +48,18 @@ ignore = [
     # 2026-11-10. EXIT: the sqlx release whose sqlx-sqlite admits libsqlite3-sys >= 0.39
     # deletes this entry, its audit passing without it.
     "RUSTSEC-2026-0459",
+
+    # url 2.5.8 — stack overflow in `Url::origin()` and `url::quirks::origin()` on a `blob:`
+    # URL nested thousands deep (published 2026-11-20; denial of service; fixed in 2.5.9,
+    # published 2026-11-20 23:03Z). IN OUR BUILD GRAPH, server and CLI: aws-sdk-s3, lettre,
+    # sqlx and webauthn-rs in the server, ureq in the CLI. NOT REACHABLE, read at source
+    # (Hlin, 2026-11-22): neither our code nor any dependent calls `quirks::origin`, and the
+    # one `Url::origin()` call is webauthn-rs-core 0.5.5 `origins_match` (core.rs:1225). It
+    # runs after an exact-equality return and a scheme check against our `https` origin, so
+    # a `blob:` client origin is refused first, and an `https` one cannot recurse. Taking
+    # 2.5.9 moves the CLI's closure, which would add a CLI release to v1.2.3. Waived for
+    # v1.2.3 by ruling (Chris, 2026-11-22): not reachable, and the fix carries a CLI release,
+    # so it ships with the next release. EXIT: the next release takes url >= 2.5.9, with its
+    # CLI release, and deletes this entry, its audit passing without it.
+    "RUSTSEC-2026-0592",
 ]

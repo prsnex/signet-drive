@@ -17,7 +17,9 @@
 // always read-write on all PRSN account folders — that is what we planned").
 
 import { describe, it, expect } from 'vitest';
-import { mayAddContent, mayDelete } from './browser.svelte';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { mayAddContent, mayChange, mayDelete } from './browser.svelte';
 
 describe('bug223 §1: mayAddContent — upload / add / delete-own authority', () => {
   it('an owner may add (owned share root reports `owner`)', () => {
@@ -97,5 +99,78 @@ describe('bug223 §2: mayDelete — delete is TWO rules, not one', () => {
     expect(filesOnly).toBe(true);
     expect(withAFolder).toBe(false);
     expect(withAFolder).not.toBe(filesOnly);
+  });
+});
+
+describe('bug284 (v1.2.3): mayChange — rename and move are write authority for files', () => {
+  it('a `read_write` member MAY rename or move a file-only selection', () => {
+    expect(mayChange(/* ownsRoot */ false, /* canWrite */ true, /* hasFolder */ false)).toBe(true);
+  });
+
+  it('a `read_write` member may NOT once a FOLDER is selected (folders stay owner-only)', () => {
+    expect(mayChange(false, true, true)).toBe(false);
+  });
+
+  it('an owner may change either', () => {
+    expect(mayChange(true, true, false)).toBe(true);
+    expect(mayChange(true, true, true)).toBe(true);
+  });
+
+  it('a `read_only` recipient may change neither (the server answers 403)', () => {
+    expect(mayChange(false, false, false)).toBe(false);
+    expect(mayChange(false, false, true)).toBe(false);
+  });
+
+  // One authority, two server routes: if rename/move and delete ever part, that has
+  // to be a decision, and this arm is where it shows.
+  it('agrees with mayDelete on every input', () => {
+    for (const owns of [false, true])
+      for (const write of [false, true])
+        for (const folder of [false, true])
+          expect(mayChange(owns, write, folder)).toBe(mayDelete(owns, write, folder));
+  });
+});
+
+describe('bug284 wiring: the controls ask the rule, not ownership', () => {
+  const list = readFileSync(
+    fileURLToPath(new URL('./components/FileList.svelte', import.meta.url)),
+    'utf8',
+  );
+  const store = readFileSync(
+    fileURLToPath(new URL('./browser.svelte.ts', import.meta.url)),
+    'utf8',
+  );
+
+  // The toolbar block of one button: from its tooltip wrapper to its click handler.
+  const button = (handler: string) => {
+    const end = list.indexOf(handler);
+    expect(end).toBeGreaterThan(-1);
+    return list.slice(list.lastIndexOf('<span class="tipwrap"', end), end);
+  };
+
+  it('Rename and Move gate on canChangeSelection, never on ownership alone', () => {
+    for (const handler of ['browser.openRename()', 'browser.openMove()']) {
+      const block = button(handler);
+      expect(block).toContain('!browser.canChangeSelection');
+      expect(block).not.toContain('ownsCurrentRoot');
+    }
+  });
+
+  it('both row menus pass the per-item answer', () => {
+    expect(list.split('browser.canChangeItem(item)').length - 1).toBe(2);
+  });
+
+  // bug286 (design v03 §4.7): in someone else's folder the upload is charged to the
+  // owner's pool, which this caller cannot read, so the pool half of the pre-check
+  // runs only where the caller owns the root; elsewhere the server decides.
+  it("the pre-check reads the caller's pool only in a folder the caller owns", () => {
+    const pre = store.slice(
+      store.indexOf('private async preflightCapacity('),
+      store.indexOf('return capacityRefusal(', store.indexOf('private async preflightCapacity(')),
+    );
+    expect(pre.split('this.drive.quota()').length - 1).toBe(1);
+    const gate = pre.indexOf('if (this.ownsCurrentRoot)');
+    expect(gate).toBeGreaterThan(-1);
+    expect(gate).toBeLessThan(pre.indexOf('this.drive.quota()'));
   });
 });

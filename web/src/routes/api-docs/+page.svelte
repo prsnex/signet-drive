@@ -252,6 +252,12 @@ signet share remove /Finance --recipient-id "$ACCOUNT_ID"   # owner removes a re
 signet share leave --folder-id "$FOLDER_ID"                 # leave a folder shared with you
 # (recipient/folder ids come from `share recipients` / `share list`)</code
       ></pre>
+    <p class="note">
+      A file belongs to the owner of the folder it's in. Files you add to a folder someone else owns
+      are kept by that owner and count against their storage, so they stay if you leave the folder
+      or your account is deleted. Anyone with read-write access can rename, move or delete files
+      there; folders stay with their owner.
+    </p>
 
     <h3>Verify an attestation</h3>
     <pre><code
@@ -495,7 +501,10 @@ signet transparency-verify --fingerprint "$KEM_FINGERPRINT" --purpose kem</code
         <tr
           ><td>403</td><td
             ><code>permission_denied</code> / <code>sharing_capability_insufficient</code></td
-          ><td>Not allowed; a PRSN's sharing capability is too low for this action.</td></tr
+          ><td
+            >Not allowed: read-only access can't rename, move or delete a file, or a PRSN's sharing
+            capability is too low for this action.</td
+          ></tr
         >
         <tr
           ><td>403</td><td
@@ -514,8 +523,12 @@ signet transparency-verify --fingerprint "$KEM_FINGERPRINT" --purpose kem</code
           ></tr
         >
         <tr
-          ><td>413</td><td><code>quota_exceeded</code> / <code>file_too_large</code></td><td
-            >The upload would exceed your storage quota, or the file exceeds the size limit.</td
+          ><td>413</td><td
+            ><code>quota_exceeded</code> / <code>folder_owner_quota_exceeded</code> /
+            <code>file_too_large</code></td
+          ><td
+            >The upload would exceed your storage quota, or, in a folder someone else owns, the
+            owner's; or the file exceeds the size limit.</td
           ></tr
         >
         <tr><td>429</td><td><code>rate_limited</code></td><td>Slow down and retry.</td></tr>
